@@ -282,6 +282,33 @@ def test_p1_g_heartbeat_kill_requeued_once_then_terminal(home, make_settings):
 
 # ================= P2：stdout 截断 / jsonl 轮转 / 单实例锁 =================
 
+def test_nested_cgroup_delegates_memory_and_cpu_controllers():
+    """三级嵌套 sched/<job>/<run>：中间层必须委派 cpu+memory，
+    否则叶子缺 memory.current/memory.max，内存硬限与画像读取静默失效。"""
+    import uuid
+    if not cgroup_mod._cgroup_fs_mounted() or os.geteuid() != 0:
+        return  # 无 cgroup v2 或非 root：无法验证，跳过（不 skip 以保持与其余用例一致风格）
+    name = f"test_nested_delegate_{uuid.uuid4().hex[:8]}/run-probe"
+    c = cgroup_mod.Cgroup(name)
+    if not c.available:
+        return
+    try:
+        assert (c.path / "memory.current").exists(), "叶子 cgroup 必须有 memory.current"
+        assert (c.path / "memory.max").exists(), "叶子 cgroup 必须有 memory.max"
+        assert (c.path / "cpu.stat").exists(), "叶子 cgroup 必须有 cpu.stat"
+        # 中间层 subtree_control 必须显式含两控制器
+        mid = c.path.parent / "cgroup.subtree_control"
+        ctrl = mid.read_text().strip().split()
+        assert "memory" in ctrl and "cpu" in ctrl
+    finally:
+        try:
+            c.kill_all()
+            c.path.rmdir()
+            c.path.parent.rmdir()
+        except OSError:
+            pass
+
+
 def test_p2_stdout_truncated_beyond_limit(home):
     """stdout 超过 max_log_bytes：保留头部 + 截断标记，磁盘占用有界。"""
     code = "print('A' * 1000)\nprint('B' * 1000)\nprint('C' * 1000)\n"  # ~3003 字节

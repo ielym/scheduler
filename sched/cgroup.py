@@ -33,9 +33,35 @@ class Cgroup:
         if self.path is not None:
             try:
                 self.path.mkdir(parents=True, exist_ok=True)
+                # 三级嵌套（sched/<job>/<run>）：中间层 cgroup 必须显式向下委派
+                # cpu+memory，否则叶子 cgroup 不会生成 memory.current/memory.max，
+                # 内存硬限与画像读取静默失效（cpu 控制器在本机恰好默认出现，不能依赖）。
+                self._delegate_to_nested_path()
                 self.available = _writable(self.path)
             except OSError:
                 self.available = False
+
+    def _delegate_to_nested_path(self) -> None:
+        """沿 name 的每一级中间目录，自上而下向其 subtree_control 写 +cpu +memory。
+
+        cgroup v2 规则：父 cgroup 的 subtree_control 决定其子代可用哪些控制器；
+        且父 cgroup 内不能直接驻留进程（no internal process）。sched/<job>/ 层
+        从不直接放进程（run 都在叶子），故可以安全委派。失败静默降级。
+        """
+        parts = [p for p in self.name.split("/") if p and p != "."]
+        ancestor = FALLBACK_ROOT
+        for part in parts[:-1]:
+            ancestor = ancestor / part
+            sc = ancestor / "cgroup.subtree_control"
+            if not sc.exists():
+                continue
+            try:
+                cur = sc.read_text().strip()
+                val = "".join(f" +{c}" for c in ("cpu", "memory") if f"+{c}" not in cur)
+                if val:
+                    sc.write_text(val.strip())
+            except OSError:
+                pass
 
     # ---- 资源上限 ----
     def set_limits(self, memory_high: int | None, memory_max: int | None, cpu_quota: float | None) -> None:
