@@ -101,6 +101,8 @@ class RunSpec:
     memory_high: int | None = None
     memory_max: int | None = None
     cpu_quota: float | None = None
+    cancel_grace_sec: int = 10    # 手动终止宽限期（settings.runner.kill_grace_sec）
+    preempt_grace_sec: int = 40   # 抢占断点保存宽限期（settings.runner.grace_sec）
 
     @property
     def workdir(self) -> Path:
@@ -204,14 +206,14 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
                     break
                 if spec.cancel.is_set():
                     scheduler_signaled = True
-                    _terminate(proc, 10)
+                    _terminate(proc, spec.cancel_grace_sec)
                     exit_code = proc.returncode
                     kind, reason = "killed", "被手动终止"
                     break
                 if spec.preempt.is_set():
                     # 优雅抢占：SIGTERM 让任务托管断点后自行退出 99；超时再 SIGKILL
                     scheduler_signaled = True
-                    _terminate(proc, 40)
+                    _terminate(proc, spec.preempt_grace_sec)
                     exit_code = proc.returncode
                     break
                 time.sleep(POLL_INTERVAL_SEC)
@@ -228,6 +230,9 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
     finished_at = runlog.now_iso()
     duration_ms = int((time.monotonic() - t0) * 1000)
 
+    # 任务 SDK 写入的精确错误分类（state.json.last_error.category），优先于退出码兜底
+    state_category = _read_last_error_category(spec.task_dir)
+
     # 终态判定
     if kind == "exited":
         if exit_code == 0:
@@ -238,6 +243,9 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
         elif exit_code in (errors.EXIT_RESOURCE, errors.EXIT_SOFT_RESOURCE):
             status = runlog.STATUS_RESOURCE
             reason = f"资源错误（退出码 {exit_code}）"
+        elif exit_code == errors.EXIT_DATA_RISK:
+            status = runlog.STATUS_FAILED
+            reason = "data_risk"
         elif exit_code == errors.EXIT_SIGKILL:
             # 137：优先归因 OOM；若非 OOM 且调度器发过信号，则为抢占/终结超时
             if oom:
@@ -247,8 +255,23 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
             else:
                 status, reason = runlog.STATUS_FAILED, "被 SIGKILL（外部）"
         else:
-            status = runlog.STATUS_FAILED
-            reason = f"退出码 {exit_code}"
+            # 其余非 0 退出码：优先用任务自报分类；无自报时按退出码兜底。
+            # G5：未分类（unclassified）一律按资源错误处理（可重试），而非转人工
+            if state_category == errors.Category.LOGIC.value:
+                status = runlog.STATUS_FAILED
+                reason = f"逻辑错误（退出码 {exit_code}，任务自报 logic）"
+            elif state_category in (errors.Category.RESOURCE.value, errors.Category.UNCLASSIFIED.value):
+                status = runlog.STATUS_RESOURCE
+                g5 = "，G5 未分类按资源处理" if state_category == errors.Category.UNCLASSIFIED.value else ""
+                reason = f"资源错误（退出码 {exit_code}，任务自报 {state_category}{g5}）"
+            else:
+                cat, cat_reason = errors.classify_exit_code(exit_code)
+                if errors.is_retryable_category(cat):
+                    status = runlog.STATUS_RESOURCE
+                    reason = f"资源错误兜底（退出码 {exit_code}，{cat_reason}）"
+                else:
+                    status = runlog.STATUS_FAILED
+                    reason = f"退出码 {exit_code}"
     elif kind == "killed":
         status = runlog.STATUS_KILLED
     else:
@@ -276,6 +299,27 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
         cpu_usage_usec=cpu_usec,
         oom_killed=oom,
     )
+
+
+def _read_last_error_category(task_dir: Path) -> str:
+    """读取任务 SDK 写入 state.json 的 last_error.category（精确分类通道）。"""
+    import json
+
+    p = task_dir / "cache" / "state.json"
+    if not p.exists():
+        return ""
+    try:
+        st = json.loads(p.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not isinstance(st, dict):
+        return ""
+    last_error = st.get("last_error")
+    if isinstance(last_error, dict):
+        cat = last_error.get("category")
+        if isinstance(cat, str):
+            return cat
+    return ""
 
 
 def scan_outputs(task_dir: Path) -> list[dict]:

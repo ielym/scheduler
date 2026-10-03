@@ -76,6 +76,15 @@ def save_active(snapshot: list[dict]) -> None:
     store.save_json(config.runtime_dir() / "active.json", snapshot)
 
 
+def load_recover_queue() -> list[dict]:
+    raw = store.load_json(config.runtime_dir() / "recover_queue.json", default=[])
+    return raw if isinstance(raw, list) else []
+
+
+def save_recover_queue(records: list[dict]) -> None:
+    store.save_json(config.runtime_dir() / "recover_queue.json", records)
+
+
 def append_decision(record: dict) -> None:
     store.append_jsonl(config.decisions_log(), record)
 

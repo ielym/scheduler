@@ -43,7 +43,8 @@ def order_waiting(items: list[dict], starvation_sec: float, now_iso: str) -> lis
     return sorted(items, key=_rank)
 
 
-def estimate_job(profile: resources.Profile, declared_cpu: float, declared_mem_mb: int, overshoot: float) -> tuple[float, int]:
+def estimate_job(profile: resources.Profile, declared_cpu: float, declared_mem_mb: int, overshoot: float,
+                 capacity: resources.Capacity | None = None) -> tuple[float, int]:
     prof = resources.Profile(
         cpu=profile.cpu, memory_mb=profile.memory_mb, samples=profile.samples,
         declared_cpu=declared_cpu, declared_memory_mb=declared_mem_mb,
@@ -52,6 +53,11 @@ def estimate_job(profile: resources.Profile, declared_cpu: float, declared_mem_m
     # 画像可能因历史样本偏低，至少不低于声明（声明是任务自报的最低下限）
     est_cpu = max(est_cpu, declared_cpu)
     est_mem = max(est_mem, declared_mem_mb)
+    # 钳制在机器上限内：画像上浮（×overshoot）可能越过上限导致任务永久无法准出。
+    # 真正超限的运行由 cgroup memory.max 硬兜底 + monitor 超限退让兜住，不会打爆机器。
+    if capacity is not None:
+        est_cpu = min(est_cpu, capacity.total_cpu)
+        est_mem = min(est_mem, capacity.total_memory_mb)
     return est_cpu, est_mem
 
 
@@ -63,19 +69,29 @@ def can_admit(
     capacity: resources.Capacity,
     soft_pool: resources.SoftResourcePool,
     hard_mem_reserve_ratio: float = 1.0,
+    extra_cpu: float = 0.0,
+    extra_mem_mb: int = 0,
+    extra_soft: dict[str, int] | None = None,
 ) -> tuple[bool, str]:
-    """固定资源按账本预留判定；软资源按令牌桶判定。"""
-    free_mem = capacity.total_memory_mb * hard_mem_reserve_ratio - ledger.reserved_mem_mb()
-    if est_mem_mb > 0 and ledger.reserved_mem_mb() + est_mem_mb > capacity.total_memory_mb * hard_mem_reserve_ratio:
+    """固定资源按账本预留判定；软资源按令牌桶判定。
+
+    extra_*：本轮扫描中已准出但尚未入账（reserve）的虚拟占用，防同轮 over-commit。
+    """
+    reserved_mem = ledger.reserved_mem_mb() + extra_mem_mb
+    reserved_cpu = ledger.reserved_cpu() + extra_cpu
+    free_mem = capacity.total_memory_mb * hard_mem_reserve_ratio - reserved_mem
+    if est_mem_mb > 0 and reserved_mem + est_mem_mb > capacity.total_memory_mb * hard_mem_reserve_ratio:
         return False, f"固定内存不足（需 {est_mem_mb}MB，账本余 {max(0, int(free_mem))}MB）"
-    free_cpu = capacity.total_cpu - ledger.reserved_cpu()
-    if est_cpu > 0 and ledger.reserved_cpu() + est_cpu > capacity.total_cpu:
+    free_cpu = capacity.total_cpu - reserved_cpu
+    if est_cpu > 0 and reserved_cpu + est_cpu > capacity.total_cpu:
         return False, f"固定 CPU 不足（需 {est_cpu} 核，账本余 {max(0.0, round(free_cpu, 2))} 核）"
+    extra_soft = extra_soft or {}
     for name, amt in soft_needs.items():
         if soft_pool.capacity(name) <= 0:
             return False, f"软资源 {name} 未配置容量"
-        if not soft_pool.available(name) >= amt:
-            return False, f"软资源 {name} 不足（需 {amt}，余 {soft_pool.available(name)}）"
+        avail = soft_pool.available(name) - extra_soft.get(name, 0)
+        if avail < amt:
+            return False, f"软资源 {name} 不足（需 {amt}，余 {avail}）"
     return True, ""
 
 
@@ -88,16 +104,27 @@ def admission_scan(
     soft_pool: resources.SoftResourcePool,
     overshoot: float,
 ) -> AdmissionResult:
-    """按双轨顺序扫描，尽量准出；软资源/固定资源不足的都留在队列继续等待（不失效）。"""
+    """按双轨顺序扫描，尽量准出；软资源/固定资源不足的都留在队列继续等待（不失效）。
+
+    扫描内维护「本轮虚拟账本」（pending_*）：本轮已准出者尚未入账（reserve 在 _admit），
+    若不累计会导致同轮多个大任务同时通过判定，预留合计超容量（over-commit）。
+    """
     res = AdmissionResult([], [], [], {})
+    pending_cpu, pending_mem = 0.0, 0
+    pending_soft: dict[str, int] = {}
     for it in items:
         rid = it["run_id"]
         declared_cpu, declared_mem, soft = get_declared(it["job_id"])
         prof = get_profile(it["job_id"])
-        est_cpu, est_mem = estimate_job(prof, declared_cpu, declared_mem, overshoot)
-        ok, reason = can_admit(est_cpu, est_mem, soft, ledger, capacity, soft_pool)
+        est_cpu, est_mem = estimate_job(prof, declared_cpu, declared_mem, overshoot, capacity)
+        ok, reason = can_admit(est_cpu, est_mem, soft, ledger, capacity, soft_pool,
+                               extra_cpu=pending_cpu, extra_mem_mb=pending_mem, extra_soft=pending_soft)
         if ok:
             res.admitted.append(rid)
+            pending_cpu += est_cpu
+            pending_mem += est_mem
+            for k, v in soft.items():
+                pending_soft[k] = pending_soft.get(k, 0) + v
         else:
             if "固定" in reason or "CPU" in reason or "内存" in reason:
                 res.blocked_fixed.append(rid)

@@ -102,9 +102,13 @@ def next_fire(schedule: dict[str, Any], now: datetime) -> datetime | None:
         return now + timedelta(seconds=int(interval))
     if stype == "once" and schedule.get("once_at"):
         try:
-            return datetime.fromisoformat(str(schedule["once_at"]))
+            fire_at = datetime.fromisoformat(str(schedule["once_at"]))
         except ValueError:
             return None
+        if fire_at.tzinfo is None and now.tzinfo is not None:
+            fire_at = fire_at.replace(tzinfo=now.tzinfo)
+        # 过期返回 None：once 只触发一次，到期后即失效（防无限重复入队）
+        return fire_at if fire_at > now else None
     return None
 
 

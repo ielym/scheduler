@@ -21,6 +21,8 @@ class RunningObs:
     actual_mem_mb: int | None      # cgroup memory.current (MB)
     heartbeat_age_sec: float       # 距上次心跳的秒数
     manual: bool = False
+    # 单任务心跳超时覆盖（manual 任务放宽用）；None = 用 Monitor 全局值
+    heartbeat_timeout_sec: int | None = None
 
 
 @dataclass
@@ -46,9 +48,12 @@ class Monitor:
         seen: set[str] = set()
         for obs in obs_list:
             seen.add(obs.run_id)
-            if not obs.manual and obs.heartbeat_age_sec > self.heartbeat_timeout_sec:
+            hb_timeout = obs.heartbeat_timeout_sec or self.heartbeat_timeout_sec
+            # manual 任务同样受心跳监测（防无限占用资源），仅阈值放宽；
+            # 超限退让对 manual 豁免（手动任务由触发者负责）
+            if obs.heartbeat_age_sec > hb_timeout:
                 actions.append(MonitorAction("heartbeat_kill", obs.run_id,
-                                             f"心跳超时（{obs.heartbeat_age_sec:.0f}s > {self.heartbeat_timeout_sec}s）"))
+                                             f"心跳超时（{obs.heartbeat_age_sec:.0f}s > {hb_timeout}s）"))
                 continue
             if obs.manual:
                 continue

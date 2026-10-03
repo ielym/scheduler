@@ -213,4 +213,10 @@ def run_gates(doc: taskdoc.TaskDoc, task_dir: Path) -> tuple[bool, list[GateResu
     for r in results:
         if r.gate == "gate4_capacity" and r.ok:
             profile["est_mem_mb"] = r.artifacts.get("est_mem_mb", 0)
+        if r.gate == "gate3_smoke" and r.ok:
+            smoke = r.artifacts.get("smoke") or {}
+            elapsed = float(smoke.get("elapsed_sec") or 0)
+            if elapsed > 0:
+                # 冒烟实测平均核数 = CPU-秒 / 时长（画像 CPU 样本单位是「核数」）
+                profile["est_cpu"] = round(float(smoke.get("cpu_sec") or 0) / elapsed, 3)
     return ok, results, profile
