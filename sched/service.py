@@ -133,6 +133,7 @@ class SchedulerService:
             persist.append_decision({"ts": runlog.now_iso(), "act": "cgroup_degraded",
                                      "reason": "cgroup 不可用，无硬资源边界"})
         self.refresh()
+        self._dedupe_wq()
         self._reconcile()
         self._recover_interrupted()
         self.started_at = runlog.now_iso()
@@ -177,6 +178,40 @@ class SchedulerService:
         self._release_instance_lock()
 
     # ================= 注册/刷新 =================
+    def _dedupe_wq(self) -> None:
+        """WQ 收口：同一 job 的等待项数不得超过 max_instances（与 running 数无关）。
+
+        崩溃恢复（recover_enqueue）可能与重启前残留在 WQ 的等待项重复；运行期
+        退避到期重入队在极端时序下（旧等待项仍在 WQ）同样可能重复。准出判定
+        发生在 pop 之后（在途 = 剩余 waiting + running ≥ cap 即塞回），因此
+        waiting 一旦超过 cap，所有等待项会互相顶掉名额，该 job 永远无法启动。
+        注意 running=1 + waiting=1（cap=1）是合法排队，不得收口。按 WQ 原序
+        保留最早入队者；启动时与每轮准出前均调用（无重复时零开销）。
+        """
+        caps: dict[str, int] = {}
+        for jid, e in self.entries.items():
+            if e.ok and e.doc is not None:
+                caps[jid] = max(1, int(e.doc.schedule.max_instances))
+        seen: dict[str, int] = {}
+        kept: list[dict] = []
+        removed: list[dict] = []
+        with self._lock:
+            for it in self.state.wq:
+                jid = str(it.get("job_id") or "")
+                cap_n = caps.get(jid, 1)
+                if seen.get(jid, 0) >= cap_n:
+                    removed.append(it)
+                else:
+                    kept.append(it)
+                    seen[jid] = seen.get(jid, 0) + 1
+            if removed:
+                self.state.wq = kept
+                persist.save_scheduler_state(self.state)
+        for it in removed:
+            persist.append_decision({"ts": runlog.now_iso(), "act": "wq_dedupe",
+                                     "job_id": it.get("job_id"), "run_id": it.get("run_id"),
+                                     "reason": "同 job 等待项超过 max_instances，丢弃历史重复入队"})
+
     def refresh(self) -> dict:
         entries = registry.load_registered()
         with self._lock:
@@ -465,6 +500,8 @@ class SchedulerService:
         return waiting + running
 
     def _tick_admission(self) -> None:
+        # 每轮准出前收口运行期可能产生的同 job 重复等待项（无重复时零开销）
+        self._dedupe_wq()
         with self._lock:
             # 冷却/退避期任务留在 WQ 但不参与本轮扫描：
             # 否则其虚拟占用会阻塞本轮其他任务，且每 tick 空转 pop/enqueue
@@ -978,6 +1015,14 @@ class SchedulerService:
             if e is None or not e.ok or e.doc is None:
                 persist.append_decision({"ts": runlog.now_iso(), "act": "recover_skip", "job_id": jid,
                                          "run_id": rec.get("run_id"), "reason": "任务不可用/未注册"})
+                continue
+            # WQ 里已有同 job 等待项时不再重复入队：重复项会互相顶掉 max_instances
+            # 名额（准出 pop 掉一个后还剩兄弟在途），导致谁都永远无法启动
+            max_inst = int(e.doc.schedule.max_instances)
+            if self._instances_in_flight(jid) >= max_inst:
+                persist.append_decision({"ts": runlog.now_iso(), "act": "recover_dedupe", "job_id": jid,
+                                         "run_id": rec.get("run_id"),
+                                         "reason": f"已有 {max_inst} 个在途实例，跳过崩溃恢复重复入队"})
                 continue
             new_rec = self._new_run_record(rec, resume_ref=True)
             with self._lock:

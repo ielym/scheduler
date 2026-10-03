@@ -345,6 +345,82 @@ def test_crash_recovery_skips_contract_exempt(home, make_settings):
     assert any(d.get("act") == "recover_manual" for d in decisions)
 
 
+def test_crash_recovery_dedupes_when_wq_already_waiting(home, make_settings):
+    """崩溃恢复入队时，WQ 已有同 job 等待项（max_instances=1）→ 跳过，否则
+    两个重复项会在准出侧互相顶掉名额，谁都永远无法启动。"""
+    config.ensure_layout()
+    write_task(home, "ok", real_sleep=0.01)
+    persist.save_active([{
+        "run_id": "stale", "job_id": "ok", "task_dir": str(home / "tasks" / "ok"),
+        "pid": 999999, "pgid": 999999, "status": "running", "trigger": "interval",
+        "priority": 50, "attempt": 1, "manual": False, "contract_exempt": False,
+        "scheduled_at": runlog.now_iso(), "queued_at": runlog.now_iso(),
+        "started_at": runlog.now_iso(),
+    }])
+    svc = _svc(home, make_settings)
+    svc.entries["ok"] = _entry(home, "ok")
+    # 模拟重启前 WQ 里残留的同 job 等待项
+    svc.state.enqueue({"job_id": "ok", "run_id": "waiting1", "status": "waiting",
+                       "queued_at": runlog.now_iso()})
+    svc._reconcile()
+    svc._recover_interrupted()
+    assert len(svc.state.wq) == 1
+    assert svc.state.wq[0]["run_id"] == "waiting1"
+    decisions = store.read_jsonl(config.decisions_log())
+    assert any(d.get("act") == "recover_dedupe" for d in decisions)
+
+
+def test_dedupe_wq_trims_historical_duplicate_waiting(home, make_settings):
+    """启动收口：同 job 的历史重复等待项只保留最早一项（max_instances=1）。"""
+    config.ensure_layout()
+    svc = _svc(home, make_settings)
+    svc.entries["ok"] = _entry(home, "ok")
+    now = runlog.now_iso()
+    svc.state.enqueue({"job_id": "ok", "run_id": "older", "status": "waiting",
+                       "queued_at": now})
+    svc.state.enqueue({"job_id": "ok", "run_id": "newer", "status": "waiting",
+                       "queued_at": now})
+    svc._dedupe_wq()
+    assert [it["run_id"] for it in svc.state.wq] == ["older"]
+    decisions = store.read_jsonl(config.decisions_log())
+    assert any(d.get("act") == "wq_dedupe" and d.get("run_id") == "newer" for d in decisions)
+    # 再跑一次无重复 → 不产生新决策
+    n = len(store.read_jsonl(config.decisions_log()))
+    svc._dedupe_wq()
+    assert len(store.read_jsonl(config.decisions_log())) == n
+
+
+def test_dedupe_wq_running_does_not_share_waiting_quota(home, make_settings):
+    """运行期收口：waiting 上限 = max_instances，与 running 数无关。
+
+    cap=1 且 1 running + 2 waiting（1 个合法排队 + 1 个重复）→ 只保留最早
+    waiting，否则 running 结束后两个 waiting 互相顶掉名额导致饿死；
+    cap=2 且 1 running + 3 waiting → 保留最早 2 个。合法的 1 running +
+    1 waiting（cap=1）排队场景由 test_admit_held_at_max_instances 覆盖。"""
+    config.ensure_layout()
+    svc = _svc(home, make_settings)
+    svc.entries["ok"] = _entry(home, "ok")
+    _entry(home, "cap2")
+    p = home / "tasks" / "cap2" / "task.json"
+    doc = json.loads(p.read_text())
+    doc["schedule"]["max_instances"] = 2
+    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    svc.entries["cap2"] = JobEntry(job_id="cap2", task_dir=home / "tasks" / "cap2",
+                                   doc=taskdoc.load_task_doc(home / "tasks" / "cap2"), enabled=True)
+    now = runlog.now_iso()
+    svc.running["r1"] = RunningEntry(run={"job_id": "ok", "run_id": "r1"},
+                                     spec=_spec(home, "ok", "r1"))
+    svc.state.enqueue({"job_id": "ok", "run_id": "w1", "status": "waiting", "queued_at": now})
+    svc.state.enqueue({"job_id": "ok", "run_id": "w2", "status": "waiting", "queued_at": now})
+    svc.running["r2"] = RunningEntry(run={"job_id": "cap2", "run_id": "r2"},
+                                     spec=_spec(home, "cap2", "r2"))
+    svc.state.enqueue({"job_id": "cap2", "run_id": "w3", "status": "waiting", "queued_at": now})
+    svc.state.enqueue({"job_id": "cap2", "run_id": "w4", "status": "waiting", "queued_at": now})
+    svc.state.enqueue({"job_id": "cap2", "run_id": "w5", "status": "waiting", "queued_at": now})
+    svc._dedupe_wq()
+    assert [it["run_id"] for it in svc.state.wq] == ["w1", "w3", "w4"]
+
+
 # ================= D3：渐进式提交 =================
 
 def test_staged_admission_one_by_one_until_healthy(home, make_settings):
