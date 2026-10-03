@@ -151,6 +151,12 @@ const STATUS_BADGE = {
   preempt_failed:"b-err", timeout:"b-warn", killed:"b-err", interrupted:"b-purple",
   waiting:"b-dim", running:"b-blue"
 };
+// 历史状态筛选的中文含义（option value 仍为接口使用的英文状态码）
+const RUN_STATUS_LABELS = {
+  success:"成功", failed:"失败（逻辑错误）", resource:"资源退让（可重试）",
+  preempted:"被抢占（断点续跑）", preempt_failed:"抢占失败（转人工）",
+  timeout:"超时", killed:"已终止", interrupted:"中断待恢复"
+};
 const badge = s => `<span class="badge ${STATUS_BADGE[s]||"b-dim"}">${esc(s||"-")}</span>`;
 const GB_MB = m => m >= 1024 ? (m/1024).toFixed(1)+"GB" : m+"MB";
 const hhmmss = iso => (iso||"").replace(/^.*T/,"").replace(/[+-].*$/,"").slice(0,8);
@@ -545,7 +551,7 @@ async function tabRuns() {
         <select id="rf-status">
           <option value="">全部状态</option>
           ${["success","failed","resource","preempted","preempt_failed","timeout","killed","interrupted"]
-            .map(s=>`<option ${s===status?"selected":""}>${s}</option>`).join("")}
+            .map(s=>`<option value="${s}" ${s===status?"selected":""}>${RUN_STATUS_LABELS[s]}</option>`).join("")}
         </select>
         <button class="act" id="rf-go">查询</button></div>
       <table><thead><tr><th>job</th><th>状态</th><th>exit</th><th>trigger</th><th>attempt</th><th>原因</th><th>时刻</th><th>操作</th></tr></thead>
