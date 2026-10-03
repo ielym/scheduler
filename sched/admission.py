@@ -38,7 +38,7 @@ def order_waiting(items: list[dict], starvation_sec: float, now_iso: str) -> lis
         enq = it.get("enqueued_at") or ""
         if _waited(enq) >= starvation_sec:
             # 饿死看门狗提权钳制在值域 0~100 之上 1 级（=101）：
-            # 保证优先于普通排队，又不越界到天级别（P2 修复）
+            # 保证优先于普通排队，又不越界到天级别
             pri = 101
         return (-pri, enq)
 
@@ -79,7 +79,7 @@ def can_admit(
     """固定资源按账本预留判定；软资源按令牌桶判定。
 
     extra_*：本轮扫描中已准出但尚未入账（reserve）的虚拟占用，防同轮 over-commit。
-    external_mem_margin_mb：对非调度进程占用的感知（R14）——est 超过整机
+    external_mem_margin_mb：对非调度进程占用的感知——est 超过整机
     MemAvailable - margin 时退让等待（不拒绝）。0 = 关闭该判定（测试用）。
     """
     reserved_mem = ledger.reserved_mem_mb() + extra_mem_mb

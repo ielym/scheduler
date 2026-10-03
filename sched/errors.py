@@ -37,7 +37,7 @@ def classify_exit_code(code: int | None) -> tuple[str, str]:
 
     99=干净抢占、100/101=资源、110=数据风险、137=待归因；
     其余非 0（含通用 1）一律按 G5 归为 unclassified → 调度器按资源错误重试，
-    倒逼任务通过 last_error.category 显式上报逻辑错误（R19：宁重试不错杀）。
+    倒逼任务通过 last_error.category 显式上报逻辑错误（宁重试不错杀）。
     """
     if code == EXIT_OK:
         return Category.RESOURCE.value, "success"  # 成功不算失败，不该走到这里
@@ -49,10 +49,10 @@ def classify_exit_code(code: int | None) -> tuple[str, str]:
         return Category.LOGIC.value, "data_risk"
     if code == EXIT_SIGKILL:
         return Category.UNCLASSIFIED.value, "sigkill_pending_attribution"
-    # G5：无任务自报分类时，未知非 0 退出码一律按资源错误处理（可重试）
+    # 无任务自报分类时，未知非 0 退出码一律按资源错误处理（可重试）
     return Category.UNCLASSIFIED.value, f"exit_code_{code}_unclassified"
 
 
 def is_retryable_category(category: str) -> bool:
-    """resource 与 unclassified（G5 兜底按资源处理）都可重试；logic 不可重试。"""
+    """resource 与 unclassified（未分类错误兜底按资源处理）都可重试；logic 不可重试。"""
     return category in (Category.RESOURCE.value, Category.UNCLASSIFIED.value)

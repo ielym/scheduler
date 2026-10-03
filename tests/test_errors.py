@@ -1,4 +1,4 @@
-from sched_v002 import errors
+from sched import errors
 
 
 def test_classify_exit_code_success():

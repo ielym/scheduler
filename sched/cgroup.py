@@ -2,7 +2,7 @@
 
 为每个 run 建立独立 cgroup，通过 memory.high（软限节流）+ memory.max（硬兜底）双水位
 实现资源硬边界，并读取 memory.current / memory.peak / cpu.stat / memory.events 作为
-monitor 与画像的唯一权威数据源。无法使用 cgroup 时降级为 no-op（L3 降标准）。
+monitor 与画像的唯一权威数据源。无法使用 cgroup 时降级为 no-op（硬限额相应不生效）。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
-FALLBACK_ROOT = CGROUP_ROOT / "scheduler_v002"
+FALLBACK_ROOT = CGROUP_ROOT / "sched"
 
 
 def _cgroup_fs_mounted() -> bool:

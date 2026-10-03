@@ -1,4 +1,4 @@
-from sched_v002 import preempt
+from sched import preempt
 
 
 def _ri(run_id, priority, cpu, mem, soft, manual=False, exempt=False):
@@ -20,7 +20,7 @@ def test_select_min_priority_first():
 
 
 def test_select_never_preempts_higher_or_equal_priority():
-    # R1/R10：等待者 priority=50，运行中 P=90（更高）与 P=50（同级）均不得入选
+    # 等待者 priority=50，运行中 P=90（更高）与 P=50（同级）均不得入选
     running = [
         _ri("high", 90, 2.0, 200, {}),
         _ri("eq", 50, 1.5, 150, {}),
@@ -31,7 +31,7 @@ def test_select_never_preempts_higher_or_equal_priority():
 
 
 def test_select_skips_contract_exempt_but_not_manual():
-    # P0-A（R1/R2）：抢占资格一律由优先级决定；manual 可恢复任务不再豁免。
+    # 抢占资格一律由优先级决定；manual 可恢复任务不再豁免。
     # 仅 contract_exempt（注册时声明不可断点恢复）仍不可被抢占。
     running = [
         _ri("manual_low", 10, 2.0, 500, {}, manual=True),

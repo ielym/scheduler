@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sched"
+version = "1.0.0"
+description = "常驻单进程本地任务调度器：契约闸门、容量准出、抢占续跑与内嵌管理台"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.scripts]
+sched = "sched.__main__:main"
+
+[tool.setuptools]
+packages = ["sched", "sched_task_sdk"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+sched = ["web_static/*"]

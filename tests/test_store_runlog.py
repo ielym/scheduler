@@ -1,6 +1,6 @@
 import json
 
-from sched_v002 import config, runlog, store
+from sched import config, runlog, store
 
 
 def test_json_roundtrip(home):

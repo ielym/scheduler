@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sched 管理台</title>
+<style>
+  :root {
+    --bg:#0f141b; --panel:#161d27; --panel2:#1d2632; --line:#2a3543;
+    --txt:#d7e0ea; --dim:#8b98a8; --accent:#4da3ff; --ok:#3fbf6f; --warn:#e6b53c;
+    --err:#ef5f5f; --purple:#b18cff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--txt); }
+  header { display:flex; align-items:center; gap:18px; padding:10px 18px; background:var(--panel);
+           border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .meta { color:var(--dim); font-size:12px; }
+  nav { display:flex; gap:2px; margin-left:auto; }
+  nav button { background:transparent; border:0; color:var(--dim); padding:7px 14px; cursor:pointer;
+               border-radius:6px; font-size:13px; }
+  nav button.active { background:var(--panel2); color:var(--txt); }
+  nav button:hover { color:var(--txt); }
+  main { padding:18px; max-width:1500px; margin:0 auto; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card .k { color:var(--dim); font-size:12px; }
+  .card .v { font-size:24px; font-weight:600; margin-top:4px; }
+  .card .sub { color:var(--dim); font-size:11px; margin-top:2px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; margin-bottom:16px; }
+  .panel h2 { font-size:13px; margin:0; padding:11px 15px; border-bottom:1px solid var(--line);
+              display:flex; align-items:center; gap:10px; }
+  .panel h2 .spacer { margin-left:auto; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); font-size:12.5px;
+           vertical-align:top; }
+  th { color:var(--dim); font-weight:500; white-space:nowrap; }
+  tr:last-child td { border-bottom:0; }
+  tbody tr:hover { background:var(--panel2); }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  button.act { background:var(--panel2); border:1px solid var(--line); color:var(--txt); border-radius:6px;
+               padding:4px 10px; cursor:pointer; font-size:12px; margin-right:5px; white-space:nowrap; }
+  button.act:hover { border-color:var(--accent); color:var(--accent); }
+  button.act.primary { background:var(--accent); border-color:var(--accent); color:#06101d; font-weight:600; }
+  button.act.danger:hover { border-color:var(--err); color:var(--err); }
+  button.act[disabled] { opacity:.45; cursor:not-allowed; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; font-weight:600; }
+  .b-ok { background:rgba(63,191,111,.15); color:var(--ok); }
+  .b-err { background:rgba(239,95,95,.15); color:var(--err); }
+  .b-warn { background:rgba(230,181,60,.15); color:var(--warn); }
+  .b-dim { background:rgba(139,152,168,.15); color:var(--dim); }
+  .b-purple { background:rgba(177,140,255,.15); color:var(--purple); }
+  .b-blue { background:rgba(77,163,255,.15); color:var(--accent); }
+  .switch { position:relative; display:inline-block; width:38px; height:20px; }
+  .switch input { display:none; }
+  .slider { position:absolute; inset:0; background:var(--line); border-radius:20px; cursor:pointer; transition:.15s; }
+  .slider:before { content:""; position:absolute; width:14px; height:14px; left:3px; top:3px; background:#fff;
+                  border-radius:50%; transition:.15s; }
+  .switch input:checked + .slider { background:var(--ok); }
+  .switch input:checked + .slider:before { transform:translateX(18px); }
+  .bar { background:var(--panel2); border-radius:5px; height:8px; overflow:hidden; margin-top:6px; }
+  .bar > i { display:block; height:100%; background:var(--accent); }
+  .bar > i.warn { background:var(--warn); } .bar > i.err { background:var(--err); }
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; display:flex;
+              align-items:center; justify-content:center; }
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(920px,92vw);
+           max-height:88vh; display:flex; flex-direction:column; }
+  .modal.wide { width:min(1200px,95vw); }
+  .modal header2, .mhead { padding:13px 18px; border-bottom:1px solid var(--line); font-weight:600;
+                           display:flex; align-items:center; gap:10px; }
+  .mbody { padding:16px 18px; overflow:auto; }
+  .mfoot { padding:11px 18px; border-top:1px solid var(--line); display:flex; gap:8px; justify-content:flex-end; }
+  .x { margin-left:auto; cursor:pointer; color:var(--dim); font-size:17px; } .x:hover{color:var(--txt);}
+  input[type=text], input[type=number], select, textarea {
+    background:var(--bg); border:1px solid var(--line); color:var(--txt); border-radius:6px;
+    padding:6px 9px; font-size:13px; }
+  textarea { width:100%; }
+  .gate { display:flex; align-items:flex-start; gap:12px; padding:10px 4px; border-bottom:1px solid var(--line); }
+  .gate:last-child{border-bottom:0;}
+  .dot { width:11px; height:11px; border-radius:50%; margin-top:4px; background:var(--dim); flex:0 0 auto; }
+  .dot.run { background:var(--accent); animation:blink 1s infinite; }
+  .dot.ok { background:var(--ok); } .dot.fail { background:var(--err); }
+  @keyframes blink { 50% { opacity:.25; } }
+  .gate .info { flex:1; } .gate .t { font-weight:600; } .gate .r { color:var(--dim); margin-top:2px; word-break:break-all; }
+  .gate .el { color:var(--dim); font-size:11px; white-space:nowrap; }
+  .editor-wrap { display:grid; grid-template-columns:190px 1fr; gap:12px; height:62vh; }
+  .filelist { background:var(--bg); border:1px solid var(--line); border-radius:8px; overflow:auto; padding:6px; }
+  .filelist div { padding:5px 8px; border-radius:5px; cursor:pointer; font-size:12px; word-break:break-all; }
+  .filelist div.active { background:var(--panel2); color:var(--accent); }
+  .editor-wrap textarea { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px; resize:none;
+                          height:100%; line-height:1.55; }
+  pre.log { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px;
+            height:46vh; overflow:auto; font-size:11.5px; margin:0; white-space:pre-wrap; word-break:break-all; }
+  .tabs-mini { display:flex; gap:4px; margin-bottom:8px; }
+  .tabs-mini button { background:var(--panel2); border:1px solid var(--line); color:var(--dim);
+                      padding:4px 12px; border-radius:6px; cursor:pointer; font-size:12px; }
+  .tabs-mini button.active { color:var(--txt); border-color:var(--accent); }
+  .toast { position:fixed; bottom:22px; right:22px; z-index:99; display:flex; flex-direction:column; gap:8px; }
+  .toast div { background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--accent);
+               padding:9px 15px; border-radius:8px; font-size:12.5px; max-width:380px; }
+  .toast div.err { border-left-color:var(--err); } .toast div.ok { border-left-color:var(--ok); }
+  .hint { color:var(--dim); font-size:11.5px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; }
+  code { background:var(--panel2); padding:1px 5px; border-radius:4px; font-size:11.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>sched 管理台</h1>
+  <span class="meta" id="meta">连接中…</span>
+  <nav>
+    <button data-tab="overview" class="active">总览</button>
+    <button data-tab="jobs">任务</button>
+    <button data-tab="queue">队列/在途</button>
+    <button data-tab="runs">历史</button>
+    <button data-tab="decisions">决策</button>
+    <button data-tab="profiles">画像</button>
+  </nav>
+</header>
+<main id="view"></main>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s, r=document) => r.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const api = async (u, opt) => {
+  const r = await fetch(u, opt);
+  if (!r.ok) { let m = `${r.status}`; try { m = (await r.json()).detail || m; } catch {} throw new Error(m); }
+  return r.json();
+};
+const toast = (msg, kind="") => {
+  const d = document.createElement("div"); if (kind) d.className = kind;
+  d.textContent = msg; $("#toast").appendChild(d);
+  setTimeout(() => d.remove(), 4200);
+};
+const post = (u, body) => api(u, {method:"POST", headers:{"Content-Type":"application/json"}, body: body?JSON.stringify(body):"{}"});
+const put = (u, body) => api(u, {method:"PUT", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+
+const STATUS_BADGE = {
+  success:"b-ok", failed:"b-err", resource:"b-warn", preempted:"b-blue",
+  preempt_failed:"b-err", timeout:"b-warn", killed:"b-err", interrupted:"b-purple",
+  waiting:"b-dim", running:"b-blue"
+};
+const badge = s => `<span class="badge ${STATUS_BADGE[s]||"b-dim"}">${esc(s||"-")}</span>`;
+const GB_MB = m => m >= 1024 ? (m/1024).toFixed(1)+"GB" : m+"MB";
+
+// ---------------- 弹窗 ----------------
+function modal(title, bodyHtml, footHtml="", wide=false) {
+  const bg = document.createElement("div"); bg.className = "modal-bg";
+  bg.innerHTML = `<div class="modal ${wide?'wide':''}">
+    <div class="mhead"><span>${title}</span><span class="x">✕</span></div>
+    <div class="mbody">${bodyHtml}</div>
+    ${footHtml ? `<div class="mfoot">${footHtml}</div>` : ""}</div>`;
+  bg.addEventListener("click", e => { if (e.target === bg || e.target.classList.contains("x")) bg.remove(); });
+  document.body.appendChild(bg);
+  return bg;
+}
+
+// ---------------- 注册（POST + SSE 流读取） ----------------
+async function registerUI(jobId, onDone) {
+  const GATE_NAMES = {gate1_static:"闸1 静态闸", gate2_contract:"闸2 契约闸", gate3_smoke:"闸3 冒烟闸",
+                      gate4_capacity:"闸4 容量闸", gate5_checkpoint:"闸5 断点闸"};
+  const gates = ["gate1_static","gate2_contract","gate3_smoke","gate4_capacity","gate5_checkpoint"];
+  const rows = {};
+  const body = `<div>${gates.map(g => `<div class="gate"><div class="dot" id="rg-${g}"></div>
+      <div class="info"><div class="t">${GATE_NAMES[g]}</div><div class="r" id="rr-${g}">等待…</div></div>
+      <div class="el" id="re-${g}"></div></div>`).join("")}</div>`;
+  const m = modal(`注册任务 <code>${esc(jobId)}</code>`, body,
+    `<button class="act" id="rc-close" disabled>关闭</button>`);
+  gates.forEach(g => { rows[g] = {dot:$("#rg-"+g,m), r:$("#rr-"+g,m), el:$("#re-"+g,m)}; });
+
+  const setGate = (g, state, reason, extra="") => {
+    const row = rows[g]; if (!row) return;
+    row.dot.className = "dot " + state;
+    row.r.textContent = reason;
+    row.el.innerHTML = extra;
+  };
+  $("#rg-gate1_static",m).className = "dot run";
+  $("#rr-gate1_static",m).textContent = "执行中…";
+
+  const r = await fetch(`/api/register/${encodeURIComponent(jobId)}`, {method:"POST"});
+  if (!r.ok) { let msg = r.status+""; try { msg = (await r.json()).detail; } catch {}
+    setGate("gate1_static","fail",msg); $("#rc-close",m).disabled=false; return; }
+  const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+  let okFinal = false;
+  while (true) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream:true});
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
+      let event = "msg", data = {};
+      for (const line of chunk.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5)); } catch {} }
+      }
+      if (event === "error") {
+        const firstPending = gates.find(g => rows[g].dot.classList.contains("run"));
+        if (firstPending) setGate(firstPending, "fail", data.message);
+        else setGate("gate1_static","fail",data.message);
+      } else if (event === "gate_ok" || event === "gate_failed") {
+        const ok = event === "gate_ok";
+        const extra = data.smoke ? `耗时 ${data.elapsed_sec}s · 峰值 ${data.smoke.memory_peak_mb}MB · CPU ${data.smoke.cpu_sec}s`
+                    : (data.elapsed_sec != null ? `${data.elapsed_sec}s` : "");
+        setGate(data.gate, ok?"ok":"fail", data.reason, extra);
+        if (!ok) { $("#rc-close",m).disabled=false; return; }
+        const next = gates[gates.indexOf(data.gate)+1];
+        if (next && rows[next] && !rows[next].dot.classList.contains("ok")) {
+          rows[next].dot.className = "dot run"; rows[next].r.textContent = "执行中…";
+        }
+      } else if (event === "done") {
+        okFinal = !!data.ok;
+        if (okFinal) toast(`注册成功：${data.job_id}（预估 ${data.est_mem_mb}MB / ${data.est_cpu} 核）`, "ok");
+      }
+    }
+  }
+  $("#rc-close",m).disabled = false;
+  if (okFinal && onDone) onDone();
+}
+
+// ---------------- 文件编辑器 ----------------
+let EDIT = {jobId:null, path:null};
+function openEditor(jobId, autoPath) {
+  const m = modal(`任务文件 · <code>${esc(jobId)}</code>`,
+    `<div class="editor-wrap"><div class="filelist" id="fl"></div>
+      <div><div class="row" style="margin-bottom:8px">
+        <span class="hint" id="ed-path"></span><span class="grow"></span>
+        <button class="act primary" id="ed-save">保存（热加载 ≤30s 生效）</button>
+        <button class="act" id="ed-reg">保存并跑五闸注册</button>
+      </div><textarea id="ed-area" spellcheck="false"></textarea></div></div>`,
+    `<button class="act" id="ed-close">关闭</button>`, true);
+  const fl = $("#fl",m), area = $("#ed-area",m);
+  const loadList = async () => {
+    const files = await api(`/api/tasks/${encodeURIComponent(jobId)}/files`);
+    fl.innerHTML = files.map(f => `<div data-p="${esc(f.path)}" class="${EDIT.path===f.path?'active':''}">${esc(f.path)}</div>`).join("")
+                   || `<div class="hint" style="padding:8px">无文件</div>`;
+    fl.querySelectorAll("div[data-p]").forEach(d => d.onclick = () => loadFile(d.dataset.p));
+  };
+  const loadFile = async (path) => {
+    EDIT.path = path;
+    const f = await api(`/api/tasks/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(path)}`);
+    area.value = f.content; $("#ed-path",m).textContent = path + `（${f.size}B）`;
+    fl.querySelectorAll("div").forEach(d => d.classList.toggle("active", d.dataset.p === path));
+  };
+  $("#ed-save",m).onclick = async () => {
+    try {
+      await put(`/api/tasks/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(EDIT.path)}`,
+                {content: area.value});
+      toast("已保存 " + EDIT.path, "ok");
+    } catch (e) { toast("保存失败：" + e.message, "err"); }
+  };
+  $("#ed-reg",m).onclick = async () => {
+    try {
+      await put(`/api/tasks/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(EDIT.path)}`,
+                {content: area.value});
+      m.remove(); await registerUI(jobId, loadTab);
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#ed-close",m).onclick = () => m.remove();
+  loadList().then(() => { if (autoPath) loadFile(autoPath).catch(()=>{});
+                          else if (!EDIT.jobId || EDIT.jobId !== jobId) EDIT.path=null; EDIT.jobId=jobId; });
+}
+
+// ---------------- run 详情 ----------------
+function openRun(jobId, runId) {
+  const m = modal(`Run <code>${esc(runId)}</code>`,
+    `<div id="rd-meta"></div>
+     <div class="tabs-mini" style="margin-top:12px">
+       <button data-l="stdout" class="active">stdout</button><button data-l="stderr">stderr</button>
+       <span class="grow"></span><button class="act" id="rd-refresh">刷新尾部</button></div>
+     <pre class="log" id="rd-log">加载中…</pre></div>`,
+    `<button class="act" id="rd-close">关闭</button>`, true);
+  let stream = "stdout";
+  const loadMeta = async () => {
+    const r = await api(`/api/runs/${encodeURIComponent(jobId)}/${encodeURIComponent(runId)}`);
+    $("#rd-meta",m).innerHTML = `<div class="row">
+      <span>${badge(r.status)}</span><b>${esc(r.job_id)}</b>
+      <span class="hint">trigger=${esc(r.trigger)} attempt=${esc(r.attempt)} exit=${esc(r.exit_code)}
+      开始=${esc(r.started_at||"-")} 结束=${esc(r.finished_at||"-")} 耗时=${Math.round((r.duration_ms||0)/100)/10}s</span></div>
+      ${r.reason?`<div class="hint" style="margin-top:6px">${esc(r.reason)}</div>`:""}
+      <details style="margin-top:8px"><summary class="hint">完整记录 JSON</summary>
+      <pre class="log" style="height:200px">${esc(JSON.stringify(r,null,2))}</pre></details>`;
+  };
+  const loadLog = async () => {
+    const l = await api(`/api/logs/${encodeURIComponent(jobId)}/${encodeURIComponent(runId)}/${stream}?tail=2000`);
+    $("#rd-log",m).textContent = l.content || "(空)";
+  };
+  m.querySelectorAll(".tabs-mini button[data-l]").forEach(b => b.onclick = () => {
+    stream = b.dataset.l; m.querySelectorAll(".tabs-mini button").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active"); loadLog();
+  });
+  $("#rd-refresh",m).onclick = loadLog;
+  $("#rd-close",m).onclick = () => m.remove();
+  loadMeta(); loadLog();
+}
+
+// ---------------- 各 Tab ----------------
+async function tabOverview() {
+  const d = await api("/api/overview");
+  const memPct = Math.min(100, Math.round((d.machine.total_memory_mb - d.machine.available_memory_mb)/d.machine.total_memory_mb*100));
+  const ledPct = Math.min(100, Math.round(d.ledger_reserved_mem_mb/Math.max(1,d.machine.total_memory_mb)*100));
+  const soft = Object.entries(d.soft||{}).map(([k,v]) => `
+    <div class="panel"><h2>软资源 <code>${esc(k)}</code>
+      <span class="spacer"></span>
+      <input type="number" id="soft-${esc(k)}" value="${v.cap}" min="0" style="width:90px">
+      <button class="act" data-soft="${esc(k)}">设置容量</button></h2>
+      <div style="padding:12px 15px">已用 ${v.used} / ${v.cap}
+        <div class="bar"><i style="width:${Math.min(100,v.cap?Math.round(v.used/v.cap*100):0)}%"></i></div></div></div>`).join("");
+  $("#view").innerHTML = `
+    <div class="cards">
+      <div class="card"><div class="k">已注册任务</div><div class="v">${d.jobs}</div></div>
+      <div class="card"><div class="k">等待 WQ</div><div class="v">${d.waiting}</div></div>
+      <div class="card"><div class="k">在途运行</div><div class="v">${d.running}</div></div>
+      <div class="card"><div class="k">整机内存</div><div class="v">${GB_MB(d.machine.available_memory_mb)}</div>
+        <div class="sub">可用 / 共 ${GB_MB(d.machine.total_memory_mb)}（${memPct}% 占用）</div>
+        <div class="bar"><i class="${memPct>85?'err':memPct>65?'warn':''}" style="width:${memPct}%"></i></div></div>
+      <div class="card"><div class="k">CPU</div><div class="v">${d.machine.total_cpu}</div><div class="sub">核</div></div>
+      <div class="card"><div class="k">账本预留</div><div class="v">${d.ledger_reserved_mem_mb}MB</div>
+        <div class="sub">实测 ${d.ledger_actual_mem_mb}MB · 占整机 ${ledPct}%</div>
+        <div class="bar"><i class="${ledPct>85?'err':ledPct>65?'warn':''}" style="width:${ledPct}%"></i></div></div>
+    </div>
+    <div class="panel"><h2>运行参数</h2><div style="padding:12px 15px" class="hint">
+      时区 ${esc(d.settings.timezone)} · cooldown ${d.settings.cooldown_sec}s · 抢占宽限 ${d.settings.grace_sec}s ·
+      cancel 宽限 ${d.settings.kill_grace_sec}s · 心跳 ${d.settings.heartbeat_timeout_sec}s ·
+      资源重试上限 ${d.settings.max_resource_attempts===0?"不封顶":d.settings.max_resource_attempts} ·
+      热加载 ${d.settings.hot_reload_sec}s · serve 启动 ${esc(d.started_at||"-")}</div></div>
+    ${soft || `<div class="panel"><h2>软资源</h2><div style="padding:12px 15px" class="hint">
+      尚未配置任何软资源；任务声明了 resources.soft 时会永久等待。
+      <button class="act" id="add-soft" style="margin-left:10px">新增软资源</button></div></div>`}
+    <div id="newsoft"></div>`;
+  document.querySelectorAll("[data-soft]").forEach(b => b.onclick = async () => {
+    const n = parseInt($("#soft-"+b.dataset.soft).value, 10);
+    try { await post("/api/soft", {name:b.dataset.soft, n}); toast(`soft[${b.dataset.soft}] = ${n}`, "ok"); }
+    catch(e){ toast(e.message,"err"); }
+  });
+  const addBtn = $("#add-soft");
+  if (addBtn) addBtn.onclick = () => {
+    $("#newsoft").innerHTML = `<div class="panel"><h2>新增软资源</h2><div style="padding:12px 15px" class="row">
+      <input type="text" id="ns-name" placeholder="资源名，如 proxy" style="width:180px">
+      <input type="number" id="ns-cap" value="1" min="0" style="width:100px">
+      <button class="act primary" id="ns-ok">创建</button></div></div>`;
+    $("#ns-ok").onclick = async () => {
+      const name = $("#ns-name").value.trim();
+      if (!name) return toast("资源名不能为空","err");
+      await post("/api/soft", {name, n: parseInt($("#ns-cap").value,10)||0});
+      toast("已创建","ok"); loadTab();
+    };
+  };
+}
+
+async function tabJobs() {
+  const [jobs, tasks] = await Promise.all([api("/api/jobs"), api("/api/tasks")]);
+  const regIds = new Set(jobs.map(j=>j.job_id));
+  const unreg = tasks.filter(t => !regIds.has(t.id));
+  const row = j => {
+    const sch = j.schedule||{};
+    return `<tr>
+      <td class="mono"><b>${esc(j.job_id)}</b><div class="hint">${esc(j.name||"")}</div></td>
+      <td>${j.priority}</td>
+      <td><span class="badge b-purple">${esc(sch.type||"manual")}</span>
+          <div class="hint mono">${sch.interval?sch.interval+"s":esc(sch.once_at||"")}</div></td>
+      <td class="mono">${esc(j.next_run_at||"-")}</td>
+      <td>${j.ok?'<span class="badge b-ok">ok</span>':
+              `<span class="badge b-err" title="${esc(j.error||'')}">异常</span>
+               <div class="hint" style="max-width:230px">${esc((j.error||"").slice(0,90))}</div>`}</td>
+      <td><label class="switch"><input type="checkbox" ${j.enabled?"checked":""} data-en="${esc(j.job_id)}">
+          <span class="slider"></span></label></td>
+      <td>
+        <button class="act primary" data-run="${esc(j.job_id)}" ${j.ok?"":"disabled"}>触发入队</button>
+        <button class="act" data-reg="${esc(j.job_id)}">跑五闸注册</button>
+        <button class="act" data-files="${esc(j.job_id)}">文件</button>
+      </td></tr>`;
+  };
+  $("#view").innerHTML = `
+    <div class="panel"><h2>已注册任务
+      <span class="spacer"></span>
+      <button class="act primary" id="new-task">+ 新建任务</button></h2>
+      <table><thead><tr><th>任务</th><th>优先级</th><th>调度</th><th>下次触发</th><th>状态</th><th>启用</th><th>操作</th></tr></thead>
+      <tbody>${jobs.map(row).join("") || `<tr><td colspan="7" class="hint" style="padding:18px">暂无注册任务</td></tr>`}</tbody></table></div>
+    ${unreg.length ? `<div class="panel"><h2>未注册的任务目录（闸未过/已删除注册）</h2>
+      <table><tbody>${unreg.map(t=>`<tr><td class="mono">${esc(t.id)}</td><td>${t.has_task_json?'<span class="badge b-dim">有 task.json</span>':'<span class="badge b-err">缺 task.json</span>'}</td>
+        <td><button class="act" data-reg="${esc(t.id)}">注册</button><button class="act" data-files="${esc(t.id)}">文件</button></td></tr>`).join("")}
+      </tbody></table></div>`:""}`;
+  document.querySelectorAll("[data-run]").forEach(b => b.onclick = async () => {
+    try { const r = await post(`/api/jobs/${encodeURIComponent(b.dataset.run)}/trigger`);
+      toast(`已入队：${r.run_id}`, "ok"); } catch(e){ toast("触发失败："+e.message,"err"); }
+  });
+  document.querySelectorAll("[data-reg]").forEach(b => b.onclick = () => registerUI(b.dataset.reg, loadTab));
+  document.querySelectorAll("[data-files]").forEach(b => b.onclick = () => openEditor(b.dataset.files, "task.json"));
+  document.querySelectorAll("[data-en]").forEach(c => c.onchange = async () => {
+    try { await post(`/api/jobs/${encodeURIComponent(c.dataset.en)}/enabled`, {enabled:c.checked});
+      toast(c.checked?"已启用":"已停用（≤30s 生效）","ok"); } catch(e){ toast(e.message,"err"); c.checked=!c.checked; }
+  });
+  $("#new-task").onclick = () => {
+    const m = modal("新建任务",
+      `<div class="hint" style="margin-bottom:10px">在 <code>tasks/</code> 下创建最小骨架（manual 调度），
+       创建后在文件编辑器里填实，再跑五闸注册。更丰富的场景模板见 sched 技能 assets/templates。</div>
+       <input type="text" id="nt-id" placeholder="任务 id：字母数字 _ -，1-64 位" style="width:100%">`,
+      `<button class="act" id="nt-cancel">取消</button><button class="act primary" id="nt-ok">创建</button>`);
+    $("#nt-cancel",m).onclick = () => m.remove();
+    $("#nt-ok",m).onclick = async () => {
+      const id = $("#nt-id",m).value.trim();
+      try { const r = await post("/api/tasks", {id}); m.remove();
+            toast("已创建 "+r.id+(r.warning||""), r.warning ? "" : "ok");
+            loadTab(); openEditor(r.id, "task.json"); }
+      catch(e){ toast("创建失败："+e.message,"err"); }
+    };
+  };
+}
+
+async function tabQueue() {
+  const q = await api("/api/queue");
+  const w = q.waiting.map(it => `<tr>
+    <td class="mono">${esc(it.job_id)}</td><td>${it.priority}</td>
+    <td>${badge(it.trigger==="manual"?"waiting":it.trigger)}<span class="hint"> ${esc(it.trigger)}</span></td>
+    <td>${it.attempt}</td><td>${it.resume_point_ref?'<span class="badge b-blue">断点恢复</span>':""}</td>
+    <td class="mono">${esc(it.queued_at||"")}</td>
+    <td>${q.backoffs[it.job_id]?`<span class="badge b-warn">退避至 ${esc(q.backoffs[it.job_id].not_before||"")}</span>`:""}
+        ${q.cooldowns[it.job_id]?`<span class="badge b-dim">冷却至 ${esc(q.cooldowns[it.job_id])}</span>`:""}</td></tr>`).join("");
+  const r = q.running.map(it => `<tr>
+    <td class="mono">${esc(it.job_id)}</td><td>${badge("running")} ${esc(it.trigger)}${it.manual?"(手动)":""}</td>
+    <td class="mono">${esc(it.run_id)}</td><td>${it.pid}</td><td>${it.est_cpu} 核 / ${it.est_mem_mb}MB</td>
+    <td>${Object.entries(it.soft||{}).map(([k,v])=>`${k}:${v}`).join(" ")||"-"}</td>
+    <td class="mono">${esc(it.started_at||"")}</td></tr>`).join("");
+  $("#view").innerHTML = `
+    <div class="panel"><h2>等待队列 WQ（${q.waiting.length}）</h2>
+      <table><thead><tr><th>任务</th><th>优先级</th><th>触发</th><th>尝试</th><th>恢复</th><th>入队时刻</th><th>退避/冷却</th></tr></thead>
+      <tbody>${w||'<tr><td colspan="7" class="hint" style="padding:16px">队列为空</td></tr>'}</tbody></table></div>
+    <div class="panel"><h2>在途运行（${q.running.length}）</h2>
+      <table><thead><tr><th>任务</th><th>状态</th><th>run_id</th><th>pid</th><th>预估资源</th><th>软资源</th><th>开始</th></tr></thead>
+      <tbody>${r||'<tr><td colspan="7" class="hint" style="padding:16px">无在途任务</td></tr>'}</tbody></table></div>`;
+}
+
+async function tabRuns() {
+  const jobId = $("#rf-job")?.value || ""; const status = $("#rf-status")?.value || "";
+  const qs = new URLSearchParams(); if (jobId) qs.set("job_id",jobId); if (status) qs.set("status",status); qs.set("limit","200");
+  const runs = await api("/api/runs?"+qs.toString());
+  $("#view").innerHTML = `
+    <div class="panel"><h2>运行历史（最近 200 条）</h2>
+      <div style="padding:10px 15px" class="row">
+        <input type="text" id="rf-job" placeholder="按 job_id 过滤" value="${esc(jobId)}" style="width:200px">
+        <select id="rf-status">
+          <option value="">全部状态</option>
+          ${["success","failed","resource","preempted","preempt_failed","timeout","killed","interrupted"]
+            .map(s=>`<option ${s===status?"selected":""}>${s}</option>`).join("")}
+        </select>
+        <button class="act" id="rf-go">查询</button></div>
+      <table><thead><tr><th>job</th><th>状态</th><th>exit</th><th>trigger</th><th>attempt</th><th>原因</th><th>时刻</th><th></th></tr></thead>
+      <tbody>${runs.map(r=>`<tr>
+        <td class="mono">${esc(r.job_id)}</td><td>${badge(r.status)}</td><td>${esc(r.exit_code)}</td>
+        <td>${esc(r.trigger)}</td><td>${esc(r.attempt)}</td>
+        <td class="hint" style="max-width:300px">${esc((r.reason||"").slice(0,100))}</td>
+        <td class="mono">${esc(r.finished_at||r.started_at||"")}</td>
+        <td><button class="act" data-rd="${esc(r.job_id)}|${esc(r.run_id)}">详情/日志</button></td></tr>`).join("")
+        ||'<tr><td colspan="8" class="hint" style="padding:16px">无记录</td></tr>'}</tbody></table></div>`;
+  $("#rf-go").onclick = loadTab;
+  $("#rf-job").onkeydown = e => { if (e.key==="Enter") loadTab(); };
+  $("#rf-status").onchange = loadTab;
+  document.querySelectorAll("[data-rd]").forEach(b => b.onclick = () => {
+    const [j,rid] = b.dataset.rd.split("|"); openRun(j,rid);
+  });
+}
+
+async function tabDecisions() {
+  const items = await api("/api/decisions?limit=300");
+  $("#view").innerHTML = `<div class="panel"><h2>决策审计 decisions.jsonl（最近 300 条）</h2>
+    <table><thead><tr><th>时刻</th><th>动作</th><th>job/run</th><th>详情</th></tr></thead><tbody>
+    ${items.map(d=>`<tr><td class="mono">${esc(d.ts||"")}</td>
+      <td><span class="badge ${d.act==="terminal"?"b-err":/enqueue|admit/.test(d.act)?"b-blue":/preempt/.test(d.act)?"b-warn":"b-dim"}">${esc(d.act)}</span></td>
+      <td class="mono">${esc(d.job_id||"")} ${d.run_id?`<span class="hint">${esc(d.run_id)}</span>`:""}</td>
+      <td class="hint" style="max-width:520px">${esc(JSON.stringify(Object.fromEntries(Object.entries(d).filter(([k])=>!["ts","act","job_id","run_id"].includes(k)))))}</td></tr>`).join("")
+      ||'<tr><td colspan="4" class="hint" style="padding:16px">无决策记录</td></tr>'}</tbody></table></div>`;
+}
+
+async function tabProfiles() {
+  const p = await api("/api/profiles");
+  $("#view").innerHTML = `<div class="panel"><h2>资源画像（冒烟+正式 run 实测，P95 滑窗 8 次 ×1.2 用于准出）</h2>
+    <table><thead><tr><th>job</th><th>声明 CPU/内存</th><th>P95 CPU</th><th>P95 内存</th><th>样本数</th></tr></thead>
+    <tbody>${Object.entries(p).map(([k,d])=>`<tr><td class="mono">${esc(k)}</td>
+      <td>${d.declared_cpu} 核 / ${d.declared_memory_mb}MB</td>
+      <td>${d.p95_cpu??"-"} 核</td><td>${d.p95_memory_mb??"-"}MB</td><td>${d.samples}</td></tr>`).join("")
+      ||'<tr><td colspan="5" class="hint" style="padding:16px">尚无画像（未注册过任务）</td></tr>'}</tbody></table></div>`;
+}
+
+const TABS = {overview:tabOverview, jobs:tabJobs, queue:tabQueue, runs:tabRuns,
+              decisions:tabDecisions, profiles:tabProfiles};
+let cur = "overview";
+async function loadTab() {
+  try { await TABS[cur](); } catch(e) { $("#view").innerHTML =
+    `<div class="panel" style="padding:20px"><b style="color:var(--err)">加载失败：</b>${esc(e.message)}</div>`; }
+}
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  cur = b.dataset.tab;
+  document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));
+  loadTab();
+});
+
+const tick = async () => {
+  try { const d = await fetch("/api/overview").then(r=>r.json());
+    $("#meta").textContent = `jobs=${d.jobs} · waiting=${d.waiting} · running=${d.running} · ${d.started_at||""}`;
+    if (cur === "overview" || cur === "queue") loadTab();
+  } catch { $("#meta").textContent = "管理台未连接（serve 是否带 --web 启动？）"; }
+};
+tick(); setInterval(tick, 3000);
+</script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-"""回归测试：覆盖 REVIEW.md 中 P0（Bug1–5）与 P1（D1–D8）修复。"""
+"""核心行为回归测试：终态账本、退出码归因、抢占、重试与冷启动等。"""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import json
 import time
 from datetime import datetime, timedelta
 
-from sched_v002 import admission, config, errors, persist, preempt, resources, runner, runlog, store, taskdoc
-from sched_v002.registry import JobEntry
-from sched_v002.service import RunningEntry, SchedulerService
+from sched import admission, config, errors, persist, preempt, resources, runner, runlog, store, taskdoc
+from sched.registry import JobEntry
+from sched.service import RunningEntry, SchedulerService
 
 from conftest import write_task
 
@@ -51,7 +51,7 @@ def _spec(home, job_id, run_id):
 # ================= Bug1：once 过期不再重复触发 =================
 
 def test_once_expired_next_fire_none():
-    from sched_v002.engine import next_fire
+    from sched.engine import next_fire
     from zoneinfo import ZoneInfo
 
     tz = ZoneInfo("Asia/Shanghai")
@@ -226,7 +226,7 @@ def test_end_to_end_preempt_high_wins(home, make_settings):
         time.sleep(0.05)
     assert svc.running, "low 应已运行"
     # 等 low 真正启动（写出 state.json = 已装 SIGTERM 处理器），避免启动竞态
-    # F4：状态文件在 cache/runs/<run_id>/state.json
+    # 实例级状态文件在 cache/runs/<run_id>/state.json
     low_run_id = next(iter(svc.running)) if svc.running else ""
     low_state = svc.entries["low"].task_dir / "cache" / "runs" / low_run_id / "state.json"
     deadline = time.time() + 10
@@ -307,7 +307,7 @@ def test_g5_unclassified_treated_as_resource(home, make_settings):
     assert out.exit_code == 1
     # G5：未分类错误一律按资源错误处理（可重试），而非转人工
     assert out.status == runlog.STATUS_RESOURCE
-    # F4：实例级状态在 cache/runs/<run_id>/state.json
+    # 实例级状态在 cache/runs/<run_id>/state.json
     st = json.loads((home / "tasks" / "unclass" / "cache" / "runs" / "r1" / "state.json").read_text())
     assert st["last_error"]["category"] == "unclassified"
 
@@ -357,7 +357,7 @@ def test_crash_recovery_skips_contract_exempt(home, make_settings):
     svc.entries["exempt"] = _entry(home, "exempt", contract_exempt=True)
     svc._reconcile()
     svc._recover_interrupted()
-    # R3：contract_exempt 不自动恢复
+    # contract_exempt 不自动恢复
     assert svc.state.wq == []
     decisions = store.read_jsonl(config.decisions_log())
     assert any(d.get("act") == "recover_manual" for d in decisions)
@@ -385,7 +385,7 @@ def test_staged_admission_one_by_one_until_healthy(home, make_settings):
     assert len(svc.running) == 1
 
     # 等待任务真正启动（写出实例级 state.json 心跳），避免心跳超时干扰门禁
-    # F4：心跳在 cache/runs/<run_id>/state.json
+    # 心跳在 cache/runs/<run_id>/state.json
     task_dir = svc.entries[svc.running[first_rid].run["job_id"]].task_dir
     deadline = time.time() + 10
     while not (task_dir / "cache" / "runs" / first_rid / "state.json").exists() and time.time() < deadline:
@@ -541,17 +541,52 @@ def test_close_expired_windows_in_monitor_tick(home, make_settings):
 # ================= D8：manual 心跳放宽不豁免（见 test_monitor.py） =================
 
 def test_manual_heartbeat_uses_relaxed_timeout(home, make_settings):
-    # service 侧：manual 观察值带 ×2 放宽阈值
+    # service 侧：manual 观察值阈值 ×2；从未写 state.json 时按进程存活年龄计时
     svc = _svc(home, make_settings)
     svc.entries["ok"] = _entry(home, "ok")
     svc.monitor.heartbeat_timeout_sec = 100
-    re = RunningEntry(
+
+    # 150s：普通任务(100s)已超限，manual 放宽到 200s → 不杀
+    spec1 = _spec(home, "ok", "r1")
+    re1 = RunningEntry(
         run={"run_id": "r1", "job_id": "ok", "priority": 50, "manual": True,
              "task_dir": str(home / "tasks" / "ok"),
              "started_at": runlog.now_iso()},
-        spec=_spec(home, "ok", "r1"), est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r1",
+        spec=spec1, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r1",
+        started_monotonic=time.monotonic() - 150,
     )
-    svc.running["r1"] = re
-    # 无 state.json → 心跳年龄无穷大；manual 放宽后仍应触发（不豁免）
+    svc.running["r1"] = re1
     svc._tick_monitor()
-    assert re.spec.cancel.is_set()
+    assert not spec1.cancel.is_set()
+
+    # 250s > 200s 放宽阈值 → 仍触发（放宽不豁免）
+    spec2 = _spec(home, "ok", "r2")
+    re2 = RunningEntry(
+        run={"run_id": "r2", "job_id": "ok", "priority": 50, "manual": True,
+             "task_dir": str(home / "tasks" / "ok"),
+             "started_at": runlog.now_iso()},
+        spec=spec2, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r2",
+        started_monotonic=time.monotonic() - 250,
+    )
+    svc.running["r2"] = re2
+    svc._tick_monitor()
+    assert spec2.cancel.is_set()
+
+
+def test_cold_start_missing_state_not_killed(home, make_settings):
+    # 准出当 tick：Python 冷启动/import 期还没写 state.json（age=1e9 哨兵），
+    # 不得在 admission→monitor 同一 tick 内把任务误判心跳超时杀掉
+    svc = _svc(home, make_settings)
+    svc.entries["ok"] = _entry(home, "ok")
+    svc.monitor.heartbeat_timeout_sec = 100
+    spec = _spec(home, "ok", "cold")
+    re = RunningEntry(
+        run={"run_id": "cold", "job_id": "ok", "priority": 50, "manual": False,
+             "task_dir": str(home / "tasks" / "ok"),
+             "started_at": runlog.now_iso()},
+        spec=spec, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/cold",
+        started_monotonic=time.monotonic(),
+    )
+    svc.running["cold"] = re
+    svc._tick_monitor()
+    assert not spec.cancel.is_set()

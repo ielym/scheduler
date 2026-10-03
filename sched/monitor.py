@@ -50,7 +50,7 @@ class Monitor:
             seen.add(obs.run_id)
             hb_timeout = obs.heartbeat_timeout_sec or self.heartbeat_timeout_sec
             # manual 任务同样受心跳监测（防无限占用资源），仅阈值放宽；
-            # 超限退让对 manual「放宽不豁免」：阈值 ×2，超过仍优雅抢占（P2 修复）
+            # 超限退让对 manual「放宽不豁免」：阈值 ×2，超过仍优雅抢占
             if obs.heartbeat_age_sec > hb_timeout:
                 actions.append(MonitorAction("heartbeat_kill", obs.run_id,
                                              f"心跳超时（{obs.heartbeat_age_sec:.0f}s > {hb_timeout}s）"))

@@ -1,4 +1,4 @@
-from sched_v002 import admission, resources
+from sched import admission, resources
 
 
 def test_order_waiting_priority_then_fifo():

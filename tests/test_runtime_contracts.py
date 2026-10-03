@@ -1,13 +1,13 @@
-"""第三轮审查（REVIEW_ROUND3.md）修复项回归测试。
+"""运行期契约回归测试。
 
 锁定行为：
-- P1-C：engine.upsert 保序（热加载不重置未到期触发）+ refresh 热加载新任务
-- P1-D：SIGKILL(-9) 三态归因（外部 kill→failed / cgroup OOM→resource / 抢占超时→preempt_failed）
-- P1-E：error_rules 经 SCHED_ERROR_RULES 注入任务进程，SDK 启动时读取
-- P1-F：run_user 不存在时注册报错含 useradd 指引
-- P1-G：闸5 运行期心跳契约（拒绝伪契约任务）+ 心跳误杀只重入队一次
-- P2：stdout 截断、jsonl 轮转、单实例锁 + cmd_serve 友好报错、重入队字段工厂
-- P2⑧/P0 闭环：110 数据风险 → second_pass 二刷端到端
+- jobs.json 热加载保序（不重置未到期触发）+ 热加载新任务即时生效
+- SIGKILL(-9) 三态归因（外部 kill→failed / cgroup OOM→resource / 抢占超时→preempt_failed）
+- error_rules 经 SCHED_ERROR_RULES 注入任务进程，SDK 启动时读取
+- run_user 不存在时注册报错含 useradd 指引
+- 闸5 运行期心跳契约（拒绝伪契约任务）+ 心跳误杀只重入队一次
+- stdout 截断、jsonl 轮转、单实例锁 + serve 友好报错、重入队字段工厂
+- 110 数据风险 → second_pass 二刷端到端闭环
 """
 
 from __future__ import annotations
@@ -22,11 +22,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from sched_v002 import config, contract, errors, runlog, runner, store, taskdoc
-from sched_v002 import cgroup as cgroup_mod
-from sched_v002 import engine as engine_mod
-from sched_v002.registry import JobEntry
-from sched_v002.service import SchedulerService
+from sched import config, contract, errors, runlog, runner, store, taskdoc
+from sched import cgroup as cgroup_mod
+from sched import engine as engine_mod
+from sched.registry import JobEntry
+from sched.service import SchedulerService
 from sched_task_sdk import SchedTask
 
 from conftest import write_task
@@ -64,7 +64,7 @@ def _make_spec(home, name, run_id="r1", code=None, **kw):
     return runner.RunSpec(**defaults)
 
 
-# ================= P1-C：upsert 保序 + 热加载 =================
+# ================= upsert 保序 + 热加载 =================
 
 class _FakeDT(datetime):
     """可控时钟：让 engine 内 datetime.now() 按偏移推进（继承以保留 fromisoformat 等）。"""
@@ -110,7 +110,7 @@ def test_p1_c_refresh_hot_loads_new_interval_job(home, make_settings):
     doc["schedule"] = {"type": "interval", "interval": 3600, "max_instances": 1, "overflow": "queue"}
     tj.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    from sched_v002 import registry
+    from sched import registry
     registry.upsert_state("hot", {"enabled": True})
     svc = SchedulerService(make_settings(run_user=""))
     svc.refresh()
@@ -122,7 +122,7 @@ def test_p1_c_refresh_hot_loads_new_interval_job(home, make_settings):
     assert svc.engine.next_run_time("hot") == nxt1
 
 
-# ================= P1-D：SIGKILL(-9) 三态归因 =================
+# ================= SIGKILL(-9) 三态归因 =================
 
 def test_p1_d_sigkill_external_is_failed(home):
     """外部 SIGKILL（rc=-9）：无 OOM、非调度器终结 → failed（转人工归因）。"""
@@ -136,7 +136,7 @@ def test_p1_d_sigkill_external_is_failed(home):
 
 
 def test_p1_d_sigkill_oom_is_resource(home, monkeypatch):
-    """cgroup OOM 计数 > 0 时 rc=-9 → resource（可重试，R20 资源不足不判失败）。"""
+    """cgroup OOM 计数 > 0 时 rc=-9 → resource（资源不足可重试，不判失败）。"""
     monkeypatch.setattr(cgroup_mod.Cgroup, "read_oom_kill_count", lambda self: 1)
     spec = _make_spec(home, "koom",
                       code="import os, signal, time; time.sleep(0.3); os.kill(os.getpid(), signal.SIGKILL)")
@@ -162,7 +162,7 @@ def test_p1_d_sigkill_during_preempt_is_preempt_failed(home):
     assert "断点未确认" in out.reason
 
 
-# ================= P1-E：error_rules 注入 =================
+# ================= error_rules 注入 =================
 
 def test_p1_e_build_env_injects_error_rules_and_home(home):
     rules = {"resource_regex": ["conn.*timeout"], "logic_regex": ["assert.*fail"]}
@@ -192,7 +192,7 @@ def test_p1_e_sdk_loads_error_rules_from_env(tmp_path, monkeypatch):
     assert task2.resource_regex == []
 
 
-# ================= P1-F：run_user 友好校验 =================
+# ================= run_user 友好校验 =================
 
 def test_p1_f_register_rejects_unknown_run_user(home, make_settings):
     task_dir = write_task(home, "u")
@@ -210,7 +210,7 @@ def test_p1_f_register_rejects_unknown_run_user(home, make_settings):
     assert "useradd" in msg  # 给出可操作的部署指引
 
 
-# ================= P1-G：闸5 心跳契约 + 心跳误杀重入队 =================
+# ================= 闸5 心跳契约 + 心跳误杀重入队 =================
 
 FAKE_CONTRACT_RUN_PY = '''\
 import os, signal, sys, time
@@ -301,7 +301,7 @@ def test_p2_jsonl_rotation_bounded(home):
     assert store.read_jsonl(p.with_name(p.name + ".1")) == [{"n": 1}]
 
     # 默认上限走模块常量（monkeypatch 后同样生效）
-    import sched_v002.store as store_mod
+    import sched.store as store_mod
     home2 = home / "data" / "runtime"
     p2 = home2 / "audit2.jsonl"
     try:
@@ -331,7 +331,7 @@ def test_p2_cmd_serve_friendly_error_when_locked(home, monkeypatch, capsys):
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
-        from sched_v002 import __main__ as main_mod
+        from sched import __main__ as main_mod
         rc = main_mod.main(["serve"])
         assert rc == 1
         assert "已有调度器实例" in capsys.readouterr().err
@@ -340,7 +340,7 @@ def test_p2_cmd_serve_friendly_error_when_locked(home, monkeypatch, capsys):
         os.close(fd)
 
 
-# ================= P2⑨：重入队字段工厂 =================
+# ================= 重入队字段工厂 =================
 
 def test_p2_new_run_record_clears_traces(home, make_settings):
     svc = _svc_with_entry(home, make_settings)
@@ -362,7 +362,7 @@ def test_p2_new_run_record_clears_traces(home, make_settings):
     assert new["job_id"] == "ok" and new["trigger"] == "manual"
 
 
-# ================= P2⑧/P0 闭环：110 数据风险二刷端到端 =================
+# ================= 110 数据风险二刷端到端闭环 =================
 
 SKIP110_RUN_PY = '''\
 import json, os, sys

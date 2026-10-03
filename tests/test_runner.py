@@ -2,7 +2,7 @@ import json
 import threading
 import time
 
-from sched_v002 import runner, taskdoc
+from sched import runner, taskdoc
 
 from conftest import write_task
 
@@ -36,7 +36,7 @@ def test_runner_preempt_exits_99_and_saves_checkpoint(home, make_settings):
     assert out.exit_code == 99
 
     # 断点已落盘，且下一步可恢复
-    # F4：实例级状态在 cache/runs/<run_id>/state.json；断点在 cache/resume_point.json
+    # 实例级状态在 cache/runs/<run_id>/state.json；断点在 cache/resume_point.json
     st = json.loads((task_dir / "cache" / "runs" / "r_pre" / "state.json").read_text())
     assert st["status"] == "preempted"
     rp = json.loads((task_dir / "cache" / "resume_point.json").read_text())

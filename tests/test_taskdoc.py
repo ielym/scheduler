@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from sched_v002 import taskdoc
+from sched import taskdoc
 
 
 def _write(root, name, payload, run_py="print('ok')\n"):

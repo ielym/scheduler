@@ -1,6 +1,6 @@
-from sched_v002 import taskdoc
-from sched_v002.registry import JobEntry
-from sched_v002.service import SchedulerService
+from sched import taskdoc
+from sched.registry import JobEntry
+from sched.service import SchedulerService
 
 from conftest import write_task
 
@@ -36,7 +36,7 @@ def test_handle_retry_enqueues_with_backoff(home, make_settings):
 
 
 def test_handle_retry_never_gives_up_by_default(home, make_settings):
-    # P0-B（R16/R17/R20）：默认无重试上限——第 5 次资源错误仍重入队退避，
+    # 默认无重试上限——第 5 次资源错误仍重入队退避，
     # 保证「资源不足不得导致任务失败」
     svc = _svc_with_entry(home, make_settings)
     rec = {"job_id": "ok", "run_id": "r1", "status": "resource", "attempt": 5}

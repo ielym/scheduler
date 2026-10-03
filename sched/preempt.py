@@ -42,10 +42,10 @@ def select_preempt_targets(
 ) -> list[RunningInfo]:
     """贪心近似最小集合覆盖：按 priority 升序（最低优先者先）逐个加入，直到释放足够。
 
-    只允许抢占优先级严格低于等待者的任务（R1/R2/R10）：contract_exempt（R3 不可恢复
+    只允许抢占优先级严格低于等待者的任务：contract_exempt（不可恢复
     任务，被抢无法恢复）与同优先级或更高优先级者直接跳过，绝不入选。
 
-    manual 触发的可恢复任务不再豁免（第三轮审查 P0-A，违反 R1/R2）：其注册时同样
+    manual 触发的可恢复任务不再豁免：其注册时同样
     通过闸5 验证了断点恢复能力，被抢后走与其他任务一致的恢复路径。
     """
     candidates = [r for r in running if not r.contract_exempt

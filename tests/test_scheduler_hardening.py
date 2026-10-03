@@ -1,7 +1,6 @@
-"""第二轮审查（REVIEW_ROUND2.md）修复项的回归测试。
-
-F1 抢占优先级下限 | F2 G5 兜底反转 | F3 退避移出扫描 | F4 多实例状态隔离
-F5 外部内存感知 | F6 闸门降权+env 黑名单 | F7 stop 单终态定点
+"""调度加固行为回归：
+抢占优先级严格下限 | 未分类错误按资源处理 | 退避任务移出准出扫描 | 多实例状态隔离 |
+外部内存感知 | 注册闸门降权与环境变量黑名单 | 停机单终态与信号优先归因。
 """
 
 from __future__ import annotations
@@ -10,14 +9,14 @@ import json
 import time
 from pathlib import Path
 
-from sched_v002 import admission, errors, preempt, resources, runner, runlog, taskdoc
-from sched_v002.service import RunningEntry, SchedulerService
+from sched import admission, errors, preempt, resources, runner, runlog, taskdoc
+from sched.service import RunningEntry, SchedulerService
 
 from conftest import write_task
 from test_regression import FakeCapacity, _entry, _run_custom, _spec, _svc
 
 
-# ================= F1：抢占优先级严格下限 =================
+# ================= 抢占优先级严格下限 =================
 
 def test_f1_low_waiter_cannot_preempt_high_runner():
     running = [preempt.RunningInfo(run_id="r_high", job_id="j", priority=90,
@@ -41,7 +40,7 @@ def test_f1_high_waiter_preempts_lower_only():
     assert [t.run_id for t in targets] == ["r50"]  # 只抢 <95 的
 
 
-# ================= F2：G5 兜底语义 =================
+# ================= 未分类错误兜底语义 =================
 
 def test_f2_exit1_without_self_report_is_resource():
     # 无 state.json 自报、退出码 1 → unclassified → 按资源错误重试（不转人工）
@@ -56,7 +55,7 @@ def test_f2_negative_exit_code_is_unclassified():
     assert cat == errors.Category.UNCLASSIFIED.value
 
 
-# ================= F3：退避任务不参与准出扫描 =================
+# ================= 退避任务不参与准出扫描 =================
 
 def test_f3_backoff_items_skipped_in_admission_scan(home, make_settings):
     svc = _svc(home, make_settings)
@@ -74,7 +73,7 @@ def test_f3_backoff_items_skipped_in_admission_scan(home, make_settings):
     assert not any(re.run["job_id"] == "ok" for re in svc.running.values())
 
 
-# ================= F4：多实例状态隔离 =================
+# ================= 多实例状态隔离 =================
 
 def test_f4_concurrent_instances_isolated_state(tmp_path, monkeypatch):
     """两个并发实例写各自的 state.json，resume_point 共享。"""
@@ -106,7 +105,7 @@ def test_f4_concurrent_instances_isolated_state(tmp_path, monkeypatch):
     assert runner._read_last_error_category(ws, "runB") == "logic"
 
 
-# ================= F5：外部内存感知 =================
+# ================= 外部内存感知 =================
 
 class _ExtCapacity(FakeCapacity):
     """带可控 MemAvailable 的容量（模拟外部进程占用）。"""
@@ -145,7 +144,7 @@ def test_f5_disabled_when_margin_zero():
     assert ok  # margin=0 关闭该判定（测试/兼容）
 
 
-# ================= F6：env 黑名单 + 降权失败上抛 =================
+# ================= env 黑名单 + 降权失败上抛 =================
 
 def test_f6_env_blacklist_rejected_at_schema(home):
     task_dir = home / "tasks" / "evil"
@@ -177,7 +176,7 @@ def test_f6_drop_privileges_unknown_user_raises():
         runner._drop_privileges("__no_such_user_hopefully__")
 
 
-# ================= F7：stop 单终态定点 + 信号优先归因 =================
+# ================= stop 单终态定点 + 信号优先归因 =================
 
 def test_f7_cancel_beats_exit_code(home, make_settings):
     """cancel 已 set 时进程退出（-15），终态必须是 killed 而非退出码兜底。"""

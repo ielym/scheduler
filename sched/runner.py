@@ -68,13 +68,13 @@ def build_env(
             "SCHED_DRY_RUN": "1" if dry_run else "0",
         }
     )
-    # P3：降权任务的 HOME 应为目标用户家目录（透传调度器的 /root 会造成权限异常）
+    # 降权任务的 HOME 应为目标用户家目录（透传调度器的 /root 会造成权限异常）
     if run_user:
         try:
             env["HOME"] = pwd.getpwnam(run_user).pw_dir
         except KeyError:
             pass
-    # P1-E：把 task.json 的 error_rules 注入任务进程，SDK 据此设置分类正则
+    # 把 task.json 的 error_rules 注入任务进程，SDK 据此设置分类正则
     if error_rules:
         import json as _json
         env["SCHED_ERROR_RULES"] = _json.dumps(error_rules, ensure_ascii=False)
@@ -127,9 +127,9 @@ class RunSpec:
     cpu_quota: float | None = None
     cancel_grace_sec: int = 10    # 手动终止宽限期（settings.runner.kill_grace_sec）
     preempt_grace_sec: int = 40   # 抢占断点保存宽限期（settings.runner.grace_sec）
-    # P1-E：task.json 的 error_rules，经环境变量注入任务进程
+    # task.json 的 error_rules，经环境变量注入任务进程
     error_rules: dict = field(default_factory=dict)
-    # P2：stdout/stderr 落盘上限（字节）；超出保留头部并写截断标记（默认 32MB）
+    # stdout/stderr 落盘上限（字节）；超出保留头部并写截断标记（默认 32MB）
     max_log_bytes: int = 32 * 1024 * 1024
     # 心跳超时等非人工取消的原因（随 cancel 置位前写入，用于终态归因与重入队判定）
     cancel_reason: str = ""
@@ -235,7 +235,7 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
     try:
         workdir = spec.workdir
         workdir.mkdir(parents=True, exist_ok=True)
-        # P2：stdout/stderr 走管道 + 泵线程落盘，超出上限截断（防日志打爆磁盘）
+        # stdout/stderr 走管道 + 泵线程落盘，超出上限截断（防日志打爆磁盘）
         proc = subprocess.Popen(
             spec.argv(),
             cwd=str(workdir),
@@ -262,7 +262,7 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
 
         while True:
             # 先查调度信号再查进程状态：避免 SIGTERM 后进程先退出、
-            # rc 先到导致 cancel/preempt 语义被退出码兜底覆盖（F7）
+            # rc 先到会让 cancel/preempt 语义被退出码兜底覆盖
             if spec.cancel.is_set():
                 scheduler_signaled = True
                 _terminate(proc, spec.cancel_grace_sec)
@@ -319,8 +319,8 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
             status = runlog.STATUS_FAILED
             reason = "data_risk"
         elif exit_code == errors.EXIT_SIGKILL or exit_code == -signal.SIGKILL:
-            # SIGKILL：Popen 直接 exec 时返回 -9，经 shell 包装才是 137（P1-D 修复：
-            # 原先只比较 137 是死分支，导致 OOM/外部 SIGKILL 归因全部失效）
+            # SIGKILL：Popen 直接 exec 时返回 -9，经 shell 包装才是 137；
+            # 两种形态都要识别，否则 OOM/外部 SIGKILL 归因会失效
             if oom:
                 status, reason = runlog.STATUS_RESOURCE, "cgroup OOM（超限被内核杀）"
             elif scheduler_signaled:
@@ -329,7 +329,7 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
                 status, reason = runlog.STATUS_FAILED, f"被 SIGKILL（外部，rc={exit_code}）"
         else:
             # 其余非 0 退出码：优先用任务自报分类；无自报时按退出码兜底。
-            # G5：未分类（unclassified）一律按资源错误处理（可重试），而非转人工
+            # 未分类（unclassified）一律按资源错误处理（可重试），而非转人工
             if state_category == errors.Category.LOGIC.value:
                 status = runlog.STATUS_FAILED
                 reason = f"逻辑错误（退出码 {exit_code}，任务自报 logic）"

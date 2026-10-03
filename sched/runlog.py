@@ -1,6 +1,6 @@
-"""运行历史（data/runs/*.jsonl）与运行日志文件读写（akapand append-only）。
+"""运行历史（data/runs/*.jsonl）与运行日志文件读写（append-only）。
 
-v002 在现有状态机基础上扩展出抢占/资源两态；终态才落盘 data/runs/*.jsonl。
+状态机含抢占/资源两类非终态；仅终态落盘 data/runs/*.jsonl。
 """
 
 from __future__ import annotations

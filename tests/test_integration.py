@@ -1,8 +1,8 @@
 import json
 import time
 
-from sched_v002 import config, persist, runlog, store
-from sched_v002.service import SchedulerService
+from sched import config, persist, runlog, store
+from sched.service import SchedulerService
 
 from conftest import write_task
 
@@ -33,7 +33,7 @@ def test_register_rejects_missing_entry(home, make_settings):
     # 无 task.json 的目录
     (home / "tasks" / "broken").mkdir(parents=True, exist_ok=True)
     svc = SchedulerService(make_settings(run_user=""))
-    from sched_v002 import taskdoc
+    from sched import taskdoc
     try:
         svc.register_job("broken")
         assert False, "应抛 TaskDocError"

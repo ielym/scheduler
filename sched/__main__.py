@@ -1,4 +1,4 @@
-"""命令行入口：sched-v002 <command>。
+"""命令行入口：sched <command>。
 
 命令：
   register <name>        跑五道闸并注册任务
@@ -78,9 +78,21 @@ def cmd_set_soft(args) -> int:
     return 0
 
 
-def cmd_serve(_args) -> int:
+def cmd_serve(args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     svc = _svc()
+    if getattr(args, "web", False):
+        svc.settings.web.enabled = True
+    if getattr(args, "no_web", False):
+        svc.settings.web.enabled = False
+    svc._web_enabled = bool(svc.settings.web.enabled)
+    if svc._web_enabled:
+        from . import web
+        try:
+            web.validate_public_listen(svc.settings.web)
+        except RuntimeError as e:
+            print(f"启动失败：{e}", file=sys.stderr)
+            return 1
     try:
         svc.start()
     except RuntimeError as e:
@@ -88,6 +100,8 @@ def cmd_serve(_args) -> int:
         print(f"启动失败：{e}", file=sys.stderr)
         return 1
     print("调度器已启动（Ctrl-C 退出）")
+    if svc._web_enabled:
+        print(f"管理台：http://{svc.settings.web.host}:{svc.settings.web.port}/")
     try:
         while True:
             time.sleep(1)
@@ -98,7 +112,7 @@ def cmd_serve(_args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="sched-v002")
+    p = argparse.ArgumentParser(prog="sched")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("register"); sp.add_argument("name"); sp.set_defaults(fn=cmd_register)
@@ -106,7 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("list"); sp.set_defaults(fn=cmd_list)
     sp = sub.add_parser("status"); sp.set_defaults(fn=cmd_status)
     sp = sub.add_parser("set-soft"); sp.add_argument("name"); sp.add_argument("n", type=int); sp.set_defaults(fn=cmd_set_soft)
-    sp = sub.add_parser("serve"); sp.set_defaults(fn=cmd_serve)
+    sp = sub.add_parser("serve")
+    sp.add_argument("--web", action="store_true", help="同时启动内嵌 Web 管理台（覆盖 settings.web.enabled）")
+    sp.add_argument("--no-web", dest="no_web", action="store_true", help="强制不启动管理台")
+    sp.set_defaults(fn=cmd_serve)
 
     args = p.parse_args(argv)
     return args.fn(args)

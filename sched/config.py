@@ -1,6 +1,7 @@
-"""scheduler_v002 路径常量与全局设置（独立于现有 scheduler，默认根 = /mnt/data01/projects/scheduler_v002）。
+"""sched 路径常量与全局设置。
 
-与现有实现保持协议面兼容：SCHED_HOME 环境变量可覆盖根目录，便于测试隔离。
+项目根（tasks/、data/ 的父目录）默认取本包所在目录的上一级——代码可整体 clone/搬迁到
+任意路径，无需改配置。SCHED_HOME 环境变量可覆盖根目录（多实例/测试隔离用）。
 """
 
 from __future__ import annotations
@@ -11,7 +12,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator
 
-DEFAULT_HOME = Path("/mnt/data01/projects/scheduler_v002")
+# sched/config.py -> sched/ -> 项目根
+DEFAULT_HOME = Path(__file__).resolve().parent.parent
 
 
 def home() -> Path:
@@ -89,10 +91,25 @@ class ResourceConfig(BaseModel):
     external_safety_margin_mb: int = 512
 
 
+class WebConfig(BaseModel):
+    # 内嵌管理台：serve 进程内起 uvicorn，所有写操作与同一个
+    # SchedulerService 实例（另开进程写 scheduler_state.json 会与 serve 内存态互相覆盖，故只允许内嵌）。
+    enabled: bool = False
+    host: str = "127.0.0.1"   # 默认仅本机；对外暴露必须配 auth_token（或显式风险开关，见下）
+    port: int = 8799
+    # HTTP Basic Auth 密码（用户名任意，只校验密码）。非空即对全部页面/接口启用。
+    # 管理台可在线改任务 .py 并注册执行（等同 RCE），绑非回环地址时必须配 token。
+    auth_token: str = ""
+    # 显式承认"无密码暴露公网"的风险开关：host 非回环且 auth_token 为空时，
+    # 必须显式置 true 才允许启动，防止改 host 后不知不觉裸奔。
+    allow_public_no_auth: bool = False
+
+
 class Settings(BaseModel):
     timezone: str = "Asia/Shanghai"
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     resource: ResourceConfig = Field(default_factory=ResourceConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
     max_log_mb: int = 32
     # 非 root 执行用户（v04 R31）；为空 = 以调度器运行用户直接执行
     run_user: str = "sched-run"

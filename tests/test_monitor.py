@@ -1,4 +1,4 @@
-from sched_v002 import monitor
+from sched import monitor
 
 
 def _obs(run_id, mem_est, mem_actual=None, age=0.0, manual=False, hb_timeout=None):

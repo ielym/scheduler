@@ -49,7 +49,7 @@ class RunningEntry:
 
 class SchedulerService:
     # 全部实例的弱引用集合：测试 fixture 在撤销 SCHED_HOME 前强制 join worker 线程，
-    # 防止 daemon 线程的异步持久化把测试数据写进生产 data/ 目录（第三轮审查 P2①）
+    # 防止 daemon 线程的异步持久化把测试数据写进生产 data/ 目录
     _instances: "weakref.WeakSet[SchedulerService]" = weakref.WeakSet()
 
     def __init__(self, settings: config.Settings | None = None):
@@ -72,10 +72,12 @@ class SchedulerService:
         self._lock = threading.RLock()
         self._stopping = threading.Event()
         self._loop_thread: threading.Thread | None = None
+        self._web_thread: threading.Thread | None = None
+        self._web_server = None
         self.started_at = ""
-        # 单实例锁（P2④）：防止同一 SCHED_HOME 双 serve 双跑任务
+        # 单实例锁：防止同一 SCHED_HOME 双 serve 双跑任务
         self._instance_lock_fd: int = -1
-        # 渐进式提交（R13）：有固定资源等待者且无运行中任务时，一次只准出 1 项，
+        # 渐进式提交：有固定资源等待者且无运行中任务时，一次只准出 1 项，
         # 观察其健康后才放开后续准出。
         self._staged_run_id: str | None = None
         self._staged_started_monotonic: float = 0.0
@@ -86,7 +88,7 @@ class SchedulerService:
         self.preempt_exempt_sec = float(self.settings.preempt_exempt_sec)
         # 数据风险（110）二刷上限：连续达上限仍 110 转人工
         self.data_risk_max_reschedules = int(self.settings.data_risk_max_reschedules)
-        # 软资源降额（R11）：窗口内软资源错误过多 → 临时降额，冷却后恢复
+        # 软资源降额：窗口内软资源错误过多 → 临时降额，冷却后恢复
         self._soft_degraded_until: dict[str, float] = {}
         self.soft_degrade_threshold = int(self.settings.soft_degrade_threshold)
         self.soft_degrade_window_sec = float(self.settings.soft_degrade_window_sec)
@@ -119,7 +121,7 @@ class SchedulerService:
         config.ensure_layout()
         if not self._acquire_instance_lock():
             raise RuntimeError("已有调度器实例在运行（runtime/scheduler.lock 被占用），拒绝双实例启动")
-        # P2⑥：cgroup 不可用时显式告警（防打爆只剩账本预估，无硬边界）
+        # cgroup 不可用时显式告警（防打爆只剩账本预估，无硬边界）
         if not cgroup.ensure_scheduler_subtree():
             log.warning("cgroup v2 不可用：任务无内存/CPU 硬边界，仅账本预估防打爆（降级运行）")
             persist.append_decision({"ts": runlog.now_iso(), "act": "cgroup_degraded",
@@ -129,14 +131,18 @@ class SchedulerService:
         self._reconcile()
         self._recover_interrupted()
         self.started_at = runlog.now_iso()
-        self._loop_thread = threading.Thread(target=self._loop, name="sched-v002-loop", daemon=True)
+        self._loop_thread = threading.Thread(target=self._loop, name="sched-loop", daemon=True)
         self._loop_thread.start()
+        # 内嵌管理台（settings.web.enabled 或 serve --web）；与调度循环共享本 service 实例
+        if getattr(self, "_web_enabled", False):
+            from . import web
+            self._web_thread = web.start_in_thread(self)
 
     def stop(self) -> None:
         self._stopping.set()
         if self._loop_thread:
             self._loop_thread.join(timeout=5)
-        # F7：优雅停机不直接 _finalize，而是对每个 worker 线程发 cancel → 等它自然收敛到
+        # 优雅停机不直接 _finalize，而是对每个 worker 线程发 cancel → 等它自然收敛到
         # worker 里的 _finalize（终态唯一定点）；只有超时才兜底。
         with self._lock:
             live_workers: list[tuple[str, threading.Thread]] = [
@@ -154,6 +160,9 @@ class SchedulerService:
                     pgid = getattr(re.spec, "pgid", None)
                     if pgid and runner.pgid_alive(int(pgid)):
                         runner.kill_process_group(int(pgid), self.settings.runner.kill_grace_sec)
+        if self._web_server is not None:
+            from . import web
+            web.stop_in_thread(self)
         persist.save_scheduler_state(self.state)
         persist.save_active(self._active_snapshot())
         self._release_instance_lock()
@@ -178,7 +187,7 @@ class SchedulerService:
         if not task_dir.is_dir():
             raise taskdoc.TaskDocError(f"任务目录不存在：{task_dir}")
         doc = taskdoc.load_task_doc(task_dir)
-        # P1-F：run_user 不存在时给出可操作的部署指引（而非闸门深处 SubprocessError）
+        # run_user 不存在时给出可操作的部署指引（而非闸门深处 SubprocessError）
         run_user = (doc.runtime.user or "") if doc.runtime else ""
         run_user = run_user or (self.settings.run_user or "")
         if run_user:
@@ -260,7 +269,7 @@ class SchedulerService:
         last_refresh = time.monotonic()
         while not self._stopping.wait(TICK_SEC):
             try:
-                # P1-C 热加载：周期性重读 jobs.json，serve 运行中注册/修改的任务即时生效
+                # 热加载：周期性重读 jobs.json，serve 运行中注册/修改的任务即时生效
                 # （engine.upsert 已保序，不会重置 interval 任务未到期的触发时刻）
                 if time.monotonic() - last_refresh >= max(1.0, float(self.settings.hot_reload_sec)):
                     self.refresh()
@@ -304,7 +313,7 @@ class SchedulerService:
     def _tick_admission(self) -> None:
         with self._lock:
             # 冷却/退避期任务留在 WQ 但不参与本轮扫描：
-            # 否则其虚拟占用会阻塞本轮其他任务，且每 tick 空转 pop/enqueue（N3）
+            # 否则其虚拟占用会阻塞本轮其他任务，且每 tick 空转 pop/enqueue
             items = [it for it in self.state.wq
                      if not self._in_cooldown(it["job_id"]) and not self._in_backoff(it["job_id"])]
         if not items:
@@ -323,7 +332,7 @@ class SchedulerService:
             external_mem_margin_mb=self.settings.resource.external_safety_margin_mb,
         )
         admitted = list(res.admitted)
-        # 渐进式提交（R13）：存在固定资源等待者时，冷启动一次只准出 1 项，
+        # 渐进式提交：存在固定资源等待者时，冷启动一次只准出 1 项，
         # 观察其健康（运行超过观察期且无资源错误/超限）后放开后续准出。
         with self._lock:
             running_cnt = len(self.running)
@@ -349,7 +358,7 @@ class SchedulerService:
             self._admit(rid)
 
     def _apply_soft_degrade(self) -> None:
-        """软资源降额（R11）：近期软资源错误过多 → 临时降额（下限 1），冷却后恢复原配额。"""
+        """软资源降额：近期软资源错误过多 → 临时降额（下限 1），冷却后恢复原配额。"""
         now = time.monotonic()
         for name, cap in list(self.state.soft_capacities.items()):
             degraded_until = self._soft_degraded_until.get(name)
@@ -383,7 +392,7 @@ class SchedulerService:
             self._finalize_stub(it, runlog.STATUS_FAILED, f"任务不可用：{e.error if e else '未注册'}")
             return
         doc = e.doc
-        # 并发上限（R12）：同 job 在途实例达 max_instances 时留在队列等待（不失效）
+        # 并发上限：同 job 在途实例达 max_instances 时留在队列等待（不失效）
         if self._instances_in_flight(it["job_id"]) >= doc.schedule.max_instances:
             with self._lock:
                 self.state.enqueue(it)
@@ -551,6 +560,11 @@ class SchedulerService:
             running = list(self.running.values())
         for re in running:
             st, age = self._read_task_state(Path(re.run["task_dir"]), re.run.get("run_id", ""))
+            if age >= 1e8:
+                # 从未读到 state.json（Python 冷启动/import 期尚未首次 flush）：
+                # 用进程存活年龄代替 1e9 哨兵——启动宽限等于完整心跳超时，
+                # 绝不能在准出当 tick 就把任务误杀（同 tick 内 admission→monitor 的固有竞态）。
+                age = max(0.0, time.monotonic() - re.started_monotonic)
             actual = self._cgroup_live_mem(re.cgroup_name)
             if actual is not None:
                 # 账本实测值刷新（cpu 速率不逐 tick 采样，仅内存；status 用于对账）
@@ -571,7 +585,7 @@ class SchedulerService:
             if re is None:
                 continue
             if act.kind == "heartbeat_kill":
-                # 心跳超时：cancel 前写入原因，终态按 interrupted 语义重入队一次（P1-G）
+                # 心跳超时：cancel 前写入原因，终态按 interrupted 语义重入队一次
                 re.spec.cancel_reason = act.reason
                 re.spec.cancel.set()
                 persist.append_decision({"ts": runlog.now_iso(), "act": "heartbeat_kill", "run_id": act.run_id,
@@ -624,7 +638,7 @@ class SchedulerService:
                                  window=self.settings.resource.window_samples)
             self.profiles.save()
 
-        # 软资源降额信号（R11）：软资源错误(101)计入错误率，供准出侧降额
+        # 软资源降额信号：软资源错误(101)计入错误率，供准出侧降额
         if status == runlog.STATUS_RESOURCE and rec.get("exit_code") == errors.EXIT_SOFT_RESOURCE:
             for name in re.soft:
                 self.monitor.record_soft_error(name)
@@ -669,16 +683,16 @@ class SchedulerService:
             self._requeue_resume(rec)
             return
         if status == runlog.STATUS_FAILED and rec.get("exit_code") == errors.EXIT_DATA_RISK:
-            # 数据风险（110）二刷闭环（R21）：跳过项已落 pending_skipped，
+            # 数据风险（110）二刷闭环：跳过项已落 pending_skipped，
             # 延迟重入队二刷；连续达上限仍 110 才转人工
             self._handle_data_risk(rec)
             return
         if status == runlog.STATUS_KILLED and self._stopping.is_set():
-            # F7：优雅停机导致的 killed 属服务中断而非任务失败 → 断点重入队，不转人工
+            # 优雅停机导致的 killed 属服务中断而非任务失败 → 断点重入队，不转人工
             self._requeue_resume(rec)
             return
         if status == runlog.STATUS_KILLED and "心跳超时" in (rec.get("error") or ""):
-            # P1-G：心跳超时误判（如长步骤未刷新状态）按 interrupted 语义重入队一次；
+            # 心跳超时误判（如长步骤未刷新状态）按 interrupted 语义重入队一次；
             # 连续两次心跳超时才转人工（真正卡死的任务不会无限循环）
             rounds = int(rec.get("hb_requeues") or 0)
             if rounds < 1:
@@ -698,7 +712,7 @@ class SchedulerService:
                         hb_requeues: int | None = None) -> dict:
         """重入队统一工厂：清空上轮运行痕迹（pid/日志/耗时/错误等），只保留调度语义字段。
 
-        P2⑨：原先各处理分支手工 dict(rec) 拷贝，error/stdout_log/wait_ms 等残留上轮失败痕迹。
+        原先各处理分支手工 dict(rec) 拷贝，error/stdout_log/wait_ms 等会残留上轮失败痕迹。
         """
         new_rec = dict(rec)
         new_rec["run_id"] = runlog.new_run_id()
@@ -746,9 +760,9 @@ class SchedulerService:
                                  "run_id": new_rec["run_id"], "job_id": jid, "round": rounds + 1})
 
     def _handle_retry(self, rec: dict, category: str) -> None:
-        """资源错误退避重试（R15/R16/R17/R20：退让而非扑杀）。
+        """资源错误退避重试（退让而非扑杀）。
 
-        P0-B：默认不再设重试次数上限——指数退避封顶 1h，任务在资源释放后自然获得
+        默认不再设重试次数上限——指数退避封顶 1h，任务在资源释放后自然获得
         准出（总目标：所有已提交任务最终都能被正确执行）。仅当运维显式配置
         settings.runner.max_resource_attempts > 0 时才封顶转人工（止损逃生舱）。
         """
@@ -801,7 +815,7 @@ class SchedulerService:
     def _reconcile(self) -> None:
         """崩溃恢复：清理上次在途 run（kill 进程组 + 落 interrupted），残留 WQ 保留。
 
-        被中断的运行写入 recover_queue，供 _recover_interrupted 重新入队（R20）。
+        被中断的运行写入 recover_queue，供 _recover_interrupted 重新入队。
         """
         prev = persist.load_active()
         now = runlog.now_iso()
@@ -813,7 +827,7 @@ class SchedulerService:
             task_dir = p.get("task_dir", "")
             if pgid and runner.pgid_alive(int(pgid)) and self._pid_belongs_to(p.get("pid"), task_dir):
                 runner.kill_process_group(int(pgid), self.settings.runner.kill_grace_sec)
-            # P3：清理上次运行遗留的 cgroup（含仍在组内的孤儿进程，经 cgroup.kill 安全终止）
+            # 清理上次运行遗留的 cgroup（含仍在组内的孤儿进程，经 cgroup.kill 安全终止）
             cg_name = p.get("cgroup_name") or f"{p.get('job_id')}/{p.get('run_id')}"
             if p.get("job_id") and p.get("run_id"):
                 try:
@@ -833,9 +847,9 @@ class SchedulerService:
         persist.save_recover_queue(recover)
 
     def _recover_interrupted(self) -> None:
-        """把重启前被中断（interrupted）且可恢复的任务重新入队（R20 崩溃恢复）。
+        """把重启前被中断（interrupted）且可恢复的任务重新入队（崩溃恢复）。
 
-        contract_exempt 任务不可断点恢复（R3：只手动触发），仅记录待人工，不自动入队。
+        contract_exempt 任务不可断点恢复（只手动触发），仅记录待人工，不自动入队。
         """
         queue = persist.load_recover_queue()
         if not queue:

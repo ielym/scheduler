@@ -102,7 +102,7 @@ def _spawn_bounded(doc: taskdoc.TaskDoc, task_dir: Path, run_id: str, env_extra:
 
 
 def _read_state(task_dir: Path, run_id: str = "") -> dict:
-    """读实例级状态并叠加任务级断点（F4 布局）。
+    """读实例级状态并叠加任务级断点（实例级 + 任务级两级布局）。
 
     实例级：cache/runs/<run_id>/state.json（回落 legacy cache/state.json）；
     resume_point 以 cache/resume_point.json 为准（任务级断点跨运行共享）。
@@ -132,7 +132,7 @@ def _read_state(task_dir: Path, run_id: str = "") -> dict:
 def _state_written_since(task_dir: Path, run_id: str, since_ts: float) -> bool:
     """run 开始后任务是否写过 state.json（实例级或 legacy 任一更新即算）。
 
-    P1-G 心跳契约：区分「只在 SCHED_CONTRACT_PROBE 环境写状态的伪契约任务」——
+    心跳契约：区分「只在 SCHED_CONTRACT_PROBE 环境写状态的伪契约任务」——
     这类任务正式运行期不写状态，120s 后会被 heartbeat_kill 且不可恢复。
     """
     candidates = [task_dir / "cache" / "runs" / run_id / "state.json",
@@ -219,7 +219,7 @@ class ContractGates:
             return GateResult("gate5_checkpoint", False,
                               f"打断后未按 99/抢占语义退出（exit={res1['exit_code']}, status={st1.get('status')}）",
                               {"run": res1, "state": st1})
-        # P1-G 运行期心跳契约：ckpt1 期间必须写过 state.json（SDK 由心跳线程保证；
+        # 运行期心跳契约：ckpt1 期间必须写过 state.json（SDK 由心跳线程保证；
         # 自研任务需在运行期产出状态），否则正式运行会在心跳超时后被杀且不可恢复
         if not _state_written_since(task_dir, "ckpt1", t_start):
             return GateResult("gate5_checkpoint", False,

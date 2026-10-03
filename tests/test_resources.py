@@ -1,4 +1,4 @@
-from sched_v002 import resources
+from sched import resources
 
 
 def test_profile_p95():
