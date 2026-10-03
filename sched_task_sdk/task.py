@@ -135,6 +135,28 @@ class SchedTask:
         self.state.flush()
         return self._exit(code)
 
+    # ---- 重试策略运行时声明（失败终态被调度器读取，合并 task.json 的 retry 段）----
+    def set_retry_hint(self, *, delay_sec: float | int | None = None,
+                       max_attempts: int | None = None,
+                       not_after: str | None = None) -> None:
+        """声明本次运行失败后调度器应如何重试（只在以可恢复错误退出时生效）。
+
+        - delay_sec：再次准出前的最小间隔；任务内部已就地重试过、需要节奏时用。
+        - max_attempts：尝试上限（0=不放弃）。
+        - not_after：时效截止（ISO8601 或每日 HH:MM），过期后不再自动重试——
+          典型场景：盘中实时任务到收盘后重跑已无意义。
+        传 None 的字段保持已有声明（task.json 或本 run 早前的设置）不变。
+        """
+        hint = dict(self.state.retry_hint or {})
+        if delay_sec is not None:
+            hint["delay_sec"] = max(0.0, float(delay_sec))
+        if max_attempts is not None:
+            hint["max_attempts"] = max(0, int(max_attempts))
+        if not_after is not None:
+            hint["not_after"] = str(not_after)
+        self.state.retry_hint = hint
+        self.state.flush()
+
     # ---- 错误分类辅助 ----
     def fail(self, message: str, category: str | None = None) -> int:
         cat = category or logic()

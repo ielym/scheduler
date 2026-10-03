@@ -2,16 +2,22 @@
 
 运行模型：
 - 自动准入：tasks/ 下出现新任务目录即由后台线程串行跑五道闸（dry、无副作用），
-  通过自动纳入调度；失败记录原因并在任务文件修改/冷却到期后自动重试，全程无需手动注册。
+  通过自动纳入调度；失败记录原因，仅在任务文件被修改后重试（不定时自动重查：
+  失败任务由创建者本地改好/删除后重提），全程无需手动注册。
 - WQ 所有待运行任务先入全局队列（持久化在 scheduler_state.json）。
-- 准出 tick：按双轨排序扫描，固定资源（CPU/内存）账本允许即准出，spawn runner 线程。
+- 准出 tick：按 优先级 → SJF（画像预估时长，短作业优先）→ FIFO 排序扫描，
+  固定资源（CPU/内存）账本允许即准出，spawn runner 线程。
 - 抢占 tick：高优等固定资源时，选最低优先者发 preempt 事件 → runner SIGTERM → 任务 exit 99。
-- 监测 tick：心跳超时/超限退让。
-- finalize：唯一定点收敛终态，释放账本、记录画像、（中断/资源/抢占）触发恢复或退避重试。
+- 监测 tick：心跳超时/超限退让；运行中动态更新资源画像（内存/CPU/时长预估）。
+- finalize：唯一定点收敛终态，释放账本、记录画像、（中断/资源/抢占）按任务自治
+  retry 策略决定重排队或转人工。
 
-代理并发/API 配额等外部资源不做静态容量池（调度器无法感知跨账号、跨机器的真实占用）：
-任务遇到这类问题时以退出码 100/101 报错，调度器按错误码指数退避重试，
-配合冷启动的渐进式提交（一次只放 1 项观察健康）动态避让。
+重试语义（任务自治，调度器不设全局冷却/退避/重试上限）：
+- 固定资源不足：任务留在 WQ 排队，等其它任务释放资源后自然获得准出。
+- 外部资源抖动（代理断连、限流等，exit 100/101）：任务先在进程内就地重试；
+  仍失败则退出，调度器默认立即重排队，节奏由 task.json 的 retry.delay_sec 声明。
+- 时效性（如收盘后重跑无意义）：任务经 task.json retry.not_after 或运行时
+  SDK set_retry_hint() 声明截止时刻，过期不再自动重试。
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import (admission, cgroup, config, contract, errors, monitor, persist, preempt,
-               registry, resources, runlog, runner, taskdoc)
+               registry, resources, runlog, runner, store, taskdoc)
 from . import engine as _engine_mod
 from .engine import TriggerEngine
 
@@ -50,6 +56,12 @@ class RunningEntry:
     cgroup_name: str = ""
     started_monotonic: float = 0.0
     exempt_until_monotonic: float = 0.0
+    # 运行中动态画像采样（CPU 速率 EMA，单位核；内存取 cgroup memory.current）
+    prev_cpu_usec: int = 0
+    prev_cpu_monotonic: float = 0.0
+    live_cpu_cores: float = 0.0
+    live_mem_mb: int = 0
+    last_profile_rec_monotonic: float = 0.0
 
 
 class SchedulerService:
@@ -92,9 +104,11 @@ class SchedulerService:
         self.preempt_exempt_sec = float(self.settings.preempt_exempt_sec)
         # 数据风险（110）二刷上限：连续达上限仍 110 转人工
         self.data_risk_max_reschedules = int(self.settings.data_risk_max_reschedules)
+        # 运行中动态画像采样/落盘节流间隔（引擎内部参数，不进管理台）
+        self.profile_live_interval_sec = max(5.0, float(self.settings.resource.profile_live_interval_sec))
+        self._last_profile_save_monotonic = 0.0
         # 自动准入：发现 tasks/ 下未注册任务 → 后台串行跑五闸 → 通过即纳入调度；
-        # 失败记录原因，任务文件变更或冷却到期后自动重试
-        self.admission_retry_sec = float(self.settings.auto_admit_retry_sec)
+        # 失败记录原因，仅在任务文件被修改后重试（不定时自动重查）
         self._admission: dict[str, dict] = persist.load_admission_state()
         self._admission_lock = threading.Lock()
         self._admission_current: str | None = None
@@ -225,20 +239,6 @@ class SchedulerService:
                     self.engine.upsert(jid, e.schedule())
         return {"jobs": len(entries), "ok": sum(1 for e in entries.values() if e.ok)}
 
-    def apply_settings(self, new_settings: config.Settings) -> None:
-        """管理台热更新设置：替换设置对象并同步派生状态，无需重启 serve。
-
-        只暴露用户可感知的少数参数（时区/成功冷却/资源退避/重试上限/准入重试间隔）；
-        web 端口、cgroup 系数等内部参数不走此通道。
-        """
-        with self._lock:
-            self.settings = new_settings
-            self.engine._tz = ZoneInfo(new_settings.timezone)
-            self.preempt_exempt_sec = float(new_settings.preempt_exempt_sec)
-            self.data_risk_max_reschedules = int(new_settings.data_risk_max_reschedules)
-            self.admission_retry_sec = float(new_settings.auto_admit_retry_sec)
-            self.staged_observe_sec = max(2.0, 2.0 * new_settings.resource.sample_interval_sec)
-
     def register_job(self, name: str) -> dict:
         taskdoc.validate_task_id(name)
         task_dir = config.tasks_dir() / name
@@ -288,7 +288,7 @@ class SchedulerService:
                 os.chown(os.path.join(root, name), uid, gid, follow_symlinks=False)
 
     def admission_snapshot(self) -> dict[str, dict]:
-        """未注册任务的自动准入状态（检查中/失败原因/下次重试），供管理台展示。"""
+        """未注册任务的自动准入状态（检查中/失败原因/文件指纹），供管理台展示。"""
         with self._admission_lock:
             snap = {k: dict(v) for k, v in self._admission.items()}
         current = self._admission_current
@@ -323,15 +323,13 @@ class SchedulerService:
                 if d.is_dir() and (d / "task.json").is_file() and d.name not in registered]
 
     def _admission_due(self, rec: dict, name: str) -> bool:
-        """失败记录是否可以重试：任务文件改动后立即重试，否则等冷却到期。"""
+        """失败任务是否允许重检：只看任务文件是否被修改（不做定时自动重试）。
+
+        准入失败说明任务未达到生产级，应由创建者本地改好/删除后重提；
+        调度器无法区分"刚提交"与"早就失败"，定时重试没有意义。
+        """
         fp = self._task_fingerprint(config.tasks_dir() / name)
-        if fp and fp != int(rec.get("fingerprint") or 0):
-            return True
-        after = rec.get("next_check_after") or ""
-        try:
-            return datetime.now().astimezone() >= datetime.fromisoformat(after)
-        except ValueError:
-            return True
+        return bool(fp) and fp != int(rec.get("fingerprint") or 0)
 
     def _kick_auto_admission(self) -> None:
         """挑选一个待准入任务，后台串行跑五闸；同一时刻只有一个检查在跑。"""
@@ -366,19 +364,16 @@ class SchedulerService:
     def _auto_admit_worker(self, name: str) -> None:
         try:
             self.register_job(name)
-        except Exception as exc:  # 准入失败不允许炸掉后台线程：记录原因，冷却后/改完文件自动重试
+        except Exception as exc:  # 准入失败不允许炸掉后台线程：记录原因，改完文件才重试
             reason = self._admission_error_text(exc)
             with self._admission_lock:
                 prev = self._admission.get(name) or {}
                 attempts = int(prev.get("attempts") or 0) + 1
-                not_before = (datetime.now().astimezone()
-                              + timedelta(seconds=self.admission_retry_sec)).isoformat(timespec="seconds")
                 self._admission[name] = {
                     "status": "failed",
                     "reason": reason,
                     "attempts": attempts,
                     "last_check": runlog.now_iso(),
-                    "next_check_after": not_before,
                     "fingerprint": self._task_fingerprint(config.tasks_dir() / name),
                 }
                 persist.save_admission_state(self._admission)
@@ -441,6 +436,7 @@ class SchedulerService:
             "state_snapshot": {},
             "error": "",
             "resume_point_ref": resume_ref,
+            "not_before": "",
             "manual": trigger == "manual",
             "contract_exempt": bool(doc.contract_exempt),
         }
@@ -451,6 +447,157 @@ class SchedulerService:
             persist.append_decision({"ts": runlog.now_iso(), "act": "enqueue", "run_id": run_id,
                                      "job_id": e.job_id, "priority": priority, "trigger": trigger})
         return rec
+
+    # ================= 运行中停止 / 调度参数在线编辑（管理台写操作） =================
+    def stop_run(self, run_id: str, reason: str = "管理员手动停止") -> dict:
+        """请求停止一个运行中的 run：走 cancel Event → runner 轮询到后 SIGTERM 整组。
+
+        终态 killed 在 _after_finalize 中既非停机也非心跳超时 → 转人工，不自动重入队。
+        """
+        with self._lock:
+            re = self.running.get(run_id)
+        if re is None:
+            raise KeyError(run_id)
+        re.spec.cancel_reason = reason
+        re.spec.cancel.set()
+        persist.append_decision({"ts": runlog.now_iso(), "act": "manual_cancel", "run_id": run_id,
+                                 "job_id": re.run.get("job_id"), "reason": reason})
+        return {"run_id": run_id, "job_id": re.run.get("job_id")}
+
+    # 允许在管理台编辑的"纯调度参数"白名单（与业务代码无关，改完立即生效）
+    _JOB_CONFIG_KEYS = {"priority", "schedule", "heartbeat", "retry"}
+    _JOB_CONFIG_SUBKEYS = {
+        "heartbeat": {"timeout_sec"},
+        "retry": {"delay_sec", "max_attempts", "not_after"},
+    }
+
+    def update_job_config(self, job_id: str, patch: dict) -> dict:
+        """只改 task.json 中的纯调度参数（priority/schedule/heartbeat/retry）并立即生效。
+
+        入口/资源/env/error_rules 等一律拒绝（任务代码修改走"停用-本地改-启用"流程）。
+        返回生效后的调度参数。
+        """
+        import json
+
+        if not isinstance(patch, dict) or not patch:
+            raise taskdoc.TaskDocError("没有要修改的参数")
+        bad = [k for k in patch if k not in self._JOB_CONFIG_KEYS]
+        if bad:
+            raise taskdoc.TaskDocError(f"不允许在管理台修改的字段：{bad}（仅允许 priority/schedule/heartbeat/retry）")
+        for parent, allowed in self._JOB_CONFIG_SUBKEYS.items():
+            if parent in patch:
+                if not isinstance(patch[parent], dict):
+                    raise taskdoc.TaskDocError(f"{parent} 必须是对象")
+                extra = set(patch[parent]) - allowed
+                if extra:
+                    raise taskdoc.TaskDocError(f"{parent} 中不允许修改的字段：{sorted(extra)}")
+        if "schedule" in patch:
+            if not isinstance(patch["schedule"], dict):
+                raise taskdoc.TaskDocError("schedule 必须是对象")
+            extra = set(patch["schedule"]) - set(taskdoc.ScheduleSpec.model_fields)
+            if extra:
+                raise taskdoc.TaskDocError(f"schedule 中不允许修改的字段：{sorted(extra)}")
+
+        e = self.entries.get(job_id)
+        if e is None or not e.task_dir.is_dir():
+            raise taskdoc.TaskDocError(f"任务未注册或目录不存在：{job_id}")
+        tj_path = e.task_dir / "task.json"
+        if not tj_path.is_file():
+            raise taskdoc.TaskDocError(f"缺少 task.json：{tj_path}")
+        try:
+            raw = json.loads(store.read_text(tj_path))
+        except json.JSONDecodeError as exc:
+            raise taskdoc.TaskDocError(f"task.json 不是合法 JSON：{exc}") from exc
+        if not isinstance(raw, dict):
+            raise taskdoc.TaskDocError("task.json 顶层必须是对象")
+
+        st_owner = tj_path.stat()
+        for k, v in patch.items():
+            if isinstance(v, dict) and isinstance(raw.get(k), dict):
+                raw[k] = {**raw[k], **v}
+            else:
+                raw[k] = v
+        # 写盘前完整校验（schema + 入口/路径），拒绝把任务改成不可用状态
+        doc = taskdoc.parse_task_json(raw, e.task_dir)
+        store.write_text_atomic(tj_path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(tj_path, 0o644)
+        try:  # 保持原属主（serve root 原子替换后文件会变 root 属主）
+            os.chown(tj_path, st_owner.st_uid, st_owner.st_gid)
+        except OSError:
+            pass
+
+        # 立即生效：重载注册表 + 强制按新 schedule 重置下次触发（不用 upsert 保序）
+        self.refresh()
+        self.engine.remove(job_id)
+        e2 = self.entries.get(job_id)
+        if e2 is not None and e2.ok and e2.enabled and not doc.contract_exempt:
+            self.engine.upsert(job_id, e2.schedule())
+        # 已在 WQ 等待的同任务项：优先级立即改（其余参数只影响后续新触发）
+        with self._lock:
+            changed = False
+            for it in self.state.wq:
+                if it.get("job_id") == job_id and int(it.get("priority") or 0) != doc.priority:
+                    it["priority"] = doc.priority
+                    changed = True
+            if changed:
+                persist.save_scheduler_state(self.state)
+        persist.append_decision({"ts": runlog.now_iso(), "act": "web_update_job_config",
+                                 "job_id": job_id, "fields": sorted(patch)})
+        return self._job_config_view(job_id)
+
+    def _job_config_view(self, job_id: str) -> dict:
+        e = self.entries.get(job_id)
+        if e is None or not e.ok or e.doc is None:
+            raise taskdoc.TaskDocError(f"任务不可用：{job_id}")
+        d = e.doc
+        return {
+            "job_id": job_id,
+            "priority": d.priority,
+            "schedule": d.schedule.model_dump(),
+            "heartbeat": {"timeout_sec": d.heartbeat.timeout_sec},
+            "retry": d.retry.model_dump(),
+        }
+
+    def delete_run(self, job_id: str, run_id: str, delete_files: bool = False) -> dict:
+        """删除一条历史 run 记录（data/runs/<job>.jsonl 中对应行）。
+
+        delete_files=True 时同步删除本地详情日志
+        data/runs/<job>/<run_id>.stdout.log|stderr.log；不删 state/cache/results。
+        运行中的 run 不允许删除（终态落盘会重新出现）。
+        """
+        import json
+
+        with self._lock:
+            running = run_id in self.running
+        if running:
+            raise RuntimeError("该 run 正在运行，请先停止再删除历史")
+        path = runlog.run_log_path(job_id)
+        removed = False
+        if path.is_file():
+            kept = []
+            for rec in store.iter_jsonl(path):
+                if rec.get("run_id") == run_id:
+                    removed = True
+                    continue
+                kept.append(rec)
+            if removed:
+                lines = [json.dumps(r, ensure_ascii=False) for r in kept]
+                store.write_text_atomic(path, ("\n".join(lines) + "\n") if lines else "")
+        if not removed:
+            raise KeyError(run_id)
+        deleted_logs = []
+        if delete_files:
+            for p in (runlog.stdout_path(job_id, run_id), runlog.stderr_path(job_id, run_id)):
+                try:
+                    p.unlink()
+                    deleted_logs.append(p.name)
+                except FileNotFoundError:
+                    pass
+        persist.append_decision({"ts": runlog.now_iso(), "act": "web_delete_run",
+                                 "job_id": job_id, "run_id": run_id,
+                                 "delete_files": delete_files, "deleted_logs": deleted_logs})
+        return {"ok": True, "job_id": job_id, "run_id": run_id,
+                "delete_files": delete_files, "deleted_logs": deleted_logs}
 
     # ================= 主循环 =================
     def _loop(self) -> None:
@@ -503,14 +650,15 @@ class SchedulerService:
         # 每轮准出前收口运行期可能产生的同 job 重复等待项（无重复时零开销）
         self._dedupe_wq()
         with self._lock:
-            # 冷却/退避期任务留在 WQ 但不参与本轮扫描：
+            # 任务自治重试间隔（retry.delay_sec）未到的等待项留在 WQ 但不参与本轮扫描：
             # 否则其虚拟占用会阻塞本轮其他任务，且每 tick 空转 pop/enqueue
-            items = [it for it in self.state.wq
-                     if not self._in_cooldown(it["job_id"]) and not self._in_backoff(it["job_id"])]
+            items = [it for it in self.state.wq if not self._not_before_pending(it)]
         if not items:
             self._staged_run_id = None
             return
-        ordered = admission.order_waiting(items, self.settings.starvation_sec, runlog.now_iso())
+        ordered = admission.order_waiting(
+            items, self.settings.starvation_sec, runlog.now_iso(),
+            get_duration_sec=self.profiles.estimate_duration_sec)
         res = admission.admission_scan(
             ordered,
             get_declared=lambda jid: self._declared(jid),
@@ -551,8 +699,8 @@ class SchedulerService:
             it = self.state.pop_run(run_id)
         if it is None:
             return
-        if self._in_cooldown(it["job_id"]) or self._in_backoff(it["job_id"]):
-            # 冷却/退避期内不重新准出，放回队列
+        if self._not_before_pending(it):
+            # 任务自治重试间隔未到，放回队列
             with self._lock:
                 self.state.enqueue(it)
             return
@@ -607,7 +755,8 @@ class SchedulerService:
         it["_started_monotonic"] = time.monotonic()
         re = RunningEntry(run=it, spec=spec, est_cpu=est_cpu, est_mem_mb=est_mem,
                           cgroup_name=cgroup_name, started_monotonic=it["_started_monotonic"],
-                          exempt_until_monotonic=float(it.get("_exempt_until_monotonic") or 0.0))
+                          exempt_until_monotonic=float(it.get("_exempt_until_monotonic") or 0.0),
+                          last_profile_rec_monotonic=it["_started_monotonic"])
         re.thread = threading.Thread(target=self._run_worker, args=(re,), name=f"run-{run_id}", daemon=True)
         with self._lock:
             self.running[run_id] = re
@@ -722,6 +871,9 @@ class SchedulerService:
             if actual is not None:
                 # 账本实测值刷新（cpu 速率不逐 tick 采样，仅内存；status 用于对账）
                 self.ledger.set_actual(re.run["run_id"], 0.0, actual)
+                re.live_mem_mb = actual
+            self._sample_live_cpu(re)
+            self._maybe_record_live_profile(re)
             e = self.entries.get(re.run["job_id"])
             hb_timeout = None
             if e is not None and e.doc is not None:
@@ -781,12 +933,15 @@ class SchedulerService:
         # 画像更新：正式 run（非 dry）采样本。
         # CPU 样本必须是「平均核数」（cpu_sec / 时长），而非累计 CPU-秒——
         # 否则长任务样本被当作核数，预估膨胀致永久饥饿。
+        # 时长样本只取成功 run（失败/抢占的耗时是残缺值，不能代表作业长度），
+        # 供同优先级 SJF 排序使用。
         if not rec.get("dry_run") and mem_peak_mb > 0:
             duration_sec = max(1, int((rec.get("duration_ms") or 0) / 1000))
             avg_cpu_cores = round(cpu_sec / duration_sec, 3)
             self.profiles.record(rec["job_id"], avg_cpu_cores, mem_peak_mb,
                                  *self._declared(rec["job_id"]),
-                                 window=self.settings.resource.window_samples)
+                                 window=self.settings.resource.window_samples,
+                                 duration_sec=(duration_sec if status == runlog.STATUS_SUCCESS else None))
             self.profiles.save()
 
         # 渐进式提交：观察项以资源错误/超限终结 → 门禁重置
@@ -815,10 +970,10 @@ class SchedulerService:
     def _after_finalize(self, rec: dict, status: str) -> None:
         jid = rec["job_id"]
         if status == runlog.STATUS_SUCCESS:
-            self._set_cooldown(jid, self.settings.runner.cooldown_sec)
+            # 不再有"成功冷却"：何时再跑由任务 schedule（interval/时间窗）决定；
+            # 需要纠错/回扫节奏的任务自行配置 schedule 或 retry 策略
             return
         if status == runlog.STATUS_PREEMPTED:
-            self._set_cooldown(jid, self.settings.runner.cooldown_sec)
             self._requeue_resume(rec, exempt_sec=self.preempt_exempt_sec)
             return
         if status == runlog.STATUS_RESOURCE:
@@ -855,7 +1010,7 @@ class SchedulerService:
 
     def _new_run_record(self, rec: dict, trigger: str | None = None, attempt: int | None = None,
                         resume_ref: bool = False, data_risk_rounds: int | None = None,
-                        hb_requeues: int | None = None) -> dict:
+                        hb_requeues: int | None = None, not_before: str = "") -> dict:
         """重入队统一工厂：清空上轮运行痕迹（pid/日志/耗时/错误等），只保留调度语义字段。
 
         原先各处理分支手工 dict(rec) 拷贝，error/stdout_log/wait_ms 等会残留上轮失败痕迹。
@@ -878,6 +1033,7 @@ class SchedulerService:
         new_rec["wait_ms"] = 0
         new_rec["duration_ms"] = 0
         new_rec["resume_point_ref"] = resume_ref
+        new_rec["not_before"] = not_before
         new_rec.pop("_started_monotonic", None)
         new_rec.pop("_exempt_until_monotonic", None)
         if trigger is not None:
@@ -906,31 +1062,46 @@ class SchedulerService:
                                  "run_id": new_rec["run_id"], "job_id": jid, "round": rounds + 1})
 
     def _handle_retry(self, rec: dict, category: str) -> None:
-        """资源错误退避重试（退让而非扑杀）。
+        """可恢复失败（资源错误 100/101、未分类兜底）后的重排队——任务自治重试策略。
 
-        默认不再设重试次数上限——指数退避封顶 1h，任务在资源释放后自然获得
-        准出（总目标：所有已提交任务最终都能被正确执行）。仅当运维显式配置
-        settings.runner.max_resource_attempts > 0 时才封顶转人工（止损逃生舱）。
+        - 无全局退避/冷却/重试上限：固定资源不足时任务留在 WQ 排队，等其它任务释放
+          资源后下一轮自然准出（默认立即重排队，delay_sec=0）。
+        - retry.delay_sec：任务声明的重试节奏（纠错/回扫/外部资源需要缓口气时）。
+        - retry.max_attempts：0=不放弃（默认，有资源必须跑完）；正整数为尝试上限。
+        - retry.not_after（静态或运行时 retry_hint）：时效性截止，过期转人工。
         """
         jid = rec["job_id"]
         attempts = int(rec.get("attempt") or 1)
-        max_attempts = int(self.settings.runner.max_resource_attempts)
+        e = self.entries.get(jid)
+        doc = e.doc if e is not None and e.ok else None
+        now = datetime.now().astimezone()
+        pol = taskdoc.resolve_retry(doc, rec.get("state_snapshot"), now)
+
+        max_attempts = int(pol["max_attempts"])
         if max_attempts > 0 and attempts >= max_attempts:
             persist.append_decision({"ts": runlog.now_iso(), "act": "giveup", "run_id": rec["run_id"],
                                      "job_id": jid,
-                                     "reason": f"资源错误已达配置上限 {max_attempts} 次（max_resource_attempts），转人工"})
+                                     "reason": f"已达任务声明的重试上限 {max_attempts} 次"
+                                               f"（task.json retry.max_attempts），转人工"})
             return
-        base = max(1, int(self.settings.runner.resource_backoff_base_sec))
-        cap = max(base, int(self.settings.runner.resource_backoff_cap_sec))
-        backoff = min(base * (2 ** min(attempts - 1, 20)), cap)
-        not_before = (datetime.now().astimezone() + timedelta(seconds=backoff)).isoformat(timespec="seconds")
-        new_rec = self._new_run_record(rec, attempt=attempts + 1, resume_ref=False)
-        self.state.backoffs[jid] = {"not_before": not_before, "attempts": attempts}
+        deadline = pol["deadline"]
+        if deadline is not None and now >= deadline:
+            persist.append_decision({"ts": runlog.now_iso(), "act": "giveup_expired", "run_id": rec["run_id"],
+                                     "job_id": jid,
+                                     "reason": f"已过任务声明的重试时效截止 {pol['not_after']}"
+                                               f"（retry.not_after），不再自动重试，转人工"})
+            return
+
+        delay = max(0.0, float(pol["delay_sec"]))
+        not_before = (now + timedelta(seconds=delay)).isoformat(timespec="seconds") if delay > 0 else ""
+        new_rec = self._new_run_record(rec, attempt=attempts + 1, resume_ref=False,
+                                       not_before=not_before)
         with self._lock:
             self.state.enqueue(new_rec)
         persist.save_scheduler_state(self.state)
         persist.append_decision({"ts": runlog.now_iso(), "act": "retry_enqueue", "run_id": new_rec["run_id"],
-                                 "job_id": jid, "attempt": attempts + 1, "backoff_sec": backoff})
+                                 "job_id": jid, "attempt": attempts + 1,
+                                 "delay_sec": round(delay, 3), "category": category})
 
     def _requeue_resume(self, rec: dict, exempt_sec: float = 0.0) -> None:
         jid = rec["job_id"]
@@ -1075,25 +1246,44 @@ class SchedulerService:
         cur = c.read_current_mem()
         return (cur // (1024 * 1024)) if cur is not None else None
 
-    def _set_cooldown(self, job_id: str, sec: int) -> None:
-        self.state.cooldowns[job_id] = (datetime.now().astimezone() + timedelta(seconds=sec)).isoformat(timespec="seconds")
-        persist.save_scheduler_state(self.state)
+    def _cgroup_cpu_usec(self, name: str) -> int | None:
+        return cgroup.Cgroup(name).read_cpu_usage_usec()
 
-    def _in_cooldown(self, job_id: str) -> bool:
-        until = self.state.cooldowns.get(job_id)
-        if not until:
+    def _sample_live_cpu(self, re: RunningEntry) -> None:
+        """按相邻两次 cgroup cpu.stat 差值算瞬时 CPU 核数，EMA 平滑后挂在 RunningEntry 上。"""
+        usec = self._cgroup_cpu_usec(re.cgroup_name)
+        now_mono = time.monotonic()
+        if usec is None:
+            return
+        if re.prev_cpu_monotonic > 0 and usec >= re.prev_cpu_usec:
+            dt = max(1e-6, now_mono - re.prev_cpu_monotonic)
+            inst = (usec - re.prev_cpu_usec) / 1_000_000.0 / dt
+            re.live_cpu_cores = inst if re.live_cpu_cores <= 0 else 0.7 * re.live_cpu_cores + 0.3 * inst
+        re.prev_cpu_usec, re.prev_cpu_monotonic = usec, now_mono
+
+    def _maybe_record_live_profile(self, re: RunningEntry) -> None:
+        """运行中周期性把实测 CPU/内存落入画像滑窗并节流落盘（画像动态更新，非终态一锤子）。"""
+        now_mono = time.monotonic()
+        if now_mono - re.last_profile_rec_monotonic < self.profile_live_interval_sec:
+            return
+        if re.live_mem_mb <= 0 and re.live_cpu_cores <= 0:
+            return
+        re.last_profile_rec_monotonic = now_mono
+        jid = re.run["job_id"]
+        self.profiles.record_live(jid, round(re.live_cpu_cores, 3), re.live_mem_mb,
+                                  *self._declared(jid), window=self.settings.resource.window_samples)
+        if now_mono - self._last_profile_save_monotonic >= self.profile_live_interval_sec:
+            self._last_profile_save_monotonic = now_mono
+            self.profiles.save()
+
+    @staticmethod
+    def _not_before_pending(it: dict) -> bool:
+        """任务自治重试间隔（retry.delay_sec）是否未到。"""
+        nb = it.get("not_before") or ""
+        if not nb:
             return False
         try:
-            return datetime.now().astimezone() < datetime.fromisoformat(until)
-        except ValueError:
-            return False
-
-    def _in_backoff(self, job_id: str) -> bool:
-        b = self.state.backoffs.get(job_id)
-        if not b:
-            return False
-        try:
-            return datetime.now().astimezone() < datetime.fromisoformat(b.get("not_before") or "")
+            return datetime.now().astimezone() < datetime.fromisoformat(nb)
         except ValueError:
             return False
 
@@ -1123,6 +1313,9 @@ class SchedulerService:
                 "ok": e.ok, "error": e.error, "enabled": e.enabled,
                 "schedule": e.schedule(), "priority": e.doc.priority if e.doc else 0,
                 "next_run_at": self.engine.next_run_time(e.job_id),
+                "heartbeat_timeout_sec": e.doc.heartbeat.timeout_sec if e.doc else None,
+                "retry": e.doc.retry.model_dump() if e.doc else None,
+                "estimate_duration_sec": self.profiles.estimate_duration_sec(e.job_id),
             })
         return out
 

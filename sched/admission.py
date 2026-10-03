@@ -1,16 +1,19 @@
 """L2 引擎 · 全局队列排序 + 准出（admission）扫描。
 
-- 双轨制：base 轨道管严格性（priority 降序）；field 轨道管同层 FIFO（enqueued_at 升序）。
-- 饿死看门狗：等待超过阈值者临时提权，避免高优洪峰永久饿死低优（兜底退让，不兜底杀）。
-- 见缝插针：准出是全局扫描，高优等固定资源时，能塞进缝隙的低优仍可先跑（需求 2.2.3）。
+- 双轨制：base 轨道管严格性（priority 降序，饿死看门狗临时提权）；
+  field 轨道管同层次序：先按画像预估运行时长做 SJF（短作业优先，100 个 1s
+  的任务排在 1 个 5 天任务之前），时长相同/未知再按 enqueued_at 升序 FIFO。
+- 见缝插针：准出是全局扫描，高优等固定资源时，能塞进缝隙的低优仍可先跑。
 - 首个任务因固定资源不足：等待并尝试其它任务。
 - 代理/配额等调度器无法感知真实容量的外部资源不参与准出判定：任务以 100/101
-  报错后按错误码退避重试，配合渐进式提交动态避让。
+  报错后按任务自治 retry 策略（task.json retry 段）立即或延时重排队，调度器
+  不做全局退避。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from . import resources
 
@@ -22,25 +25,33 @@ class AdmissionResult:
     reasons: dict[str, str]       # run_id -> 未准出原因
 
 
-def order_waiting(items: list[dict], starvation_sec: float, now_iso: str) -> list[dict]:
-    """双轨排序：priority 降序 → 同层 enqueued_at 升序；饿死看门狗临时提权。
+def order_waiting(items: list[dict], starvation_sec: float, now_iso: str,
+                  get_duration_sec: Callable[[str], float | None] | None = None) -> list[dict]:
+    """排序：饿死提权 > priority 降序 > 同优先级 SJF（预估时长升序）> FIFO。
 
     enqueued_at 为带时区 ISO 串（按字典序即时间序）；等待时长用 wall-clock 差值估，
-    跨重启安全（不依赖 monotonic 基准）。
+    跨重启安全（不依赖 monotonic 基准）。无历史时长样本的任务按 +inf 处理
+    （未知=可能很长，排在已知短作业之后），彼此间仍按 FIFO。
     """
     from .runlog import _iso_seconds_between  # 延迟导入避免环
 
     def _waited(enqueued: str) -> float:
         return _iso_seconds_between(enqueued, now_iso)
 
-    def _rank(it: dict) -> tuple[int, str]:
+    def _rank(it: dict) -> tuple[int, float, str]:
         pri = int(it.get("priority") or 0)
         enq = it.get("enqueued_at") or ""
         if _waited(enq) >= starvation_sec:
             # 饿死看门狗提权钳制在值域 0~100 之上 1 级（=101）：
             # 保证优先于普通排队，又不越界到天级别
             pri = 101
-        return (-pri, enq)
+        dur = None
+        if get_duration_sec is not None:
+            try:
+                dur = get_duration_sec(str(it.get("job_id") or ""))
+            except Exception:
+                dur = None
+        return (-pri, float(dur) if dur is not None else float("inf"), enq)
 
     return sorted(items, key=_rank)
 

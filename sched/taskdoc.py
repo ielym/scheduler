@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -135,6 +136,57 @@ class SmokeSpec(BaseModel):
     signal_after_sec: float = 1.5  # 断点闸首次运行后多久发 SIGTERM（重导入任务可调大）
 
 
+# 重试时效截止允许的两种写法：
+#   1) ISO8601 绝对时间：2026-10-04T15:00:00+08:00
+#   2) 每日时刻：HH:MM 或 HH:MM:SS（按调度时区解释，"每天此刻之后不再自动重试"）
+NOT_AFTER_DAILY_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
+
+
+class RetrySpec(BaseModel):
+    """任务自治的可恢复失败重试策略（资源错误 100/101、未分类、超时、中断后自动重排队）。
+
+    调度器不设全局冷却/退避/重试上限：资源不足时任务在 WQ 排队，等其它任务释放
+    固定资源后自然获得准出；是否重试、重试节奏、何时因时效性放弃，一律由任务声明。
+    """
+
+    # 自动重入队后最早可再次准出的间隔（秒）。0 = 立即重排队（默认：固定资源不足靠
+    # 队列排队即可，任务内部的就地重试/换连接由任务自己在进程内完成）。
+    delay_sec: float = 0.0
+    # 最大尝试次数（含首次）：0 = 不放弃（默认，有资源必须跑完）；
+    # 正整数 N = 第 N 次仍失败则转人工。新计划触发（interval/once/手动）的 run 计数重置。
+    max_attempts: int = 0
+    # 时效性截止：超过该时刻后不再自动重试（转人工），防止收盘后/过期后无意义空跑。
+    # 空串 = 不设时效；支持 ISO8601 绝对时间或每日 HH:MM（每日时刻按调度时区解释）。
+    not_after: str = ""
+
+    @field_validator("delay_sec")
+    @classmethod
+    def _delay_ok(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("retry.delay_sec 不能为负")
+        return v
+
+    @field_validator("max_attempts")
+    @classmethod
+    def _max_ok(cls, v: int) -> int:
+        if isinstance(v, bool) or v < 0:
+            raise ValueError("retry.max_attempts 必须是 >= 0 的整数（0=不放弃）")
+        return v
+
+    @field_validator("not_after")
+    @classmethod
+    def _not_after_ok(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v and not NOT_AFTER_DAILY_RE.match(v):
+            try:
+                datetime.fromisoformat(v)
+            except ValueError as e:
+                raise ValueError(
+                    "retry.not_after 必须是 ISO8601 时间（2026-10-04T15:00:00+08:00）"
+                    "或每日时刻 HH:MM（如 15:00）") from e
+        return v
+
+
 class RuntimeSpec(BaseModel):
     user: str = "sched-run"  # 非 root 执行用户；空 = 以调度器运行用户执行
 
@@ -153,6 +205,7 @@ class TaskDoc(BaseModel):
     heartbeat: HeartbeatSpec = Field(default_factory=HeartbeatSpec)
     smoke: SmokeSpec = Field(default_factory=SmokeSpec)
     runtime: RuntimeSpec = Field(default_factory=RuntimeSpec)
+    retry: RetrySpec = Field(default_factory=RetrySpec)
     contract_exempt: bool = False  # True：只能手动触发，禁止自动调度（不可断点恢复的任务）
 
     @field_validator("schema_version")
@@ -256,3 +309,54 @@ def effective(task_dir: Path, doc: TaskDoc) -> dict[str, Any]:
         "priority": doc.priority,
         "resources": doc.resources.model_dump(),
     }
+
+
+# ================= 任务自治重试策略（task.json retry 段 + 运行时 state.json 覆盖） =================
+
+def retry_deadline(not_after: str, now: datetime) -> datetime | None:
+    """把 retry.not_after 解析为具体截止时刻；空串/非法（schema 已校验）返回 None。
+
+    每日 HH:MM 取"今天的该时刻"；若今天该时刻已过，即代表截止已到（调用方用 now > dl 判定）。
+    """
+    not_after = (not_after or "").strip()
+    if not not_after:
+        return None
+    if NOT_AFTER_DAILY_RE.match(not_after):
+        parts = [int(x) for x in not_after.split(":")]
+        h, m = parts[0], parts[1]
+        s = parts[2] if len(parts) > 2 else 0
+        tz = now.tzinfo
+        return now.replace(hour=h, minute=m, second=s, microsecond=0) if tz is not None \
+            else datetime(now.year, now.month, now.day, h, m, s)
+    try:
+        dl = datetime.fromisoformat(not_after)
+    except ValueError:
+        return None
+    if dl.tzinfo is None and now.tzinfo is not None:
+        dl = dl.replace(tzinfo=now.tzinfo)
+    return dl
+
+
+def resolve_retry(doc: TaskDoc | None, state_snapshot: dict | None, now: datetime) -> dict[str, Any]:
+    """合并任务静态声明（task.json retry）与运行时覆盖（state.json.retry_hint）。
+
+    运行时 hint 由任务 SDK 在本次运行中按当天实际情况写入（如半日市的收盘时刻），
+    仅允许收紧/指定 retry 三要素；字段缺省回落 task.json 声明。
+    返回 {delay_sec, max_attempts, not_after, deadline}。
+    """
+    r = doc.retry if doc is not None else RetrySpec()
+    delay, max_attempts, not_after = r.delay_sec, r.max_attempts, r.not_after
+    hint = (state_snapshot or {}).get("retry_hint")
+    if isinstance(hint, dict):
+        try:
+            h = RetrySpec.model_validate({
+                "delay_sec": hint.get("delay_sec", delay),
+                "max_attempts": hint.get("max_attempts", max_attempts),
+                "not_after": hint.get("not_after", not_after),
+            })
+        except ValidationError:
+            pass  # 任务写坏 hint 不影响调度：回落静态声明
+        else:
+            delay, max_attempts, not_after = h.delay_sec, h.max_attempts, h.not_after
+    return {"delay_sec": float(delay), "max_attempts": int(max_attempts),
+            "not_after": not_after, "deadline": retry_deadline(not_after, now)}

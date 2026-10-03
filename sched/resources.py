@@ -66,6 +66,7 @@ class Profile:
     cpu: float = 0.0
     memory_mb: int = 0
     samples: list[tuple[float, int]] = field(default_factory=list)  # [(cpu, mem_mb)]
+    durations: list[float] = field(default_factory=list)            # 正式 run 时长（秒）
     declared_cpu: float = 0.0
     declared_memory_mb: int = 0
 
@@ -73,6 +74,13 @@ class Profile:
         self.samples.append((max(0.0, cpu), max(0, int(mem_mb))))
         if len(self.samples) > window:
             self.samples = self.samples[-window:]
+
+    def record_duration(self, duration_sec: float, window: int = 8) -> None:
+        if duration_sec <= 0:
+            return
+        self.durations.append(round(float(duration_sec), 3))
+        if len(self.durations) > window:
+            self.durations = self.durations[-window:]
 
     def p95_memory_mb(self) -> int | None:
         if not self.samples:
@@ -88,11 +96,21 @@ class Profile:
         idx = min(len(vals) - 1, int(len(vals) * 0.95))
         return vals[idx]
 
+    def p50_duration_sec(self) -> float | None:
+        """典型运行时长（中位数）：同优先级 SJF 排序依据，抗长尾。"""
+        if not self.durations:
+            return None
+        return statistics.median(self.durations)
+
     def estimate(self, overshoot: float) -> tuple[float, int]:
         """(cpu, memory_mb) 预估。有样本用 P95，否则用声明，再否则 0（=未知，交给容量闸拒绝）。"""
         cpu = self.p95_cpu() if self.samples else (self.declared_cpu or 0.0)
         mem = self.p95_memory_mb() if self.samples else (self.declared_memory_mb or 0)
         return round(cpu * overshoot, 2), int(mem * overshoot)
+
+    def estimate_duration_sec(self) -> float | None:
+        """运行时长预估（秒）；无历史样本返回 None（调度排序时按最长处理）。"""
+        return self.p50_duration_sec()
 
 
 class ProfileStore:
@@ -109,19 +127,51 @@ class ProfileStore:
             cpu=float(d.get("cpu") or 0.0),
             memory_mb=int(d.get("memory_mb") or 0),
             samples=[(float(c), int(m)) for c, m in (d.get("samples") or [])],
+            durations=[float(x) for x in (d.get("durations") or [])],
             declared_cpu=float(declared_cpu),
             declared_memory_mb=int(declared_mem_mb),
         )
 
-    def record(self, job_id: str, cpu: float, mem_mb: int, declared_cpu: float, declared_mem_mb: int, window: int = 8) -> Profile:
+    def _store_profile(self, job_id: str, prof: Profile,
+                       declared_cpu: float, declared_mem_mb: int) -> None:
+        self._data[job_id] = {
+            "cpu": prof.p95_cpu() if prof.samples else declared_cpu,
+            "memory_mb": prof.p95_memory_mb() if prof.samples else declared_mem_mb,
+            "samples": [list(s) for s in prof.samples],
+            "durations": list(prof.durations),
+        }
+
+    def record(self, job_id: str, cpu: float, mem_mb: int, declared_cpu: float, declared_mem_mb: int,
+               window: int = 8, duration_sec: float | None = None) -> Profile:
         prof = self.get(job_id, declared_cpu, declared_mem_mb)
         prof.record_sample(cpu, mem_mb, window=window)
-        self._data[job_id] = {
-            "cpu": prof.p95_cpu() or declared_cpu,
-            "memory_mb": prof.p95_memory_mb() or declared_mem_mb,
-            "samples": [list(s) for s in prof.samples],
-        }
+        if duration_sec is not None:
+            prof.record_duration(duration_sec, window=window)
+        self._store_profile(job_id, prof, declared_cpu, declared_mem_mb)
         return prof
+
+    def record_live(self, job_id: str, cpu: float, mem_mb: int, declared_cpu: float,
+                    declared_mem_mb: int, window: int = 8) -> Profile:
+        """运行中动态采样：立即更新内存画像（不落盘，由调用方节流 save）。
+
+        让任务越跑越吃资源时画像随之变化，而不是直到终态才采一次、更不是只用冒烟结果。
+        """
+        prof = self.get(job_id, declared_cpu, declared_mem_mb)
+        prof.record_sample(cpu, mem_mb, window=window)
+        self._store_profile(job_id, prof, declared_cpu, declared_mem_mb)
+        return prof
+
+    def record_duration(self, job_id: str, duration_sec: float, window: int = 8) -> None:
+        """只补时长样本（终态收敛用）。"""
+        d = self._data.get(job_id) or {}
+        prof = self.get(job_id, float(d.get("cpu") or 0.0), int(d.get("memory_mb") or 0))
+        prof.record_duration(duration_sec, window=window)
+        self._store_profile(job_id, prof, prof.declared_cpu, prof.declared_memory_mb)
+
+    def estimate_duration_sec(self, job_id: str) -> float | None:
+        d = self._data.get(job_id) or {}
+        vals = [float(x) for x in (d.get("durations") or [])]
+        return statistics.median(vals) if vals else None
 
     def save(self) -> None:
         store.save_json(config.profiles_file(), self._data)

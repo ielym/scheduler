@@ -535,7 +535,7 @@ def test_data_risk_gives_up_after_max_rounds(home, make_settings):
     assert any(d.get("act") == "terminal" and d.get("status") == "data_risk" for d in decisions)
 
 
-# ================= D6：100/101 资源错误按退出码退避重试 =================
+# ================= D6：100/101 资源错误立即重排队（任务自治 retry 节奏） =================
 
 def test_exit_101_classified_as_retryable_resource():
     # 101 = 代理/隧道、限流、配额等外部资源错误：归类 resource，可重试
@@ -545,8 +545,8 @@ def test_exit_101_classified_as_retryable_resource():
     assert "101" in reason
 
 
-def test_finalize_101_schedules_backoff_retry(home, make_settings):
-    """外部资源错误(101) 不再有任何容量池：终态只负责指数退避后重入队。"""
+def test_finalize_101_immediately_requeues(home, make_settings):
+    """外部资源错误(101) 终态：立即重排队（无全局退避/冷却），attempt+1。"""
     svc = _svc(home, make_settings)
     svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 64})
     re = RunningEntry(
@@ -556,19 +556,21 @@ def test_finalize_101_schedules_backoff_retry(home, make_settings):
         spec=None, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r1",
     )
     svc._finalize(re, runlog.STATUS_RESOURCE, mem_peak_mb=50, cpu_sec=0.5)
-    # 退避记录已写入，任务重新入队等待重试
-    assert "ok" in svc.state.backoffs
-    assert svc.state.backoffs["ok"]["attempts"] == 1
+    # 不再有作业级退避/冷却字典；任务立即重新入队
+    assert not hasattr(svc.state, "backoffs")
+    assert not hasattr(svc.state, "cooldowns")
     assert len(svc.state.wq) == 1
-    assert svc.state.wq[0]["attempt"] == 2
+    new = svc.state.wq[0]
+    assert new["attempt"] == 2
+    assert new["not_before"] == ""
+    assert svc._not_before_pending(new) is False
 
 
-def test_backoff_uses_settings_base_and_cap(home, make_settings):
-    """退避起始/封顶由运行参数控制，可在管理台热更新。"""
-    settings = make_settings(run_user="", runner=config.RunnerConfig(
-        resource_backoff_base_sec=10, resource_backoff_cap_sec=30))
-    svc = SchedulerService(settings)
-    svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 64})
+def test_retry_delay_sec_sets_not_before(home, make_settings):
+    """任务在 task.json retry.delay_sec 声明重试节奏：等待项带 not_before，到期前不参与准出。"""
+    svc = _svc(home, make_settings)
+    svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 64},
+                               retry={"delay_sec": 300})
     re = RunningEntry(
         run={"run_id": "r1", "job_id": "ok", "dry_run": False, "duration_ms": 1000,
              "queued_at": runlog.now_iso(), "status": "resource", "trigger": "manual",
@@ -576,19 +578,17 @@ def test_backoff_uses_settings_base_and_cap(home, make_settings):
         spec=None, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r1",
     )
     svc._finalize(re, runlog.STATUS_RESOURCE, mem_peak_mb=50, cpu_sec=0.5)
-    decs = [json.loads(l) for l in config.decisions_log().read_text().splitlines() if l.strip()]
-    assert decs[-1]["act"] == "retry_enqueue"
-    assert decs[-1]["backoff_sec"] == 10
-    # 封顶：attempt 足够大时不超过 cap
-    re2 = RunningEntry(
-        run={"run_id": "r2", "job_id": "ok", "dry_run": False, "duration_ms": 1000,
-             "queued_at": runlog.now_iso(), "status": "resource", "trigger": "manual",
-             "attempt": 9, "exit_code": errors.EXIT_EXTERNAL_RESOURCE},
-        spec=None, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r2",
-    )
-    svc._finalize(re2, runlog.STATUS_RESOURCE, mem_peak_mb=50, cpu_sec=0.5)
-    decs = [json.loads(l) for l in config.decisions_log().read_text().splitlines() if l.strip()]
-    assert decs[-1]["backoff_sec"] == 30
+    assert len(svc.state.wq) == 1
+    new = svc.state.wq[0]
+    assert new["not_before"]
+    assert svc._not_before_pending(new) is True
+    # not_before 未到：admission tick 不扫描该项，也不会把它 pop 出来
+    svc._tick_admission()
+    assert len(svc.state.wq) == 1
+    assert svc._staged_run_id is None
+    # 到期后正常参与准出（用一条已到期的 not_before 模拟时间流逝）
+    new["not_before"] = (datetime.now().astimezone() - timedelta(seconds=1)).isoformat(timespec="seconds")
+    assert svc._not_before_pending(new) is False
 
 
 # ================= D7：窗口收口每 tick 检查 =================

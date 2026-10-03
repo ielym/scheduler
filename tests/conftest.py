@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 # 用于测试的通用任务入口：参数经 task.json 的 env 注入（build_env 会透传到子进程）。
+# 故障注入一律仅在真实运行（not dry_run）生效，保证注册冒烟（闸5 dry）永远能过。
 RUN_PY = '''\
 import json, os, sys, time
 from pathlib import Path
@@ -22,7 +23,18 @@ REAL_SLEEP = float(os.environ.get("SCHED_TASK_REAL_SLEEP", "0.01"))
 
 class Task(SchedTask):
     def steps(self, resume):
-        if os.environ.get("SCHED_TASK_FAIL") == "1":
+        if not self.dry_run:
+            hint = os.environ.get("SCHED_TASK_RETRY_HINT")
+            if hint:
+                self.set_retry_hint(**json.loads(hint))
+            if os.environ.get("SCHED_TASK_HB_STALL") == "1":
+                self._stop_heartbeat()  # 模拟真卡死（死锁/GIL 卡死）：心跳也停
+                time.sleep(30)  # 不写心跳，由调度器心跳超时兜底
+            code = os.environ.get("SCHED_TASK_EXIT_CODE")
+            if code:
+                self.state.flush()
+                sys.exit(int(code))
+        if not self.dry_run and os.environ.get("SCHED_TASK_FAIL") == "1":
             raise RuntimeError("connection timeout simulated")
         start = int((resume or {}).get("index", 0))
         for i in range(start, TOTAL):
@@ -51,6 +63,9 @@ def write_task(
     resources: dict | None = None,
     contract_exempt: bool = False,
     extra_env: dict | None = None,
+    retry: dict | None = None,
+    heartbeat_timeout: int | None = None,
+    logic_regex: list[str] | None = None,
 ) -> Path:
     """在 root/tasks/<name>/ 下写一个可跑五道闸与正常运行的测试任务。"""
     task_dir = root / "tasks" / name
@@ -74,12 +89,14 @@ def write_task(
         "env": env,
         "outputs": {"expect": ["results/final.json"]},
         "resources": resources or {"cpu": 0.1, "memory_mb": 64},
-        "error_rules": {"resource_regex": [], "logic_regex": []},
-        "heartbeat": {"timeout_sec": 120},
+        "error_rules": {"resource_regex": [], "logic_regex": logic_regex or []},
+        "heartbeat": {"timeout_sec": heartbeat_timeout or 120},
         "smoke": {"mode": "dry", "max_runtime_sec": 60},
         "runtime": {"user": ""},  # 测试环境不降权（置空 = 以调度器身份执行）
         "contract_exempt": contract_exempt,
     }
+    if retry is not None:
+        doc["retry"] = retry
     (task_dir / "task.json").write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
     return task_dir
 

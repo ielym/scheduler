@@ -70,19 +70,11 @@ def sched_user_conf() -> Path:
 
 
 class RunnerConfig(BaseModel):
+    # 这些都是引擎内部参数，不在管理台暴露；重试节奏/放弃策略由任务在 task.json
+    # 的 retry 段自行声明（见 taskdoc.RetrySpec），调度器不设全局冷却/退避/重试上限。
     kill_grace_sec: int = 10
     heartbeat_timeout_sec: int = 120
-    cooldown_sec: int = 60
     grace_sec: int = 40
-    # 资源类错误最大重试次数；0 = 不设上限（R17 退让而非扑杀，默认永不放弃）。
-    # 仅当运维确认某任务的"资源质量长期不可用"时，才显式配置封顶转人工。
-    max_resource_attempts: int = 0
-    # 外部资源错误（退出码 100/101：代理被掐断、限流、网络抖动等）退避序列：
-    # 等待 base 秒后重试，连续失败翻倍，最长等待 cap 秒。
-    # 这类问题多为单连接/单出口 IP 的瞬时故障，任务侧应先就地快速重试（换连接/换 IP），
-    # 只有连续失败才以退出码 101 交给调度器做长退避，避免一次抖动就白等一小时。
-    resource_backoff_base_sec: int = 300
-    resource_backoff_cap_sec: int = 3600
 
 
 # 资源阈值阶梯（v04 R29，并经评估建议改为 memory.high 软限 + memory.max 硬限双水位）
@@ -97,6 +89,8 @@ class ResourceConfig(BaseModel):
     overload_ratio: float = 2.0      # 实际/预估 >2.0 视为超限
     overload_sustain_sec: int = 60   # 持续判定窗口
     sample_interval_sec: int = 3     # monitor 采样间隔
+    # 运行中动态画像：每隔这么多秒把 cgroup 实测（CPU 速率/内存）落入画像滑窗并落盘
+    profile_live_interval_sec: int = 60
     # 准出时对非调度进程占用的感知（R14）：est_mem > MemAvailable - margin → 退让等待
     external_safety_margin_mb: int = 512
 
@@ -123,12 +117,11 @@ class Settings(BaseModel):
     max_log_mb: int = 32
     # 非 root 执行用户（v04 R31）；为空 = 以调度器运行用户直接执行
     run_user: str = "sched-run"
-    # ---- 调度行为参数（原为模块级硬编码，第三轮审查后统一入 Settings）----
+    # ---- 调度行为参数（引擎内部，不进管理台；任务自治参数在各任务 task.json 的 retry 段）----
     starvation_sec: float = 3600.0        # 饿死看门狗阈值（1h）
     preempt_exempt_sec: float = 60.0      # 任务启动后的抢占豁免期
     data_risk_max_reschedules: int = 3    # 110 数据风险二刷轮数上限
     hot_reload_sec: float = 30.0          # serve 主循环周期性热加载 jobs.json/tasks 目录
-    auto_admit_retry_sec: float = 300.0   # 新任务自动准入（跑五闸）失败后的重试冷却
 
     @field_validator("timezone")
     @classmethod

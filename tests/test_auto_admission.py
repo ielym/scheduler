@@ -1,5 +1,5 @@
 """自动准入：tasks/ 下出现新任务目录即后台跑五闸，通过自动纳入调度；
-失败记录原因并持久化，任务文件修改后立即重试（否则冷却到期再试），全程无手动注册。"""
+失败记录原因并持久化，闸失败不做定时重试——任务文件被修改（fingerprint 变化）后才重查，全程无手动注册。"""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def test_bad_task_failed_then_retried_after_fix(home, make_settings):
     task_dir = write_task(home, "auto_bad", real_sleep=0.01)
     # 破坏入口：run.py 语法错误 → 闸门必然失败
     (task_dir / "run.py").write_text("def broken(:\n", encoding="utf-8")
-    svc = SchedulerService(make_settings(run_user="", auto_admit_retry_sec=3600))
+    svc = SchedulerService(make_settings(run_user=""))
 
     svc._kick_auto_admission()
     assert _wait_for(
@@ -48,13 +48,17 @@ def test_bad_task_failed_then_retried_after_fix(home, make_settings):
     rec = svc.admission_snapshot()["auto_bad"]
     assert rec["attempts"] == 1
     assert rec["reason"]            # 失败原因必须可展示给用户
-    assert rec["next_check_after"]
+    assert rec["fingerprint"]       # 记录失败时文件指纹，供"改没改"判定
+    assert "next_check_after" not in rec  # 不再有定时自动重试
     assert "auto_bad" not in registry.load_state()
 
-    # 冷却未到且文件未改 → 不重试
+    # 文件未改 → 不重试（闸失败靠创建者本地修改/删除后重提）
     assert svc._admission_due(rec, "auto_bad") is False
+    # 再 kick 也不会挑选它
+    svc._kick_auto_admission()
+    assert svc._admission_current is None
 
-    # 修好文件 → fingerprint 变化 → 立即允许重试，无需等冷却
+    # 修好文件 → fingerprint 变化 → 立即允许重试
     write_task(home, "auto_bad", real_sleep=0.01)
     assert svc._admission_due(rec, "auto_bad") is True
     svc._kick_auto_admission()
@@ -65,13 +69,13 @@ def test_bad_task_failed_then_retried_after_fix(home, make_settings):
 def test_failed_state_persisted_across_restart(home, make_settings):
     task_dir = write_task(home, "auto_bad2", real_sleep=0.01)
     (task_dir / "run.py").write_text("def broken(:\n", encoding="utf-8")
-    svc = SchedulerService(make_settings(run_user="", auto_admit_retry_sec=3600))
+    svc = SchedulerService(make_settings(run_user=""))
     svc._kick_auto_admission()
     assert _wait_for(
         lambda: (svc.admission_snapshot().get("auto_bad2") or {}).get("status") == "failed")
 
     # 重新启动一个调度器实例：失败状态从 admission.json 恢复，页面仍能展示原因
-    svc2 = SchedulerService(make_settings(run_user="", auto_admit_retry_sec=3600))
+    svc2 = SchedulerService(make_settings(run_user=""))
     rec2 = svc2.admission_snapshot()["auto_bad2"]
     assert rec2["status"] == "failed"
     assert rec2["reason"]

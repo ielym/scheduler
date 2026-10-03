@@ -1,6 +1,8 @@
 """L3 持久化：调度态原子快照 + 决策审计日志 + 运行态(active.json) 读写。
 
-- scheduler_state.json：全局队列 WQ / 冷却 / 退避 的原子快照（先落快照后执行）。
+- scheduler_state.json：全局队列 WQ 的原子快照（先落快照后执行）。
+  重试节奏由任务自治（task.json retry 段），per-item 记 not_before，不再有
+  作业级 cooldown/backoff 字典（旧文件里的遗留键加载时忽略、下次保存自动清除）。
 - decisions.jsonl：每次调度决策的可追溯审计（append-only）。
 - active.json：在途运行（pid/pgid）供崩溃恢复 reconcile 用。
 """
@@ -23,6 +25,7 @@ class WaitingRun:
     scheduled_at: str
     enqueued_at: str
     resume_point_ref: bool = False   # 是否为恢复运行（来自之前的抢占/中断）
+    not_before: str = ""             # 任务自治重试间隔：此刻前不参与准出（retry.delay_sec）
     missed_count: int = 0
     contract_exempt: bool = False
     manual: bool = False
@@ -31,8 +34,6 @@ class WaitingRun:
 @dataclass
 class SchedulerState:
     wq: list[dict] = field(default_factory=list)
-    cooldowns: dict[str, str] = field(default_factory=dict)     # job_id -> iso 截止
-    backoffs: dict[str, dict] = field(default_factory=dict)     # job_id -> {"until": iso, "attempts": n}
 
     def waiting_items(self) -> list[dict]:
         return self.wq
@@ -51,11 +52,7 @@ def load_scheduler_state() -> SchedulerState:
     raw = store.load_json(config.scheduler_state_file(), default=None)
     if not isinstance(raw, dict):
         return SchedulerState()
-    return SchedulerState(
-        wq=raw.get("wq") or [],
-        cooldowns=raw.get("cooldowns") or {},
-        backoffs=raw.get("backoffs") or {},
-    )
+    return SchedulerState(wq=raw.get("wq") or [])
 
 
 def save_scheduler_state(st: SchedulerState) -> None:
@@ -63,7 +60,7 @@ def save_scheduler_state(st: SchedulerState) -> None:
 
 
 def load_admission_state() -> dict[str, dict]:
-    """自动准入状态：{job_id: {status: checking|failed, reason, last_check, next_check_after, ...}}。"""
+    """自动准入状态：{job_id: {status: checking|failed, reason, last_check, fingerprint, ...}}。"""
     raw = store.load_json(config.admission_state_file(), default={})
     return raw if isinstance(raw, dict) else {}
 

@@ -55,22 +55,24 @@ def test_f2_negative_exit_code_is_unclassified():
     assert cat == errors.Category.UNCLASSIFIED.value
 
 
-# ================= 退避任务不参与准出扫描 =================
+# ================= retry.delay_sec 未到的等待项不参与准出扫描 =================
 
-def test_f3_backoff_items_skipped_in_admission_scan(home, make_settings):
+def test_f3_not_before_items_skipped_in_admission_scan(home, make_settings):
     svc = _svc(home, make_settings)
     svc.capacity = FakeCapacity(total_memory_mb=1000, total_cpu=4.0)
     svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 900})
     svc.entries["ok2"] = _entry(home, "ok2", resources={"cpu": 0.1, "memory_mb": 50})
-    svc.trigger("ok", trigger="manual")   # 900MB，将处于退避期
+    svc.trigger("ok", trigger="manual")   # 900MB，等待项带未到的 not_before
     svc.trigger("ok2", trigger="manual")  # 50MB，应正常准出
     import datetime as _dt
     future = (_dt.datetime.now().astimezone() + _dt.timedelta(hours=1)).isoformat(timespec="seconds")
-    svc.state.backoffs["ok"] = {"not_before": future}
+    next(it for it in svc.state.wq if it["job_id"] == "ok")["not_before"] = future
     svc._tick_admission()
-    # 退避的 ok 不准出；ok2 正常准出（不被 ok 的 900MB 虚拟占用挡住）
+    # not_before 未到的 ok 不准出；ok2 正常准出（不被 ok 的 900MB 虚拟占用挡住）
     assert any(re.run["job_id"] == "ok2" for re in svc.running.values())
     assert not any(re.run["job_id"] == "ok" for re in svc.running.values())
+    # ok 仍在 WQ
+    assert [it["job_id"] for it in svc.state.wq] == ["ok"]
 
 
 # ================= 多实例状态隔离 =================

@@ -95,6 +95,9 @@ class TaskState:
         self.resume_point: dict[str, Any] = self.store.load_resume_point()
         self.metrics: dict[str, Any] = raw.get("metrics") or {}
         self.last_error: dict[str, Any] = raw.get("last_error") or {}
+        # 重试策略运行时覆盖（调度器在失败终态读取，合并 task.json 的 retry 静态声明）：
+        # {"delay_sec": 60, "max_attempts": 0, "not_after": "2026-10-04T15:00:00+08:00"}
+        self.retry_hint: dict[str, Any] = raw.get("retry_hint") or {}
         self.started_at: str = raw.get("started_at") or now_iso()
         self.updated_at: str = now_iso()
         self._lock = threading.Lock()
@@ -120,6 +123,7 @@ class TaskState:
             "resume_point": self.resume_point,
             "metrics": self.metrics,
             "last_error": self.last_error,
+            "retry_hint": self.retry_hint,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
         }
