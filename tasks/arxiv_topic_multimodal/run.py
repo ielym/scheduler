@@ -26,10 +26,25 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import requests
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# 复用已安装 CLI 的库（隧道 HTTP + arXiv Atom 解析；不 fork 子进程、不经 CLI 的 JSON 输出）
+for _p in (
+    os.environ.get("IP_TUNNEL_SRC", "/mnt/data01/projects/clihub/ip-tunnel/src"),
+    os.environ.get("ARXIV_SRC", "/mnt/data01/projects/clihub/arxiv/src"),
+):
+    if _p and os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from ip_tunnel.http import build_proxy_url, http_request  # noqa: E402
+from ip_tunnel.certification import get_credential  # noqa: E402
+from arxiv.cli import parse_feed as parse_atom_feed  # noqa: E402
 from sched_task_sdk import SchedTask, Step, run_task
 
 # ===================== 任务参数（每份副本独立） =====================
@@ -40,19 +55,37 @@ QUERY = '(all:"multimodal generation" OR all:"multimodal understanding" OR all:"
 OSS_BUCKET = "ielym-data"
 OSS_DIR_PREFIX = f"oss://{OSS_BUCKET}/academic/papers/{TOPIC}"
 LOCAL_CACHE_ROOT = Path("/mnt/data01/data/papers_cache")
-PAGE_SIZE = 100          # arXiv API 单页条数
+ARXIV_API = "https://export.arxiv.org/api/query"
+PAGE_SIZE = 100          # arXiv API 单页条数（http_request 默认 gzip，线路上仅十几~几十KB，
+                          # 远低于隧道截断阈值；条数大还能减少分页请求数）
 MAX_TOTAL = 2000         # 单日单主题硬上限，超出视为检索式异常（LOGIC 转人工）
 API_GAP_SEC = 3.0        # arXiv 官方建议页间约 3 秒
 CONSEC_FAIL_LIMIT = 5    # 连续 N 篇失败判定隧道/目标站点整体故障 -> 101
-PDF_CONNECT_TIMEOUT = 10
-PDF_READ_TIMEOUT = 30
+PDF_CHUNK_SIZE = 2 * 1024 * 1024  # PDF Range 分块大小（每块独立隧道连接=换 IP）
+PDF_FULL_DEADLINE_SEC = 60   # 整文件请求硬墙钟（秒）
+PDF_RANGE_DEADLINE_SEC = 60  # 单个 Range 块硬墙钟（秒）
+# 坏窗代理会「慢速 drip」（连接不断、零星给字节），socket 静默超时永不触发，
+# 故下载必须再加一层墙钟兜底。
 SHANGHAI_TZ = timezone(timedelta(hours=8))
-RETRIABLE_HTTP_STATUS = {403, 407, 429, 500, 502, 503, 504}
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 _VERSION_RE = re.compile(r"v\d+$")
+
+
+def _hard_call(func, deadline: float, *args, **kwargs):
+    """硬墙钟调用：墙钟到点即放弃等待并抛 FutureTimeout。
+
+    被放弃的底层读线程无法强杀，但其 socket 自带静默超时（45/60s），
+    最迟多活一个静默超时后自然消亡；shutdown(wait=False) 不阻塞主流程。
+    """
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-dl")
+    future = pool.submit(func, *args, **kwargs)
+    try:
+        return future.result(timeout=deadline)
+    finally:
+        pool.shutdown(wait=False)
 
 
 class ResourceError(RuntimeError):
@@ -80,7 +113,7 @@ class ArxivTopicTask(SchedTask):
             if self.dry
             else LOCAL_CACHE_ROOT / TOPIC
         )
-        self._proxies: dict | None = None
+        self._cred: dict | None = None
 
     # ---------- 基础设施 ----------
 
@@ -138,14 +171,6 @@ class ArxivTopicTask(SchedTask):
 
     # ---------- 隧道代理 ----------
 
-    def _proxy_env(self) -> dict:
-        """供 arxiv CLI（urllib 读 HTTP(S)_PROXY 环境变量）使用的进程环境。"""
-        env = os.environ.copy()
-        env["HTTP_PROXY"] = self._proxies["http"]
-        env["HTTPS_PROXY"] = self._proxies["https"]
-        env["NO_PROXY"] = ""
-        return env
-
     @staticmethod
     def _oss_env() -> dict:
         """OSS 走内网 endpoint，显式剥除代理变量，禁止经隧道转发。"""
@@ -153,33 +178,21 @@ class ArxivTopicTask(SchedTask):
                   "http_proxy", "https_proxy", "all_proxy"}
         return {k: v for k, v in os.environ.copy().items() if k not in banned}
 
-    def _ensure_proxies(self) -> dict:
-        if self._proxies:
-            return self._proxies
+    def _ensure_cred(self) -> dict:
+        """隧道凭据 dict：ip_tunnel 库凭此为每个请求组新代理 URL（新连接=换 IP）。"""
+        if self._cred:
+            return self._cred
         last_err = "unknown"
         for attempt in range(3):
             try:
-                proc = subprocess.run(
-                    ["ip-tunnel", "export", "--raw"],
-                    capture_output=True, text=True, timeout=25,
-                )
-                if proc.returncode == 0:
-                    out = proc.stdout
-                    s = out[out.find("{"):out.rfind("}") + 1]
-                    cfg = json.loads(s)
-                    proxies = cfg.get("proxies") or {}
-                    if proxies.get("http") and proxies.get("https"):
-                        self._proxies = proxies
-                        self.log.info("已获取隧道代理配置（不落盘）")
-                        return proxies
-                    last_err = "隧道配置缺少 proxies 字段"
-                else:
-                    last_err = (proc.stderr or "export 非零退出").strip()[:160]
+                self._cred = get_credential()
+                self.log.info("已获取隧道凭据（不落盘）：%s", self._cred.get("tunnel"))
+                return self._cred
             except Exception as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
-            self.log.warning("取隧道代理失败(第%s次)：%s", attempt + 1, last_err)
+            self.log.warning("取隧道凭据失败(第%s次)：%s", attempt + 1, last_err)
             time.sleep(2 * (2 ** attempt))
-        self._fail_resource(f"ip-tunnel export 连续失败: {last_err}")
+        self._fail_resource(f"获取隧道凭据连续失败: {last_err}")
         return {}  # 不可达，仅为类型检查
 
     # ---------- arXiv 检索 ----------
@@ -209,48 +222,44 @@ class ArxivTopicTask(SchedTask):
                     f"topic={TOPIC} date={date}"
                 )
             yield Step("search_page", {"date": date, "start": start})
-            cmd = [
-                "arxiv", "--query", full_query,
-                "--start", str(start),
-                "--max-results", str(PAGE_SIZE),
-                "--sort-by", "submittedDate",
-                "--sort-order", "descending",
-            ]
-            # 隧道代理每次连接自动换出口 IP，实测会间歇性在传输中途掐断响应
-            # （IncompleteRead / JSON 在任意位置截断）——属于单连接瞬时故障，
-            # 不能一次抖动就退出码 101 白等一小时：先就地快速重试（每次新连接=新 IP），
-            # 连续 4 次仍失败才判定外部资源确实不可用，交调度器按退避节奏处理。
+            params = {
+                "search_query": full_query,
+                "start": start,
+                "max_results": PAGE_SIZE,
+                "sortBy": "submittedDate",
+                "sortOrder": "descending",
+            }
+            url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
+            # http_request 每请求新建隧道连接（换 IP）、默认 gzip 传输（线路体积小，
+            # 实测 100 条的 Atom feed 压缩后仅十几~几十KB，远低于隧道截断阈值）；
+            # 其内部已对部分瞬时错误重试，IncompleteRead / gzip 损坏等截断不在重试
+            # 范围，由本层再做 5 次退避（跨度约 40s 撑过代理坏窗），仍失败才 101。
             page = None
             last_fetch_err = ""
-            for fetch_attempt in range(4):
-                proc = None
-                try:
-                    proc = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=60,
-                        env=self._proxy_env(),
-                    )
-                except Exception as exc:
-                    last_fetch_err = f"arxiv 检索进程异常(start={start}): {exc}"
-                if proc is not None and proc.returncode != 0:
-                    last_fetch_err = (
-                        f"arxiv 检索失败(start={start}): "
-                        f"{(proc.stderr or proc.stdout or '')[:200]}"
-                    )
-                elif proc is not None:
+            for fetch_attempt in range(5):
+                res = http_request(
+                    "GET", url, cred=self._ensure_cred(),
+                    retries=2, timeout=90.0,
+                )
+                if res.get("ok"):
                     try:
-                        envelope = json.loads(proc.stdout)
-                        page = envelope.get("records") or []
+                        page = parse_atom_feed(res["body"])
                         break
                     except Exception as exc:
                         last_fetch_err = f"arxiv 响应解析失败(start={start}): {exc}"
-                if fetch_attempt < 3:
+                else:
+                    last_fetch_err = (
+                        f"arxiv 抓取失败(start={start}): "
+                        f"HTTP {res.get('status')} {str(res.get('reason'))[:120]}"
+                    )
+                if fetch_attempt < 4:
                     self.log.warning(
-                        "arxiv 抓取瞬时失败(第%s/4次)，换新隧道连接重试：%s",
+                        "arxiv 抓取瞬时失败(第%s/5次)，换新隧道连接重试：%s",
                         fetch_attempt + 1, last_fetch_err[:160],
                     )
-                    time.sleep(2 * (2 ** fetch_attempt))
+                    time.sleep((4, 8, 12, 16)[fetch_attempt])
             if page is None:
-                self._fail_resource(f"arxiv 连续 4 次抓取失败: {last_fetch_err}")
+                self._fail_resource(f"arxiv 连续 5 次抓取失败: {last_fetch_err}")
 
             records.extend(page)
             self._atomic_write_json(
@@ -351,46 +360,91 @@ class ArxivTopicTask(SchedTask):
 
     # ---------- PDF 下载 ----------
 
+    def _pdf_range_get(self, url: str, start: int, end: int):
+        """经隧道 Range 取 [start,end] 闭区间；每块新连接=换 IP，截断自动重试。"""
+        proxy = build_proxy_url(self._ensure_cred())
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        req = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT, "Accept": "*/*",
+            "Accept-Encoding": "identity", "Range": f"bytes={start}-{end}",
+        })
+        last: Exception | None = None
+
+        def _do_open():
+            with opener.open(req, timeout=60) as resp:
+                return resp.status, resp.headers, resp.read()
+
+        for attempt in range(4):
+            try:
+                return _hard_call(_do_open, PDF_RANGE_DEADLINE_SEC)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    return 404, exc.headers, b""
+                last = exc
+            except Exception as exc:
+                last = exc
+            if attempt < 3:
+                self.log.warning("PDF Range[%d-%d] 瞬时失败(第%s次)：%s",
+                                 start, end, attempt + 1, str(last)[:120])
+                time.sleep(1.5 * (2 ** attempt))
+        raise RuntimeError(f"Range 下载失败 [{start}-{end}]：{type(last).__name__}: {last}")
+
+    def _download_pdf_chunked(self, url: str) -> bytes:
+        """Range 分块下载拼接（2MB/块，各块独立换 IP），规避隧道大文件随机截断。"""
+        status, headers, _ = self._pdf_range_get(url, 0, 0)
+        if status == 404:
+            raise FileNotFoundError("HTTP 404")
+        m = re.search(r"/(\d+)\s*$", headers.get("Content-Range") or "")
+        total = int(m.group(1)) if m else 0
+        if status != 206 or not total:
+            raise RuntimeError(f"无法探测 PDF 大小（HTTP {status}）")
+        chunks, offset = [], 0
+        while offset < total:
+            end = min(offset + PDF_CHUNK_SIZE - 1, total - 1)
+            status, _h, body = self._pdf_range_get(url, offset, end)
+            if status not in (200, 206) or not body:
+                raise RuntimeError(f"分块失败 HTTP {status}（[{offset}-{end}] 空响应）")
+            chunks.append(body)
+            offset += len(body)
+        data = b"".join(chunks)
+        if len(data) != total or b"%%EOF" not in data:
+            raise RuntimeError(f"分块拼接不完整（{len(data)}/{total}，缺 %%EOF）")
+        return data
+
     def _download_pdf(self, record: dict, dest: Path) -> tuple[bool, str]:
         """返回 (成功?, 原因)；404 原因以 fatal: 前缀表示永久失败。"""
         url = record.get("pdf_url") or (
-            f"https://arxiv.org/pdf/{record.get('source_id', '')}"
+            f"https://arxiv.org/pdf/{strip_version(record.get('source_id', ''))}"
         )
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.name + ".tmp")
-        last = "unknown"
-        for attempt in range(3):
+        cred = self._ensure_cred()
+        # 1) 整文件快路径：仅 1 次尝试、45s 静默超时。坏窗里代理常慢速 drip
+        # （持续有零星字节、静默超时不触发），久拖无意义——快速失败转 Range
+        # 分块（小块成功率高、总耗时可控）才是可靠路径。
+        try:
+            res = _hard_call(http_request, PDF_FULL_DEADLINE_SEC,
+                             "GET", url, cred=cred, retries=0, timeout=45.0)
+        except FutureTimeout:
+            res = {"ok": False, "status": 0, "body": None}
+        if res.get("status") == 404:
+            return False, "fatal: HTTP 404"
+        data = res["body"] if res.get("ok") else None
+        if data is None or data[:4] != b"%PDF" or b"%%EOF" not in data:
+            # 2) 整文件截断/失败 -> Range 分块兜底（每块换 IP）
             try:
-                if tmp.exists():
-                    tmp.unlink()
-                with requests.get(
-                    url,
-                    proxies=self._proxies,
-                    timeout=(PDF_CONNECT_TIMEOUT, PDF_READ_TIMEOUT),
-                    headers={"User-Agent": USER_AGENT},
-                    stream=True,
-                ) as resp:
-                    if resp.status_code == 404:
-                        return False, "fatal: HTTP 404"
-                    if resp.status_code in RETRIABLE_HTTP_STATUS:
-                        raise RuntimeError(f"HTTP {resp.status_code}")
-                    resp.raise_for_status()
-                    with open(tmp, "wb") as fh:
-                        for chunk in resp.iter_content(chunk_size=64 * 1024):
-                            if chunk:
-                                fh.write(chunk)
-                with open(tmp, "rb") as fh:
-                    magic = fh.read(5)
-                if magic != b"%PDF-":
-                    raise RuntimeError("返回内容不是 PDF（可能是拦截/校验页）")
-                tmp.replace(dest)
-                return True, ""
+                self.log.info("整文件未取到完整 PDF，转 Range 分块下载：%s", url.rsplit("/", 1)[-1])
+                data = self._download_pdf_chunked(url)
+            except FileNotFoundError:
+                return False, "fatal: HTTP 404"
             except Exception as exc:
-                last = f"{type(exc).__name__}: {exc}"
-                self.log.warning("PDF 下载 %s 失败(第%s次)：%s",
-                                 url, attempt + 1, last)
-                time.sleep(2 * (2 ** attempt))
-        return False, last
+                return False, f"{type(exc).__name__}: {str(exc)[:200]}"
+        if data[:4] != b"%PDF" or b"%%EOF" not in data:
+            return False, "下载内容不是完整 PDF（缺 %PDF 头或 %%EOF）"
+        tmp = dest.with_name(dest.name + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+        return True, ""
 
     # ---------- pending_skipped 维护 ----------
 
@@ -515,7 +569,7 @@ class ArxivTopicTask(SchedTask):
         if self.dry:
             records = yield from self._dry_search(date)
         else:
-            self._ensure_proxies()
+            self._ensure_cred()
             records = yield from self._search_manifest(date)
 
         oss_objects = self._list_oss_objects(date)
@@ -585,7 +639,7 @@ class ArxivTopicTask(SchedTask):
         pending = self.read_pending_skipped()
         self.log.info("二刷开始 date=%s 待补 %d 篇", date, len(pending))
         if not self.dry:
-            self._ensure_proxies()
+            self._ensure_cred()
         oss_objects = self._list_oss_objects(date)
 
         stats = {"papers_found": len(records), "uploaded": 0,
