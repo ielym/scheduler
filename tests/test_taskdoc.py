@@ -17,7 +17,7 @@ MINIMAL = {
     "schema_version": 2,
     "entry": {"file": "run.py", "interpreter": "python3", "args": [], "cwd": "."},
     "schedule": {"type": "manual"},
-    "resources": {"cpu": 0.1, "memory_mb": 64, "soft": {}},
+    "resources": {"cpu": 0.1, "memory_mb": 64},
 }
 
 

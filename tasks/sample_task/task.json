@@ -16,12 +16,13 @@
   "priority": 50,
   "env": {},
   "outputs": {
-    "expect": ["results/final.json"]
+    "expect": [
+      "results/final.json"
+    ]
   },
   "resources": {
     "cpu": 0.1,
-    "memory_mb": 64,
-    "soft": {}
+    "memory_mb": 64
   },
   "error_rules": {
     "resource_regex": [],

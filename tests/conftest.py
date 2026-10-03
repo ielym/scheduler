@@ -73,7 +73,7 @@ def write_task(
         "priority": priority,
         "env": env,
         "outputs": {"expect": ["results/final.json"]},
-        "resources": resources or {"cpu": 0.1, "memory_mb": 64, "soft": {}},
+        "resources": resources or {"cpu": 0.1, "memory_mb": 64},
         "error_rules": {"resource_regex": [], "logic_regex": []},
         "heartbeat": {"timeout_sec": 120},
         "smoke": {"mode": "dry", "max_runtime_sec": 60},

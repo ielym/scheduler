@@ -113,7 +113,7 @@
   <nav>
     <button data-tab="overview" class="active">总览</button>
     <button data-tab="jobs">任务</button>
-    <button data-tab="queue">队列/在途</button>
+    <button data-tab="queue">运行队列</button>
     <button data-tab="runs">历史</button>
     <button data-tab="decisions">决策</button>
     <button data-tab="profiles">画像</button>
@@ -159,69 +159,6 @@ function modal(title, bodyHtml, footHtml="", wide=false) {
   return bg;
 }
 
-// ---------------- 注册（POST + SSE 流读取） ----------------
-async function registerUI(jobId, onDone) {
-  const GATE_NAMES = {gate1_static:"闸1 静态闸", gate2_contract:"闸2 契约闸", gate3_smoke:"闸3 冒烟闸",
-                      gate4_capacity:"闸4 容量闸", gate5_checkpoint:"闸5 断点闸"};
-  const gates = ["gate1_static","gate2_contract","gate3_smoke","gate4_capacity","gate5_checkpoint"];
-  const rows = {};
-  const body = `<div>${gates.map(g => `<div class="gate"><div class="dot" id="rg-${g}"></div>
-      <div class="info"><div class="t">${GATE_NAMES[g]}</div><div class="r" id="rr-${g}">等待…</div></div>
-      <div class="el" id="re-${g}"></div></div>`).join("")}</div>`;
-  const m = modal(`注册任务 <code>${esc(jobId)}</code>`, body,
-    `<button class="act" id="rc-close" disabled>关闭</button>`);
-  gates.forEach(g => { rows[g] = {dot:$("#rg-"+g,m), r:$("#rr-"+g,m), el:$("#re-"+g,m)}; });
-
-  const setGate = (g, state, reason, extra="") => {
-    const row = rows[g]; if (!row) return;
-    row.dot.className = "dot " + state;
-    row.r.textContent = reason;
-    row.el.innerHTML = extra;
-  };
-  $("#rg-gate1_static",m).className = "dot run";
-  $("#rr-gate1_static",m).textContent = "执行中…";
-
-  const r = await fetch(`/api/register/${encodeURIComponent(jobId)}`, {method:"POST"});
-  if (!r.ok) { let msg = r.status+""; try { msg = (await r.json()).detail; } catch {}
-    setGate("gate1_static","fail",msg); $("#rc-close",m).disabled=false; return; }
-  const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
-  let okFinal = false;
-  while (true) {
-    const {value, done} = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, {stream:true});
-    let idx;
-    while ((idx = buf.indexOf("\n\n")) >= 0) {
-      const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
-      let event = "msg", data = {};
-      for (const line of chunk.split("\n")) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5)); } catch {} }
-      }
-      if (event === "error") {
-        const firstPending = gates.find(g => rows[g].dot.classList.contains("run"));
-        if (firstPending) setGate(firstPending, "fail", data.message);
-        else setGate("gate1_static","fail",data.message);
-      } else if (event === "gate_ok" || event === "gate_failed") {
-        const ok = event === "gate_ok";
-        const extra = data.smoke ? `耗时 ${data.elapsed_sec}s · 峰值 ${data.smoke.memory_peak_mb}MB · CPU ${data.smoke.cpu_sec}s`
-                    : (data.elapsed_sec != null ? `${data.elapsed_sec}s` : "");
-        setGate(data.gate, ok?"ok":"fail", data.reason, extra);
-        if (!ok) { $("#rc-close",m).disabled=false; return; }
-        const next = gates[gates.indexOf(data.gate)+1];
-        if (next && rows[next] && !rows[next].dot.classList.contains("ok")) {
-          rows[next].dot.className = "dot run"; rows[next].r.textContent = "执行中…";
-        }
-      } else if (event === "done") {
-        okFinal = !!data.ok;
-        if (okFinal) toast(`注册成功：${data.job_id}（预估 ${data.est_mem_mb}MB / ${data.est_cpu} 核）`, "ok");
-      }
-    }
-  }
-  $("#rc-close",m).disabled = false;
-  if (okFinal && onDone) onDone();
-}
-
 // ---------------- 文件编辑器 ----------------
 let EDIT = {jobId:null, path:null};
 function openEditor(jobId, autoPath) {
@@ -229,8 +166,7 @@ function openEditor(jobId, autoPath) {
     `<div class="editor-wrap"><div class="filelist" id="fl"></div>
       <div><div class="row" style="margin-bottom:8px">
         <span class="hint" id="ed-path"></span><span class="grow"></span>
-        <button class="act primary" id="ed-save">保存（热加载 ≤30s 生效）</button>
-        <button class="act" id="ed-reg">保存并跑五闸注册</button>
+        <button class="act primary" id="ed-save">保存（自动重新检查，≤30s 生效）</button>
       </div><textarea id="ed-area" spellcheck="false"></textarea></div></div>`,
     `<button class="act" id="ed-close">关闭</button>`, true);
   const fl = $("#fl",m), area = $("#ed-area",m);
@@ -250,15 +186,8 @@ function openEditor(jobId, autoPath) {
     try {
       await put(`/api/tasks/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(EDIT.path)}`,
                 {content: area.value});
-      toast("已保存 " + EDIT.path, "ok");
+      toast("已保存 " + EDIT.path + "，调度器将自动重新上线检查", "ok");
     } catch (e) { toast("保存失败：" + e.message, "err"); }
-  };
-  $("#ed-reg",m).onclick = async () => {
-    try {
-      await put(`/api/tasks/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(EDIT.path)}`,
-                {content: area.value});
-      m.remove(); await registerUI(jobId, loadTab);
-    } catch (e) { toast(e.message, "err"); }
   };
   $("#ed-close",m).onclick = () => m.remove();
   loadList().then(() => { if (autoPath) loadFile(autoPath).catch(()=>{});
@@ -303,18 +232,30 @@ async function tabOverview() {
   const d = await api("/api/overview");
   const memPct = Math.min(100, Math.round((d.machine.total_memory_mb - d.machine.available_memory_mb)/d.machine.total_memory_mb*100));
   const ledPct = Math.min(100, Math.round(d.ledger_reserved_mem_mb/Math.max(1,d.machine.total_memory_mb)*100));
-  const soft = Object.entries(d.soft||{}).map(([k,v]) => `
-    <div class="panel"><h2>软资源 <code>${esc(k)}</code>
-      <span class="spacer"></span>
-      <input type="number" id="soft-${esc(k)}" value="${v.cap}" min="0" style="width:90px">
-      <button class="act" data-soft="${esc(k)}">设置容量</button></h2>
-      <div style="padding:12px 15px">已用 ${v.used} / ${v.cap}
-        <div class="bar"><i style="width:${Math.min(100,v.cap?Math.round(v.used/v.cap*100):0)}%"></i></div></div></div>`).join("");
+  const tasks = await api("/api/tasks");
+  const pending = tasks.filter(t => !t.registered);
+  const admRows = pending.map(t => {
+    const a = t.admission;
+    let badgeHtml, detail;
+    if (!t.has_task_json) { badgeHtml = '<span class="badge b-err">缺少 task.json</span>'; detail = "放入合规的 task.json 后自动开始检查"; }
+    else if (!a) { badgeHtml = '<span class="badge b-dim">等待检查</span>'; detail = "下一轮热加载时自动开始（≤30s）"; }
+    else if (a.status === "checking") { badgeHtml = '<span class="badge b-blue">检查中</span>'; detail = "正在执行上线检查（静态/契约/冒烟/容量/断点）…"; }
+    else { badgeHtml = `<span class="badge b-err">未通过（已重试 ${a.attempts} 次）</span>`;
+           detail = `${esc(a.reason||"")}；修改文件后立即重试，否则 ${esc((a.next_check_after||"").replace(/^.*T/,"").slice(0,8))} 后自动重试`; }
+    return `<tr><td class="mono">${esc(t.id)}</td><td>${badgeHtml}</td>
+      <td class="hint" style="max-width:560px">${detail}</td>
+      <td><button class="act" data-files="${esc(t.id)}">查看文件</button></td></tr>`;
+  }).join("");
+  const admPanel = !pending.length ? "" : `
+    <div class="panel"><h2>等待上线检查的任务（${pending.length}）
+      <span class="spacer"></span><span class="hint">任务放进 tasks/ 即自动检查，通过后自动开始调度，无需注册</span></h2>
+      <table><thead><tr><th>任务</th><th>检查状态</th><th>说明 / 未通过原因</th><th></th></tr></thead>
+      <tbody>${admRows}</tbody></table></div>`;
   $("#view").innerHTML = `
     <div class="cards">
-      <div class="card"><div class="k">已注册任务</div><div class="v">${d.jobs}</div></div>
-      <div class="card"><div class="k">等待 WQ</div><div class="v">${d.waiting}</div></div>
-      <div class="card"><div class="k">在途运行</div><div class="v">${d.running}</div></div>
+      <div class="card"><div class="k">已纳入调度任务</div><div class="v">${d.jobs}</div></div>
+      <div class="card"><div class="k">等待运行</div><div class="v">${d.waiting}</div></div>
+      <div class="card"><div class="k">运行中</div><div class="v">${d.running}</div></div>
       <div class="card"><div class="k">整机内存</div><div class="v">${GB_MB(d.machine.available_memory_mb)}</div>
         <div class="sub">可用 / 共 ${GB_MB(d.machine.total_memory_mb)}（${memPct}% 占用）</div>
         <div class="bar"><i class="${memPct>85?'err':memPct>65?'warn':''}" style="width:${memPct}%"></i></div></div>
@@ -324,32 +265,12 @@ async function tabOverview() {
         <div class="bar"><i class="${ledPct>85?'err':ledPct>65?'warn':''}" style="width:${ledPct}%"></i></div></div>
     </div>
     <div class="panel"><h2>运行参数</h2><div style="padding:12px 15px" class="hint">
-      时区 ${esc(d.settings.timezone)} · cooldown ${d.settings.cooldown_sec}s · 抢占宽限 ${d.settings.grace_sec}s ·
-      cancel 宽限 ${d.settings.kill_grace_sec}s · 心跳 ${d.settings.heartbeat_timeout_sec}s ·
-      资源重试上限 ${d.settings.max_resource_attempts===0?"不封顶":d.settings.max_resource_attempts} ·
+      时区 ${esc(d.settings.timezone)} · 成功冷却 ${d.settings.cooldown_sec}s · 抢占宽限 ${d.settings.grace_sec}s ·
+      终止宽限 ${d.settings.kill_grace_sec}s · 心跳超时 ${d.settings.heartbeat_timeout_sec}s ·
+      资源错误重试上限 ${d.settings.max_resource_attempts===0?"不封顶（指数退避至 1h）":d.settings.max_resource_attempts} ·
       热加载 ${d.settings.hot_reload_sec}s · serve 启动 ${esc(d.started_at||"-")}</div></div>
-    ${soft || `<div class="panel"><h2>软资源</h2><div style="padding:12px 15px" class="hint">
-      尚未配置任何软资源；任务声明了 resources.soft 时会永久等待。
-      <button class="act" id="add-soft" style="margin-left:10px">新增软资源</button></div></div>`}
-    <div id="newsoft"></div>`;
-  document.querySelectorAll("[data-soft]").forEach(b => b.onclick = async () => {
-    const n = parseInt($("#soft-"+b.dataset.soft).value, 10);
-    try { await post("/api/soft", {name:b.dataset.soft, n}); toast(`soft[${b.dataset.soft}] = ${n}`, "ok"); }
-    catch(e){ toast(e.message,"err"); }
-  });
-  const addBtn = $("#add-soft");
-  if (addBtn) addBtn.onclick = () => {
-    $("#newsoft").innerHTML = `<div class="panel"><h2>新增软资源</h2><div style="padding:12px 15px" class="row">
-      <input type="text" id="ns-name" placeholder="资源名，如 proxy" style="width:180px">
-      <input type="number" id="ns-cap" value="1" min="0" style="width:100px">
-      <button class="act primary" id="ns-ok">创建</button></div></div>`;
-    $("#ns-ok").onclick = async () => {
-      const name = $("#ns-name").value.trim();
-      if (!name) return toast("资源名不能为空","err");
-      await post("/api/soft", {name, n: parseInt($("#ns-cap").value,10)||0});
-      toast("已创建","ok"); loadTab();
-    };
-  };
+    ${admPanel}`;
+  document.querySelectorAll("[data-files]").forEach(b => b.onclick = () => openEditor(b.dataset.files, "task.json"));
 }
 
 async function tabJobs() {
@@ -370,26 +291,44 @@ async function tabJobs() {
       <td><label class="switch"><input type="checkbox" ${j.enabled?"checked":""} data-en="${esc(j.job_id)}">
           <span class="slider"></span></label></td>
       <td>
-        <button class="act primary" data-run="${esc(j.job_id)}" ${j.ok?"":"disabled"}>触发入队</button>
-        <button class="act" data-reg="${esc(j.job_id)}">跑五闸注册</button>
+        <button class="act primary" data-run="${esc(j.job_id)}" ${j.ok?"":"disabled"}>立即运行一次</button>
         <button class="act" data-files="${esc(j.job_id)}">文件</button>
       </td></tr>`;
   };
+  const unregRow = t => {
+    const a = t.admission;
+    let statusCell, hintCell;
+    if (!t.has_task_json) {
+      statusCell = '<span class="badge b-err">缺少 task.json</span>';
+      hintCell = "放入合规的 task.json 后自动开始检查";
+    } else if (!a) {
+      statusCell = '<span class="badge b-dim">等待检查</span>';
+      hintCell = "≤30s 内自动开始上线检查";
+    } else if (a.status === "checking") {
+      statusCell = '<span class="badge b-blue">检查中…</span>';
+      hintCell = "正在跑五道闸（静态/契约/冒烟/容量/断点）";
+    } else {
+      statusCell = `<span class="badge b-err">未通过 · 已重试 ${a.attempts} 次</span>`;
+      hintCell = `${esc((a.reason||"").slice(0,160))}<br><span class="hint">改好文件后立即重试；否则下次自动重试 ${esc((a.next_check_after||"").replace(/^.*T/,"").slice(0,8))}</span>`;
+    }
+    return `<tr><td class="mono"><b>${esc(t.id)}</b></td><td>${statusCell}</td>
+      <td class="hint" style="max-width:520px">${hintCell}</td>
+      <td><button class="act" data-files="${esc(t.id)}">查看/修改文件</button></td></tr>`;
+  };
   $("#view").innerHTML = `
-    <div class="panel"><h2>已注册任务
+    <div class="panel"><h2>已纳入调度的任务
       <span class="spacer"></span>
       <button class="act primary" id="new-task">+ 新建任务</button></h2>
-      <table><thead><tr><th>任务</th><th>优先级</th><th>调度</th><th>下次触发</th><th>状态</th><th>启用</th><th>操作</th></tr></thead>
-      <tbody>${jobs.map(row).join("") || `<tr><td colspan="7" class="hint" style="padding:18px">暂无注册任务</td></tr>`}</tbody></table></div>
-    ${unreg.length ? `<div class="panel"><h2>未注册的任务目录（闸未过/已删除注册）</h2>
-      <table><tbody>${unreg.map(t=>`<tr><td class="mono">${esc(t.id)}</td><td>${t.has_task_json?'<span class="badge b-dim">有 task.json</span>':'<span class="badge b-err">缺 task.json</span>'}</td>
-        <td><button class="act" data-reg="${esc(t.id)}">注册</button><button class="act" data-files="${esc(t.id)}">文件</button></td></tr>`).join("")}
-      </tbody></table></div>`:""}`;
+      <table><thead><tr><th>任务</th><th>优先级</th><th>调度</th><th>下次运行</th><th>状态</th><th>启用</th><th>操作</th></tr></thead>
+      <tbody>${jobs.map(row).join("") || `<tr><td colspan="7" class="hint" style="padding:18px">暂无任务（把任务目录放进 tasks/，会自动完成上线检查）</td></tr>`}</tbody></table></div>
+    ${unreg.length ? `<div class="panel"><h2>等待上线检查（${unreg.length}）
+      <span class="spacer"></span><span class="hint">全自动：检查通过即开始调度，未通过改文件后自动重试</span></h2>
+      <table><thead><tr><th>任务</th><th>检查状态</th><th>说明 / 未通过原因</th><th>操作</th></tr></thead>
+      <tbody>${unreg.map(unregRow).join("")}</tbody></table></div>`:""}`;
   document.querySelectorAll("[data-run]").forEach(b => b.onclick = async () => {
     try { const r = await post(`/api/jobs/${encodeURIComponent(b.dataset.run)}/trigger`);
-      toast(`已入队：${r.run_id}`, "ok"); } catch(e){ toast("触发失败："+e.message,"err"); }
+      toast(`已加入运行队列：${r.run_id}`, "ok"); } catch(e){ toast("运行失败："+e.message,"err"); }
   });
-  document.querySelectorAll("[data-reg]").forEach(b => b.onclick = () => registerUI(b.dataset.reg, loadTab));
   document.querySelectorAll("[data-files]").forEach(b => b.onclick = () => openEditor(b.dataset.files, "task.json"));
   document.querySelectorAll("[data-en]").forEach(c => c.onchange = async () => {
     try { await post(`/api/jobs/${encodeURIComponent(c.dataset.en)}/enabled`, {enabled:c.checked});
@@ -397,8 +336,9 @@ async function tabJobs() {
   });
   $("#new-task").onclick = () => {
     const m = modal("新建任务",
-      `<div class="hint" style="margin-bottom:10px">在 <code>tasks/</code> 下创建最小骨架（manual 调度），
-       创建后在文件编辑器里填实，再跑五闸注册。更丰富的场景模板见 sched 技能 assets/templates。</div>
+      `<div class="hint" style="margin-bottom:10px">在 <code>tasks/</code> 下创建最小骨架（手动调度）。
+       创建后调度器会自动进行上线检查（五道闸），通过即开始调度；未通过会在本页显示原因，
+       在文件编辑器里改好保存后自动重试。更丰富的场景模板见 sched 技能 assets/templates。</div>
        <input type="text" id="nt-id" placeholder="任务 id：字母数字 _ -，1-64 位" style="width:100%">`,
       `<button class="act" id="nt-cancel">取消</button><button class="act primary" id="nt-ok">创建</button>`);
     $("#nt-cancel",m).onclick = () => m.remove();
@@ -422,17 +362,16 @@ async function tabQueue() {
     <td>${q.backoffs[it.job_id]?`<span class="badge b-warn">退避至 ${esc(q.backoffs[it.job_id].not_before||"")}</span>`:""}
         ${q.cooldowns[it.job_id]?`<span class="badge b-dim">冷却至 ${esc(q.cooldowns[it.job_id])}</span>`:""}</td></tr>`).join("");
   const r = q.running.map(it => `<tr>
-    <td class="mono">${esc(it.job_id)}</td><td>${badge("running")} ${esc(it.trigger)}${it.manual?"(手动)":""}</td>
+    <td class="mono">${esc(it.job_id)}</td><td>${badge("running")} ${esc(it.trigger)}${it.manual?"(手动运行)":""}</td>
     <td class="mono">${esc(it.run_id)}</td><td>${it.pid}</td><td>${it.est_cpu} 核 / ${it.est_mem_mb}MB</td>
-    <td>${Object.entries(it.soft||{}).map(([k,v])=>`${k}:${v}`).join(" ")||"-"}</td>
     <td class="mono">${esc(it.started_at||"")}</td></tr>`).join("");
   $("#view").innerHTML = `
-    <div class="panel"><h2>等待队列 WQ（${q.waiting.length}）</h2>
-      <table><thead><tr><th>任务</th><th>优先级</th><th>触发</th><th>尝试</th><th>恢复</th><th>入队时刻</th><th>退避/冷却</th></tr></thead>
-      <tbody>${w||'<tr><td colspan="7" class="hint" style="padding:16px">队列为空</td></tr>'}</tbody></table></div>
-    <div class="panel"><h2>在途运行（${q.running.length}）</h2>
-      <table><thead><tr><th>任务</th><th>状态</th><th>run_id</th><th>pid</th><th>预估资源</th><th>软资源</th><th>开始</th></tr></thead>
-      <tbody>${r||'<tr><td colspan="7" class="hint" style="padding:16px">无在途任务</td></tr>'}</tbody></table></div>`;
+    <div class="panel"><h2>等待运行（${q.waiting.length}）</h2>
+      <table><thead><tr><th>任务</th><th>优先级</th><th>触发方式</th><th>尝试</th><th>恢复</th><th>入队时刻</th><th>退避/冷却</th></tr></thead>
+      <tbody>${w||'<tr><td colspan="7" class="hint" style="padding:16px">没有等待运行的任务</td></tr>'}</tbody></table></div>
+    <div class="panel"><h2>运行中（${q.running.length}）</h2>
+      <table><thead><tr><th>任务</th><th>状态</th><th>run_id</th><th>pid</th><th>预估资源</th><th>开始</th></tr></thead>
+      <tbody>${r||'<tr><td colspan="6" class="hint" style="padding:16px">无运行中任务</td></tr>'}</tbody></table></div>`;
 }
 
 async function tabRuns() {

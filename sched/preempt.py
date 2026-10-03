@@ -15,7 +15,6 @@ class RunningInfo:
     priority: int
     est_cpu: float
     est_mem_mb: int
-    soft: dict[str, int]
     progress: int = 0
     started_monotonic: float = 0.0
     exempt_until_monotonic: float = 0.0
@@ -23,21 +22,16 @@ class RunningInfo:
     contract_exempt: bool = False  # 声明不可断点恢复的手动任务（不可被抢占）
 
 
-def freed_by(targets: list[RunningInfo]) -> tuple[float, int, dict[str, int]]:
+def freed_by(targets: list[RunningInfo]) -> tuple[float, int]:
     cpu = sum(t.est_cpu for t in targets)
     mem = sum(t.est_mem_mb for t in targets)
-    soft: dict[str, int] = {}
-    for t in targets:
-        for k, v in t.soft.items():
-            soft[k] = soft.get(k, 0) + v
-    return cpu, mem, soft
+    return cpu, mem
 
 
 def select_preempt_targets(
     running: list[RunningInfo],
     need_cpu: float,
     need_mem_mb: int,
-    need_soft: dict[str, int],
     waiter_priority: int,
 ) -> list[RunningInfo]:
     """贪心近似最小集合覆盖：按 priority 升序（最低优先者先）逐个加入，直到释放足够。
@@ -52,37 +46,25 @@ def select_preempt_targets(
                   and r.priority < waiter_priority]
     candidates.sort(key=lambda r: (r.priority, r.started_monotonic))  # 低优先、先启动者先被抢
     chosen: list[RunningInfo] = []
-    fcpu, fmem, fsoft = 0.0, 0, {}
-
-    def _enough() -> bool:
-        if fcpu < need_cpu or fmem < need_mem_mb:
-            return False
-        for k, v in need_soft.items():
-            if fsoft.get(k, 0) < v:
-                return False
-        return True
-
+    fcpu, fmem = 0.0, 0
     for cand in candidates:
-        if _enough():
+        if fcpu >= need_cpu and fmem >= need_mem_mb:
             break
         chosen.append(cand)
         fcpu += cand.est_cpu
         fmem += cand.est_mem_mb
-        for k, v in cand.soft.items():
-            fsoft[k] = fsoft.get(k, 0) + v
-    if not _enough():
+    if fcpu < need_cpu or fmem < need_mem_mb:
         return []
     return chosen
 
 
-def make_running_info(run: dict, est_cpu: float, est_mem_mb: int, soft: dict[str, int]) -> RunningInfo:
+def make_running_info(run: dict, est_cpu: float, est_mem_mb: int) -> RunningInfo:
     return RunningInfo(
         run_id=run["run_id"],
         job_id=run["job_id"],
         priority=int(run.get("priority") or 0),
         est_cpu=est_cpu,
         est_mem_mb=est_mem_mb,
-        soft=soft,
         progress=int(run.get("progress") or 0),
         started_monotonic=float(run.get("_started_monotonic") or 0.0),
         exempt_until_monotonic=float(run.get("_exempt_until_monotonic") or 0.0),

@@ -74,13 +74,3 @@ def test_reconcile_interrupted(home, make_settings):
     assert rows[0]["run_id"] == "stale"
     # active.json 已清空
     assert persist.load_active() == []
-
-
-def test_soft_pool_restore(home, make_settings):
-    config.ensure_layout()
-    st = persist.load_scheduler_state()
-    st.soft_capacities["proxy"] = 7
-    persist.save_scheduler_state(st)
-    svc = SchedulerService(make_settings(run_user=""))
-    svc._restore_soft_capacities()
-    assert svc.soft_pool.capacity("proxy") == 7

@@ -1,10 +1,14 @@
-"""L1 资源层：容量模型 + 画像（三级 + 下行）+ 账本（账本值/实测值双校验）+ 软资源令牌桶。
+"""L1 资源层：容量模型 + 画像（三级 + 下行）+ 账本（账本值/实测值双校验）。
 
 - 容量：/proc/meminfo + os.cpu_count() 读取整机能力，MemAvailable 用于「非调度器进程占用」感知。
 - 画像：三级估算 —— 个例峰值(cgroup memory.peak) → 滑动窗口 P95 → 保守默认/声明值，
   统一 × overshoot 上浮；样本窗口自然实现「下行修正」（越用越小则估小）。
 - 账本：book 值 = Σ 已准出任务预估；actual 值 = Σ cgroup 实测（由 monitor 刷新）。
-- 软资源：每个资源名一个令牌桶，占用量来自任务声明，满了就「时间换空间」排队。
+
+注意：代理并发、API 配额等「跨账号/跨机器、调度器无法感知真实容量」的外部资源不做
+令牌池管理——调度器无法获知同一代理是否被别的机器占用，静态容量只可能配错。
+这类资源由任务按退出码 100/101 自分类报错，调度器据错误码指数退避重试 + 渐进式提交
+动态避让（见 errors.py / service._handle_retry）。
 """
 
 from __future__ import annotations
@@ -128,11 +132,11 @@ class Ledger:
     """账本值预留（估计值求和）。actual 实测由 monitor 写入。"""
 
     def __init__(self) -> None:
-        self._reserved: dict[str, dict[str, float]] = {}  # run_id -> {"cpu": , "mem_mb": , "soft": {}}
+        self._reserved: dict[str, dict[str, float]] = {}  # run_id -> {"cpu": , "mem_mb": }
         self._actual: dict[str, dict[str, float]] = {}     # run_id -> monitor 实测
 
-    def reserve(self, run_id: str, cpu: float, mem_mb: int, soft: dict[str, int]) -> None:
-        self._reserved[run_id] = {"cpu": float(cpu), "mem_mb": float(mem_mb), "soft": dict(soft)}
+    def reserve(self, run_id: str, cpu: float, mem_mb: int) -> None:
+        self._reserved[run_id] = {"cpu": float(cpu), "mem_mb": float(mem_mb)}
 
     def release(self, run_id: str) -> None:
         self._reserved.pop(run_id, None)
@@ -147,9 +151,6 @@ class Ledger:
     def reserved_mem_mb(self) -> int:
         return int(sum(v["mem_mb"] for v in self._reserved.values()))
 
-    def reserved_soft(self, resource: str) -> int:
-        return int(sum(v["soft"].get(resource, 0) for v in self._reserved.values()))
-
     def actual_cpu(self) -> float:
         return sum(v["cpu"] for v in self._actual.values())
 
@@ -158,42 +159,3 @@ class Ledger:
 
     def reserved_snapshot(self) -> dict[str, dict]:
         return dict(self._reserved)
-
-
-# ---------- 软资源令牌桶 ----------
-class SoftResourcePool:
-    """每个软资源名一个令牌桶。容量由运行时配置声明，任务准出占用令牌，结束归还。"""
-
-    def __init__(self) -> None:
-        self._capacities: dict[str, int] = {}
-        self._used: dict[str, int] = {}
-
-    def set_capacity(self, name: str, amount: int) -> None:
-        self._capacities[name] = max(0, int(amount))
-
-    def capacity(self, name: str) -> int:
-        return self._capacities.get(name, 0)
-
-    def used(self, name: str) -> int:
-        return self._used.get(name, 0)
-
-    def available(self, name: str) -> int:
-        cap = self._capacities.get(name)
-        if cap is None:
-            return 0
-        return cap - self._used.get(name, 0)
-
-    def acquire(self, name: str, amount: int) -> bool:
-        if amount <= 0:
-            return True
-        if self.available(name) < amount:
-            return False
-        self._used[name] = self._used.get(name, 0) + amount
-        return True
-
-    def release(self, name: str, amount: int) -> None:
-        self._used[name] = max(0, self._used.get(name, 0) - amount)
-
-    def release_all(self, amounts: dict[str, int]) -> None:
-        for k, v in amounts.items():
-            self.release(k, v)

@@ -1,15 +1,12 @@
-"""L4 监测：阈值阶梯 + 心跳 + 超限退让 + 软资源降额。
+"""L4 监测：阈值阶梯 + 心跳 + 超限退让。
 
 - 心跳：任务 state.json.updated_at / 文件 mtime 超时 → 判卡死，整组终止（数据风险）。
 - 超限退让：cgroup 实测 / 账本预估 > overload_ratio 且持续 → 优雅抢占（而非硬杀）。
-- 软资源降额：某软资源近期 resource 错误过多 → 临时降低容量（时间换空间）。
 """
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 
 @dataclass
@@ -40,8 +37,6 @@ class Monitor:
         self.overload_sustain_ticks = max(1, int(overload_sustain_ticks))
         self.tick_interval_sec = tick_interval_sec
         self._overload_cnt: dict[str, int] = {}
-        # 软资源错误计数：resource_name -> 时间戳列表
-        self._soft_errors: dict[str, list[float]] = {}
 
     def tick(self, obs_list: list[RunningObs]) -> list[MonitorAction]:
         actions: list[MonitorAction] = []
@@ -68,13 +63,3 @@ class Monitor:
             if rid not in seen:
                 self._overload_cnt.pop(rid, None)
         return actions
-
-    def record_soft_error(self, resource_name: str) -> None:
-        self._soft_errors.setdefault(resource_name, []).append(time.monotonic())
-
-    def soft_error_count(self, resource_name: str, window_sec: float = 600.0) -> int:
-        """窗口内软资源错误计数（原误命名 soft_error_rate，返回的是计数而非比率）。"""
-        cutoff = time.monotonic() - window_sec
-        lst = self._soft_errors.get(resource_name, [])
-        self._soft_errors[resource_name] = [t for t in lst if t >= cutoff]
-        return len(self._soft_errors[resource_name])

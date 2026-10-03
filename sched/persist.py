@@ -1,6 +1,6 @@
 """L3 持久化：调度态原子快照 + 决策审计日志 + 运行态(active.json) 读写。
 
-- scheduler_state.json：全局队列 WQ / 冷却 / 退避 / 软资源容量 的原子快照（先落快照后执行）。
+- scheduler_state.json：全局队列 WQ / 冷却 / 退避 的原子快照（先落快照后执行）。
 - decisions.jsonl：每次调度决策的可追溯审计（append-only）。
 - active.json：在途运行（pid/pgid）供崩溃恢复 reconcile 用。
 """
@@ -31,9 +31,8 @@ class WaitingRun:
 @dataclass
 class SchedulerState:
     wq: list[dict] = field(default_factory=list)
-    cooldowns: dict[str, str] = field(default_factory=dict)     # key(job 或 job/soft) -> iso 截止
+    cooldowns: dict[str, str] = field(default_factory=dict)     # job_id -> iso 截止
     backoffs: dict[str, dict] = field(default_factory=dict)     # job_id -> {"until": iso, "attempts": n}
-    soft_capacities: dict[str, int] = field(default_factory=dict)
 
     def waiting_items(self) -> list[dict]:
         return self.wq
@@ -56,12 +55,21 @@ def load_scheduler_state() -> SchedulerState:
         wq=raw.get("wq") or [],
         cooldowns=raw.get("cooldowns") or {},
         backoffs=raw.get("backoffs") or {},
-        soft_capacities=raw.get("soft_capacities") or {},
     )
 
 
 def save_scheduler_state(st: SchedulerState) -> None:
     store.save_json(config.scheduler_state_file(), asdict(st))
+
+
+def load_admission_state() -> dict[str, dict]:
+    """自动准入状态：{job_id: {status: checking|failed, reason, last_check, next_check_after, ...}}。"""
+    raw = store.load_json(config.admission_state_file(), default={})
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_admission_state(state: dict[str, dict]) -> None:
+    store.save_json(config.admission_state_file(), state)
 
 
 def load_active() -> list[dict]:

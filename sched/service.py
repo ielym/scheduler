@@ -1,11 +1,17 @@
 """组装层：注册表 + 触发引擎 + 全局队列(WQ) + 准出/抢占 + 监测 + 执行(带 cgroup) + 持久化。
 
 运行模型：
+- 自动准入：tasks/ 下出现新任务目录即由后台线程串行跑五道闸（dry、无副作用），
+  通过自动纳入调度；失败记录原因并在任务文件修改/冷却到期后自动重试，全程无需手动注册。
 - WQ 所有待运行任务先入全局队列（持久化在 scheduler_state.json）。
-- 准出 tick：按双轨排序扫描，账本/软资源允许即准出，spawn runner 线程（cgroup 硬边界）。
+- 准出 tick：按双轨排序扫描，固定资源（CPU/内存）账本允许即准出，spawn runner 线程。
 - 抢占 tick：高优等固定资源时，选最低优先者发 preempt 事件 → runner SIGTERM → 任务 exit 99。
-- 监测 tick：心跳超时/超限退让/软资源降额。
-- finalize：唯一定点收敛终态，释放账本/软资源、记录画像、（中断/资源/抢占）触发恢复或退避重试。
+- 监测 tick：心跳超时/超限退让。
+- finalize：唯一定点收敛终态，释放账本、记录画像、（中断/资源/抢占）触发恢复或退避重试。
+
+代理并发/API 配额等外部资源不做静态容量池（调度器无法感知跨账号、跨机器的真实占用）：
+任务遇到这类问题时以退出码 100/101 报错，调度器按错误码指数退避重试，
+配合冷启动的渐进式提交（一次只放 1 项观察健康）动态避让。
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ import shutil
 import threading
 import time
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -40,7 +46,6 @@ class RunningEntry:
     spec: runner.RunSpec
     est_cpu: float = 0.0
     est_mem_mb: int = 0
-    soft: dict[str, int] = field(default_factory=dict)
     thread: threading.Thread | None = None
     cgroup_name: str = ""
     started_monotonic: float = 0.0
@@ -59,7 +64,6 @@ class SchedulerService:
         self.profiles.load()
         self.state = persist.load_scheduler_state()
         self.ledger = resources.Ledger()
-        self.soft_pool = resources.SoftResourcePool()
         self.capacity = resources.Capacity()
         self.running: dict[str, RunningEntry] = {}
         self.engine = TriggerEngine(self.settings.timezone)
@@ -88,11 +92,13 @@ class SchedulerService:
         self.preempt_exempt_sec = float(self.settings.preempt_exempt_sec)
         # 数据风险（110）二刷上限：连续达上限仍 110 转人工
         self.data_risk_max_reschedules = int(self.settings.data_risk_max_reschedules)
-        # 软资源降额：窗口内软资源错误过多 → 临时降额，冷却后恢复
-        self._soft_degraded_until: dict[str, float] = {}
-        self.soft_degrade_threshold = int(self.settings.soft_degrade_threshold)
-        self.soft_degrade_window_sec = float(self.settings.soft_degrade_window_sec)
-        self.soft_degrade_cooldown_sec = float(self.settings.soft_degrade_cooldown_sec)
+        # 自动准入：发现 tasks/ 下未注册任务 → 后台串行跑五闸 → 通过即纳入调度；
+        # 失败记录原因，任务文件变更或冷却到期后自动重试
+        self.admission_retry_sec = float(self.settings.auto_admit_retry_sec)
+        self._admission: dict[str, dict] = persist.load_admission_state()
+        self._admission_lock = threading.Lock()
+        self._admission_current: str | None = None
+        self._admission_thread: threading.Thread | None = None
         SchedulerService._instances.add(self)
 
     # ================= 生命周期 =================
@@ -127,12 +133,13 @@ class SchedulerService:
             persist.append_decision({"ts": runlog.now_iso(), "act": "cgroup_degraded",
                                      "reason": "cgroup 不可用，无硬资源边界"})
         self.refresh()
-        self._restore_soft_capacities()
         self._reconcile()
         self._recover_interrupted()
         self.started_at = runlog.now_iso()
         self._loop_thread = threading.Thread(target=self._loop, name="sched-loop", daemon=True)
         self._loop_thread.start()
+        # tasks/ 下的新任务自动跑五闸准入（后台串行，不阻塞主循环）
+        self._kick_auto_admission()
         # 内嵌管理台（settings.web.enabled 或 serve --web）；与调度循环共享本 service 实例
         if getattr(self, "_web_enabled", False):
             from . import web
@@ -142,6 +149,8 @@ class SchedulerService:
         self._stopping.set()
         if self._loop_thread:
             self._loop_thread.join(timeout=5)
+        if self._admission_thread and self._admission_thread.is_alive():
+            self._admission_thread.join(timeout=10)
         # 优雅停机不直接 _finalize，而是对每个 worker 线程发 cancel → 等它自然收敛到
         # worker 里的 _finalize（终态唯一定点）；只有超时才兜底。
         with self._lock:
@@ -192,11 +201,19 @@ class SchedulerService:
         run_user = run_user or (self.settings.run_user or "")
         if run_user:
             try:
-                pwd.getpwnam(run_user)
+                pw = pwd.getpwnam(run_user)
             except KeyError:
                 raise taskdoc.TaskDocError(
                     f"运行用户 {run_user!r} 不存在：请先创建（useradd -r -m -s /usr/sbin/nologin {run_user}），"
                     f"或在 task.json 的 runtime.user / settings.json 的 run_user 中改用已有用户/置空")
+            # serve 以 root 运行时，把任务目录树降权给执行用户（等价部署步骤
+            # chown -R <user> tasks/<id>），保证闸门冒烟与正式运行能读代码、写 cache/results；
+            # 非 root 部署下用户与任务同属主，无需 chown
+            if os.geteuid() == 0:
+                try:
+                    self._chown_tree(task_dir, pw.pw_uid, pw.pw_gid)
+                except OSError as exc:
+                    raise taskdoc.TaskDocError(f"任务目录降权给 {run_user} 失败：{exc}")
         # 五道闸
         ok, results, profile = contract.run_gates(doc, task_dir, settings=self.settings)
         if not ok:
@@ -211,6 +228,128 @@ class SchedulerService:
         registry.upsert_state(name, {"enabled": True})
         self.refresh()
         return {"job_id": name, "gates": [r.reason for r in results]}
+
+    # ================= 自动准入 =================
+    @staticmethod
+    def _chown_tree(path: Path, uid: int, gid: int) -> None:
+        """递归改属主；对符号链接只改链接本身，不跟随到目录外目标。"""
+        os.chown(path, uid, gid, follow_symlinks=False)
+        for root, dirs, files in os.walk(path):
+            for name in dirs + files:
+                os.chown(os.path.join(root, name), uid, gid, follow_symlinks=False)
+
+    def admission_snapshot(self) -> dict[str, dict]:
+        """未注册任务的自动准入状态（检查中/失败原因/下次重试），供管理台展示。"""
+        with self._admission_lock:
+            snap = {k: dict(v) for k, v in self._admission.items()}
+        current = self._admission_current
+        if current and current not in snap:
+            snap[current] = {"status": "checking", "since": ""}
+        return snap
+
+    @staticmethod
+    def _task_fingerprint(task_dir: Path) -> int:
+        """任务代码/配置文件的最新修改时间（ns）。cache/results 是运行产物，不参与。"""
+        latest = 0
+        if not task_dir.is_dir():
+            return latest
+        for p in task_dir.rglob("*"):
+            rel = p.relative_to(task_dir)
+            if rel.parts and rel.parts[0] in ("cache", "results"):
+                continue
+            try:
+                latest = max(latest, p.stat().st_mtime_ns)
+            except OSError:
+                continue
+        return latest
+
+    def _discover_unregistered(self) -> list[str]:
+        """tasks/ 下含 task.json 但不在 jobs.json 的任务目录（按名排序，保证处理顺序稳定）。"""
+        with self._lock:
+            registered = set(self.entries)
+        tdir = config.tasks_dir()
+        if not tdir.is_dir():
+            return []
+        return [d.name for d in sorted(tdir.iterdir())
+                if d.is_dir() and (d / "task.json").is_file() and d.name not in registered]
+
+    def _admission_due(self, rec: dict, name: str) -> bool:
+        """失败记录是否可以重试：任务文件改动后立即重试，否则等冷却到期。"""
+        fp = self._task_fingerprint(config.tasks_dir() / name)
+        if fp and fp != int(rec.get("fingerprint") or 0):
+            return True
+        after = rec.get("next_check_after") or ""
+        try:
+            return datetime.now().astimezone() >= datetime.fromisoformat(after)
+        except ValueError:
+            return True
+
+    def _kick_auto_admission(self) -> None:
+        """挑选一个待准入任务，后台串行跑五闸；同一时刻只有一个检查在跑。"""
+        if self._stopping.is_set():
+            return
+        with self._admission_lock:
+            if self._admission_current is not None:
+                return
+            candidate, attempts = None, 0
+            for name in self._discover_unregistered():
+                rec = self._admission.get(name)
+                if rec is not None and rec.get("status") == "failed" and not self._admission_due(rec, name):
+                    continue
+                if rec is not None and rec.get("status") == "checking":
+                    # 上次进程崩溃遗留的 checking：作为新一轮重试
+                    attempts = int(rec.get("attempts") or 0)
+                elif rec is not None:
+                    attempts = int(rec.get("attempts") or 0)
+                candidate = name
+                break
+            if candidate is None:
+                return
+            self._admission[candidate] = {"status": "checking", "since": runlog.now_iso(),
+                                          "attempts": attempts}
+            self._admission_current = candidate
+            persist.save_admission_state(self._admission)
+        t = threading.Thread(target=self._auto_admit_worker, args=(candidate,),
+                             name=f"admit-{candidate}", daemon=True)
+        self._admission_thread = t
+        t.start()
+
+    def _auto_admit_worker(self, name: str) -> None:
+        try:
+            self.register_job(name)
+        except Exception as exc:  # 准入失败不允许炸掉后台线程：记录原因，冷却后/改完文件自动重试
+            reason = self._admission_error_text(exc)
+            with self._admission_lock:
+                prev = self._admission.get(name) or {}
+                attempts = int(prev.get("attempts") or 0) + 1
+                not_before = (datetime.now().astimezone()
+                              + timedelta(seconds=self.admission_retry_sec)).isoformat(timespec="seconds")
+                self._admission[name] = {
+                    "status": "failed",
+                    "reason": reason,
+                    "attempts": attempts,
+                    "last_check": runlog.now_iso(),
+                    "next_check_after": not_before,
+                    "fingerprint": self._task_fingerprint(config.tasks_dir() / name),
+                }
+                persist.save_admission_state(self._admission)
+            persist.append_decision({"ts": runlog.now_iso(), "act": "auto_admit_failed",
+                                     "job_id": name, "reason": reason, "attempts": attempts})
+        else:
+            with self._admission_lock:
+                self._admission.pop(name, None)
+                persist.save_admission_state(self._admission)
+            persist.append_decision({"ts": runlog.now_iso(), "act": "auto_admit_ok", "job_id": name})
+        finally:
+            with self._admission_lock:
+                self._admission_current = None
+            self._kick_auto_admission()  # 立刻检查下一个，不必等下一轮热加载
+
+    @staticmethod
+    def _admission_error_text(exc: Exception) -> str:
+        if isinstance(exc, taskdoc.TaskDocError):
+            return "；".join(exc.errors)
+        return f"{type(exc).__name__}: {exc}"
 
     # ================= 触发/入队 =================
     def trigger(self, job_id: str, trigger: str = "manual", dry_run: bool = False, priority_override: int | None = None) -> dict:
@@ -275,6 +414,7 @@ class SchedulerService:
                     self.refresh()
                     if isinstance(self.capacity, resources.Capacity):
                         self.capacity.refresh()
+                    self._kick_auto_admission()
                     last_refresh = time.monotonic()
                 self._tick_triggers()
                 self._tick_admission()
@@ -319,15 +459,13 @@ class SchedulerService:
         if not items:
             self._staged_run_id = None
             return
-        self._apply_soft_degrade()
         ordered = admission.order_waiting(items, self.settings.starvation_sec, runlog.now_iso())
         res = admission.admission_scan(
             ordered,
             get_declared=lambda jid: self._declared(jid),
-            get_profile=lambda jid: self.profiles.get(jid, *self._declared(jid)[:2]),
+            get_profile=lambda jid: self.profiles.get(jid, *self._declared(jid)),
             ledger=self.ledger,
             capacity=self.capacity,
-            soft_pool=self.soft_pool,
             overshoot=self.settings.resource.overshoot,
             external_mem_margin_mb=self.settings.resource.external_safety_margin_mb,
         )
@@ -337,7 +475,7 @@ class SchedulerService:
         with self._lock:
             running_cnt = len(self.running)
             staged_in_running = self._staged_run_id is not None and self._staged_run_id in self.running
-        if res.blocked_fixed:
+        if res.blocked:
             if self._staged_run_id is None:
                 if running_cnt == 0:
                     admitted = admitted[:1]
@@ -356,26 +494,6 @@ class SchedulerService:
             self._staged_released = False
         for rid in admitted:
             self._admit(rid)
-
-    def _apply_soft_degrade(self) -> None:
-        """软资源降额：近期软资源错误过多 → 临时降额（下限 1），冷却后恢复原配额。"""
-        now = time.monotonic()
-        for name, cap in list(self.state.soft_capacities.items()):
-            degraded_until = self._soft_degraded_until.get(name)
-            if degraded_until is not None:
-                if now >= degraded_until:
-                    self.soft_pool.set_capacity(name, cap)
-                    self._soft_degraded_until.pop(name, None)
-                    persist.append_decision({"ts": runlog.now_iso(), "act": "soft_capacity_restore",
-                                             "resource": name, "capacity": cap})
-                continue
-            if self.monitor.soft_error_count(name, self.soft_degrade_window_sec) >= self.soft_degrade_threshold:
-                new_cap = max(1, int(cap) // 2)
-                self.soft_pool.set_capacity(name, new_cap)
-                self._soft_degraded_until[name] = now + self.soft_degrade_cooldown_sec
-                persist.append_decision({"ts": runlog.now_iso(), "act": "soft_capacity_degrade",
-                                         "resource": name, "capacity": new_cap,
-                                         "cooldown_sec": self.soft_degrade_cooldown_sec})
 
     def _admit(self, run_id: str) -> None:
         with self._lock:
@@ -397,7 +515,7 @@ class SchedulerService:
             with self._lock:
                 self.state.enqueue(it)
             return
-        decl_cpu, decl_mem, soft = self._declared(it["job_id"])
+        decl_cpu, decl_mem = self._declared(it["job_id"])
         prof = self.profiles.get(it["job_id"], decl_cpu, decl_mem)
         est_cpu, est_mem = admission.estimate_job(prof, decl_cpu, decl_mem,
                                                   self.settings.resource.overshoot, self.capacity)
@@ -406,17 +524,7 @@ class SchedulerService:
         if est_cpu <= 0:
             est_cpu = decl_cpu or 0.5
 
-        # 软资源令牌（admission_scan 已预判，这里竞态兜底）
-        acquired: list[str] = []
-        for name, amt in soft.items():
-            if not self.soft_pool.acquire(name, amt):
-                for n2 in acquired:
-                    self.soft_pool.release(n2, soft.get(n2, 0))
-                with self._lock:
-                    self.state.enqueue(it)
-                return
-            acquired.append(name)
-        self.ledger.reserve(run_id, est_cpu, est_mem, soft)
+        self.ledger.reserve(run_id, est_cpu, est_mem)
 
         cgroup_name = f"{it['job_id']}/{run_id}"
         mem_high = int(est_mem * 1024 * 1024 * self.settings.resource.memory_high_ratio)
@@ -444,9 +552,9 @@ class SchedulerService:
         it["status"] = runlog.STATUS_RUNNING
         it["started_at"] = runlog.now_iso()
         it["wait_ms"] = int(runlog._iso_seconds_between(it["queued_at"], it["started_at"]) * 1000)
-        it["resources"] = {"cpu": est_cpu, "memory_mb": est_mem, "soft": soft}
+        it["resources"] = {"cpu": est_cpu, "memory_mb": est_mem}
         it["_started_monotonic"] = time.monotonic()
-        re = RunningEntry(run=it, spec=spec, est_cpu=est_cpu, est_mem_mb=est_mem, soft=soft,
+        re = RunningEntry(run=it, spec=spec, est_cpu=est_cpu, est_mem_mb=est_mem,
                           cgroup_name=cgroup_name, started_monotonic=it["_started_monotonic"],
                           exempt_until_monotonic=float(it.get("_exempt_until_monotonic") or 0.0))
         re.thread = threading.Thread(target=self._run_worker, args=(re,), name=f"run-{run_id}", daemon=True)
@@ -495,25 +603,21 @@ class SchedulerService:
         if not blocked:
             return
         blocked.sort(key=lambda it: -int(it.get("priority") or 0))
-        running_infos = [preempt.make_running_info(re.run, re.est_cpu, re.est_mem_mb, re.soft)
+        running_infos = [preempt.make_running_info(re.run, re.est_cpu, re.est_mem_mb)
                          for re in list(self.running.values())]
         chosen: set[str] = set()
         freed_cpu, freed_mem = 0.0, 0
-        freed_soft: dict[str, int] = {}
         for top in blocked:
             need_cpu, need_mem = self._estimate_for(top)
-            _, _, soft_need = self._declared(top["job_id"])
             # 按真实缺口计算：需求 - 当前账本空闲 - 本轮已抢占将释放的量（部分空闲场景只补差额）
             free_cpu = self.capacity.total_cpu - self.ledger.reserved_cpu() + freed_cpu
             free_mem = self.capacity.total_memory_mb - self.ledger.reserved_mem_mb() + freed_mem
             gap_cpu = max(0.0, need_cpu - free_cpu)
             gap_mem = max(0, need_mem - free_mem)
-            gap_soft = {k: max(0, v - (self.soft_pool.available(k) + freed_soft.get(k, 0)))
-                        for k, v in soft_need.items()}
-            if gap_cpu <= 0 and gap_mem <= 0 and not any(gap_soft.values()):
+            if gap_cpu <= 0 and gap_mem <= 0:
                 continue  # 空闲已足够，无需抢占（等待可能是账本竞态，下轮准出即可）
             targets = preempt.select_preempt_targets(
-                running_infos, gap_cpu, gap_mem, gap_soft,
+                running_infos, gap_cpu, gap_mem,
                 waiter_priority=int(top.get("priority") or 0))
             for t in targets:
                 if t.run_id in chosen:
@@ -527,22 +631,20 @@ class SchedulerService:
                 chosen.add(t.run_id)
                 freed_cpu += t.est_cpu
                 freed_mem += t.est_mem_mb
-                for k, v in t.soft.items():
-                    freed_soft[k] = freed_soft.get(k, 0) + v
                 persist.append_decision({"ts": runlog.now_iso(), "act": "preempt", "run_id": t.run_id,
                                          "job_id": t.job_id, "for_job": top["job_id"]})
 
     def _fixed_blocked(self, it: dict) -> bool:
-        decl_cpu, decl_mem, soft = self._declared(it["job_id"])
+        decl_cpu, decl_mem = self._declared(it["job_id"])
         prof = self.profiles.get(it["job_id"], decl_cpu, decl_mem)
         est_cpu, est_mem = admission.estimate_job(prof, decl_cpu, decl_mem,
                                                   self.settings.resource.overshoot, self.capacity)
-        ok, reason = admission.can_admit(est_cpu, est_mem, soft, self.ledger, self.capacity, self.soft_pool,
+        ok, reason = admission.can_admit(est_cpu, est_mem, self.ledger, self.capacity,
                                          external_mem_margin_mb=self.settings.resource.external_safety_margin_mb)
-        return (not ok) and ("固定" in reason or "CPU" in reason or "内存" in reason)
+        return not ok
 
     def _estimate_for(self, it: dict) -> tuple[float, int]:
-        decl_cpu, decl_mem, soft = self._declared(it["job_id"])
+        decl_cpu, decl_mem = self._declared(it["job_id"])
         prof = self.profiles.get(it["job_id"], decl_cpu, decl_mem)
         return admission.estimate_job(prof, decl_cpu, decl_mem,
                                       self.settings.resource.overshoot, self.capacity)
@@ -616,8 +718,6 @@ class SchedulerService:
         with self._lock:
             self.running.pop(rec["run_id"], None)
         self.ledger.release(rec["run_id"])
-        for k, v in re.soft.items():
-            self.soft_pool.release(k, v)
         cgroup.Cgroup(re.cgroup_name).remove()
 
         rec["status"] = status
@@ -634,14 +734,9 @@ class SchedulerService:
             duration_sec = max(1, int((rec.get("duration_ms") or 0) / 1000))
             avg_cpu_cores = round(cpu_sec / duration_sec, 3)
             self.profiles.record(rec["job_id"], avg_cpu_cores, mem_peak_mb,
-                                 *self._declared(rec["job_id"])[:2],
+                                 *self._declared(rec["job_id"]),
                                  window=self.settings.resource.window_samples)
             self.profiles.save()
-
-        # 软资源降额信号：软资源错误(101)计入错误率，供准出侧降额
-        if status == runlog.STATUS_RESOURCE and rec.get("exit_code") == errors.EXIT_SOFT_RESOURCE:
-            for name in re.soft:
-                self.monitor.record_soft_error(name)
 
         # 渐进式提交：观察项以资源错误/超限终结 → 门禁重置
         if status in (runlog.STATUS_RESOURCE, runlog.STATUS_PREEMPTED, runlog.STATUS_FAILED):
@@ -889,12 +984,12 @@ class SchedulerService:
         return task_dir.encode() in raw
 
     # ================= 工具 =================
-    def _declared(self, job_id: str) -> tuple[float, int, dict[str, int]]:
+    def _declared(self, job_id: str) -> tuple[float, int]:
         e = self.entries.get(job_id)
         if e is None or not e.ok or e.doc is None:
-            return 0.0, 0, {}
+            return 0.0, 0
         r = e.doc.resources
-        return float(r.cpu), int(r.memory_mb), dict(r.soft)
+        return float(r.cpu), int(r.memory_mb)
 
     def _read_task_state(self, task_dir: Path, run_id: str = "") -> tuple[dict, float]:
         """读任务实例级状态。F4：优先 cache/runs/<run_id>/state.json，回落 legacy。"""
@@ -941,10 +1036,6 @@ class SchedulerService:
         except ValueError:
             return False
 
-    def _restore_soft_capacities(self) -> None:
-        for k, v in self.state.soft_capacities.items():
-            self.soft_pool.set_capacity(k, v)
-
     def _close_expired_windows(self, doc: taskdoc.TaskDoc, now: datetime) -> None:
         sched = doc.schedule
         if sched.type != "interval" or not (sched.start_time and sched.end_time) or sched.allow_overrun:
@@ -982,6 +1073,10 @@ class SchedulerService:
                 "running": len(self.running),
                 "ledger_reserved_mem_mb": self.ledger.reserved_mem_mb(),
                 "ledger_actual_mem_mb": self.ledger.actual_mem_mb(),
-                "soft": {k: {"cap": self.soft_pool.capacity(k), "used": self.soft_pool.used(k)}
-                         for k in self.state.soft_capacities},
+                "admission": {
+                    "checking": sum(1 for v in self.admission_snapshot().values()
+                                    if v.get("status") == "checking"),
+                    "failed": sum(1 for v in self.admission_snapshot().values()
+                                  if v.get("status") == "failed"),
+                },
             }

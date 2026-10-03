@@ -2,9 +2,11 @@
 
 设计约束（与 sched 技能的 H1 一致）：
 - Web 层只允许在 serve 进程内启动（start_in_thread），所有写操作直接调用同一个
-  SchedulerService 实例。禁止另起 Web 进程：WQ/账本/软资源是 serve 的内存态，
+  SchedulerService 实例。禁止另起 Web 进程：WQ/账本是 serve 的内存态，
   跨进程写 scheduler_state.json 会被 serve 下一次落盘覆盖。
-- 触发类操作只入队（service.trigger），绝不直接拉起任务进程；注册真实跑五道闸。
+- 上线检查（五道闸）由调度器自动完成：tasks/ 出现新任务目录即后台检查，
+  通过自动纳入调度，失败在页面展示原因并自动重试，页面无注册按钮。
+- 「立即运行一次」只入队（service.trigger），绝不直接拉起任务进程。
 - 文件编辑仅限任务目录内的源码类文件，cache/results 运行时产物禁止经 Web 改写。
 """
 
@@ -13,17 +15,16 @@ from __future__ import annotations
 import base64
 import hmac
 import ipaddress
-import json
 import os
 import threading
 import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import config, contract, persist, registry, runlog, store, taskdoc
+from . import config, persist, registry, runlog, store, taskdoc
 
 
 def is_loopback(host: str) -> bool:
@@ -49,9 +50,6 @@ def validate_public_listen(cfg) -> None:
 
 STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 
-# 同一时刻只允许一个 register（闸门会真实串行拉起最多 4 个进程，见 gates.md）
-_register_lock = threading.Lock()
-
 _EDIT_ALLOWED_SUFFIX = {".py", ".json", ".txt", ".md", ".conf", ".cfg", ".ini", ".yaml", ".yml", ".sh", ".env"}
 _EDIT_DENY_PARTS = {"cache", "results", "__pycache__", ".git"}
 _MAX_FILE_BYTES = 1024 * 1024
@@ -66,11 +64,6 @@ class TriggerResp(BaseModel):
 
 class EnabledReq(BaseModel):
     enabled: bool
-
-
-class SoftReq(BaseModel):
-    name: str
-    n: int
 
 
 class CreateReq(BaseModel):
@@ -119,7 +112,7 @@ _SKELETON_TASK_JSON = """{
   "priority": 40,
   "env": {},
   "outputs": {"expect": ["results/final.json"]},
-  "resources": {"cpu": 0.2, "memory_mb": 128, "soft": {}},
+  "resources": {"cpu": 0.2, "memory_mb": 128},
   "error_rules": {"resource_regex": [], "logic_regex": ["LOGIC:"]},
   "heartbeat": {"timeout_sec": 120},
   "smoke": {"mode": "dry", "max_runtime_sec": 60, "signal_after_sec": 1.5},
@@ -210,7 +203,7 @@ def _running_snapshot(svc) -> list[dict]:
             "run_id": r.get("run_id"), "job_id": r.get("job_id"), "pid": r.get("pid"),
             "trigger": r.get("trigger"), "attempt": r.get("attempt"),
             "started_at": r.get("started_at"), "est_cpu": re.est_cpu, "est_mem_mb": re.est_mem_mb,
-            "soft": re.soft, "manual": bool(r.get("manual")),
+            "manual": bool(r.get("manual")),
         })
     return out
 
@@ -332,7 +325,7 @@ def create_app(svc) -> FastAPI:
         svc.profiles.load()
         out = {}
         for jid, d in svc.profiles._data.items():
-            decl_cpu, decl_mem, _ = svc._declared(jid)
+            decl_cpu, decl_mem = svc._declared(jid)
             p = svc.profiles.get(jid, decl_cpu, decl_mem)
             out[jid] = {
                 "p95_cpu": p.p95_cpu(), "p95_memory_mb": p.p95_memory_mb(),
@@ -364,143 +357,33 @@ def create_app(svc) -> FastAPI:
                                  "job_id": job_id, "enabled": req.enabled})
         return {"ok": True, "job_id": job_id, "enabled": req.enabled}
 
-    @app.post("/api/soft")
-    def set_soft(req: SoftReq):
-        if req.n < 0:
-            raise HTTPException(400, "容量必须是非负整数")
-        svc.state.soft_capacities[req.name] = req.n
-        svc.soft_pool.set_capacity(req.name, req.n)
-        persist.save_scheduler_state(svc.state)
-        return {"ok": True, "name": req.name, "capacity": req.n}
-
-    # ---------- 注册（SSE 逐闸推送，等价 python3 -m sched register） ----------
-
-    @app.post("/api/register/{job_id}")
-    def register_job(job_id: str):
-        if not _register_lock.acquire(blocking=False):
-            raise HTTPException(409, "已有注册在进行中，请等待其结束")
-
-        def sse():
-            try:
-                def emit(event: str, payload: dict) -> str:
-                    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-                try:
-                    taskdoc.validate_task_id(job_id)
-                    task_dir = config.tasks_dir() / job_id
-                    if not task_dir.is_dir():
-                        yield emit("error", {"message": f"任务目录不存在：{task_dir}"})
-                        return
-                    doc = taskdoc.load_task_doc(task_dir)
-                    run_user = (doc.runtime.user or "") or (svc.settings.run_user or "")
-                    import pwd
-                    if run_user:
-                        try:
-                            pwd.getpwnam(run_user)
-                        except KeyError:
-                            yield emit("error", {"message": f"运行用户 {run_user!r} 不存在"})
-                            return
-                        # 与技能部署步骤等价：保证降权用户能读代码、写 cache/results
-                        try:
-                            _chown_tree(task_dir, run_user)
-                        except (PermissionError, OSError) as e:
-                            yield emit("error", {"message": f"chown {run_user} 失败（serve 是否 root？）：{e}"})
-                            return
-                except taskdoc.TaskDocError as e:
-                    yield emit("error", {"message": "; ".join(e.errors)})
-                    return
-
-                gates = contract.ContractGates(svc.settings)
-                measured_mem = 0
-
-                # 手动逐闸（为拿到每闸事件，不能直接 run_all）
-                seq = [
-                    ("gate1_static", lambda: gates.gate_static(doc, task_dir)),
-                    ("gate2_contract", lambda: gates.gate_contract(doc, task_dir)),
-                    ("gate3_smoke", lambda: gates.gate_smoke(doc, task_dir)),
-                ]
-                results = []
-                for name, fn in seq:
-                    t0 = time.monotonic()
-                    try:
-                        r = fn()
-                    except Exception as e:
-                        yield emit("error", {"message": f"{name} 执行异常：{type(e).__name__}: {e}"})
-                        return
-                    elapsed = round(time.monotonic() - t0, 2)
-                    results.append(r)
-                    data = {"gate": r.gate, "ok": r.ok, "reason": r.reason, "elapsed_sec": elapsed}
-                    smoke = (r.artifacts or {}).get("smoke")
-                    if smoke:
-                        measured_mem = int(smoke.get("memory_peak_mb") or 0)
-                        data["smoke"] = {k: smoke.get(k) for k in
-                                         ("elapsed_sec", "memory_peak_mb", "cpu_sec", "exit_code")}
-                    if (r.artifacts or {}).get("est_mem_mb"):
-                        data["est_mem_mb"] = r.artifacts["est_mem_mb"]
-                    yield emit("gate_ok" if r.ok else "gate_failed", data)
-                    if not r.ok:
-                        yield emit("done", {"ok": False, "job_id": job_id})
-                        return
-
-                t0 = time.monotonic()
-                g4 = gates.gate_capacity(doc, task_dir, measured_mem_mb=measured_mem)
-                results.append(g4)
-                d4 = {"gate": g4.gate, "ok": g4.ok, "reason": g4.reason,
-                      "elapsed_sec": round(time.monotonic() - t0, 2),
-                      "est_mem_mb": (g4.artifacts or {}).get("est_mem_mb")}
-                yield emit("gate_ok" if g4.ok else "gate_failed", d4)
-                if not g4.ok:
-                    yield emit("done", {"ok": False, "job_id": job_id})
-                    return
-
-                if not doc.contract_exempt:
-                    t0 = time.monotonic()
-                    g5 = gates.gate_checkpoint(doc, task_dir)
-                    results.append(g5)
-                    d5 = {"gate": g5.gate, "ok": g5.ok, "reason": g5.reason,
-                          "elapsed_sec": round(time.monotonic() - t0, 2)}
-                    yield emit("gate_ok" if g5.ok else "gate_failed", d5)
-                    if not g5.ok:
-                        yield emit("done", {"ok": False, "job_id": job_id})
-                        return
-
-                # 全过：与 SchedulerService.register_job 相同的落库动作（本进程同一 svc）
-                est_mem = int(measured_mem or doc.resources.memory_mb or 0)
-                est_cpu = 0.0
-                smoke_r = results[2].artifacts.get("smoke") or {}
-                el = float(smoke_r.get("elapsed_sec") or 0)
-                if el > 0:
-                    est_cpu = round(float(smoke_r.get("cpu_sec") or 0) / el, 3)
-                svc.profiles.record(job_id, est_cpu, est_mem, doc.resources.cpu,
-                                    doc.resources.memory_mb,
-                                    window=svc.settings.resource.window_samples)
-                svc.profiles.save()
-                registry.upsert_state(job_id, {"enabled": True})
-                svc.refresh()
-                yield emit("done", {"ok": True, "job_id": job_id,
-                                    "est_mem_mb": est_mem, "est_cpu": est_cpu})
-            finally:
-                _register_lock.release()
-
-        return StreamingResponse(sse(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
     # ---------- 任务源码文件 ----------
 
     @app.get("/api/tasks")
     def list_tasks():
         rows = []
         registered = registry.load_state()
+        admission = svc.admission_snapshot()
         if config.tasks_dir().exists():
             for d in sorted(config.tasks_dir().iterdir()):
                 if not d.is_dir() or d.name.startswith((".", "_")):
                     continue
                 has_tj = (d / "task.json").exists()
-                rows.append({
+                row = {
                     "id": d.name, "has_task_json": has_tj,
                     "registered": d.name in registered,
                     "enabled": bool(registered.get(d.name, {}).get("enabled", True)),
-                })
+                }
+                adm = admission.get(d.name)
+                if not row["registered"] and adm:
+                    row["admission"] = {
+                        "status": adm.get("status"),
+                        "reason": adm.get("reason", ""),
+                        "attempts": int(adm.get("attempts") or 0),
+                        "last_check": adm.get("last_check", ""),
+                        "next_check_after": adm.get("next_check_after", ""),
+                    }
+                rows.append(row)
         return rows
 
     @app.post("/api/tasks")
@@ -526,6 +409,8 @@ def create_app(svc) -> FastAPI:
             except (KeyError, PermissionError, OSError) as e:
                 chown_error = f"（注意：chown {run_user} 失败：{e}；闸2 前需手动处理目录属主）"
         persist.append_decision({"ts": runlog.now_iso(), "act": "web_create_task", "job_id": req.id})
+        # 新任务目录已就位：立即让调度器开始上线检查（不必等下一轮热加载）
+        svc._kick_auto_admission()
         return {"ok": True, "id": req.id, "warning": chown_error}
 
     @app.get("/api/tasks/{job_id}/files")

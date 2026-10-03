@@ -20,23 +20,23 @@ from test_regression import FakeCapacity, _entry, _run_custom, _spec, _svc
 
 def test_f1_low_waiter_cannot_preempt_high_runner():
     running = [preempt.RunningInfo(run_id="r_high", job_id="j", priority=90,
-                                   est_cpu=4.0, est_mem_mb=400, soft={})]
+                                   est_cpu=4.0, est_mem_mb=400)]
     # 等待者 priority=50：即使缺口只有高优任务能补，也绝不抢占
-    assert preempt.select_preempt_targets(running, 2.0, 200, {}, waiter_priority=50) == []
+    assert preempt.select_preempt_targets(running, 2.0, 200, waiter_priority=50) == []
 
 
 def test_f1_equal_priority_never_preempts():
     running = [preempt.RunningInfo(run_id="r_eq", job_id="j", priority=50,
-                                   est_cpu=4.0, est_mem_mb=400, soft={})]
-    assert preempt.select_preempt_targets(running, 2.0, 200, {}, waiter_priority=50) == []
+                                   est_cpu=4.0, est_mem_mb=400)]
+    assert preempt.select_preempt_targets(running, 2.0, 200, waiter_priority=50) == []
 
 
 def test_f1_high_waiter_preempts_lower_only():
     running = [
-        preempt.RunningInfo(run_id="r90", job_id="j", priority=90, est_cpu=2.0, est_mem_mb=200, soft={}),
-        preempt.RunningInfo(run_id="r50", job_id="j", priority=50, est_cpu=2.0, est_mem_mb=200, soft={}),
+        preempt.RunningInfo(run_id="r90", job_id="j", priority=90, est_cpu=2.0, est_mem_mb=200),
+        preempt.RunningInfo(run_id="r50", job_id="j", priority=50, est_cpu=2.0, est_mem_mb=200),
     ]
-    targets = preempt.select_preempt_targets(running, 2.0, 200, {}, waiter_priority=95)
+    targets = preempt.select_preempt_targets(running, 2.0, 200, waiter_priority=95)
     assert [t.run_id for t in targets] == ["r50"]  # 只抢 <95 的
 
 
@@ -60,8 +60,8 @@ def test_f2_negative_exit_code_is_unclassified():
 def test_f3_backoff_items_skipped_in_admission_scan(home, make_settings):
     svc = _svc(home, make_settings)
     svc.capacity = FakeCapacity(total_memory_mb=1000, total_cpu=4.0)
-    svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 900, "soft": {}})
-    svc.entries["ok2"] = _entry(home, "ok2", resources={"cpu": 0.1, "memory_mb": 50, "soft": {}})
+    svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 900})
+    svc.entries["ok2"] = _entry(home, "ok2", resources={"cpu": 0.1, "memory_mb": 50})
     svc.trigger("ok", trigger="manual")   # 900MB，将处于退避期
     svc.trigger("ok2", trigger="manual")  # 50MB，应正常准出
     import datetime as _dt
@@ -121,9 +121,8 @@ class _ExtCapacity(FakeCapacity):
 def test_f5_external_occupancy_blocks_admission():
     cap = _ExtCapacity(total_memory_mb=2000, mem_available_mb=300)  # 外部吃掉大半
     ledger = resources.Ledger()
-    soft = resources.SoftResourcePool()
     # 账本有余量（2000 空闲），但 MemAvailable 只有 300 - margin
-    ok, reason = admission.can_admit(0.1, 500, {}, ledger, cap, soft,
+    ok, reason = admission.can_admit(0.1, 500, ledger, cap,
                                      external_mem_margin_mb=512)
     assert not ok
     assert "MemAvailable" in reason
@@ -132,15 +131,15 @@ def test_f5_external_occupancy_blocks_admission():
 def test_f5_external_occupancy_allows_when_enough():
     cap = _ExtCapacity(total_memory_mb=2000, mem_available_mb=1500)
     ledger = resources.Ledger()
-    ok, _ = admission.can_admit(0.1, 500, {}, ledger, cap, resources.SoftResourcePool(),
+    ok, _ = admission.can_admit(0.1, 500, ledger, cap,
                                 external_mem_margin_mb=512)
     assert ok
 
 
 def test_f5_disabled_when_margin_zero():
     cap = _ExtCapacity(total_memory_mb=2000, mem_available_mb=100)
-    ok, _ = admission.can_admit(0.1, 500, {}, resources.Ledger(), cap,
-                                resources.SoftResourcePool(), external_mem_margin_mb=0)
+    ok, _ = admission.can_admit(0.1, 500, resources.Ledger(), cap,
+                                external_mem_margin_mb=0)
     assert ok  # margin=0 关闭该判定（测试/兼容）
 
 

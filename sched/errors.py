@@ -23,13 +23,13 @@ class Category(str, Enum):
 # 退出码保留段（协议 A2：与任务 SDK 约定）
 EXIT_OK = 0
 EXIT_PREEMPTED = 99         # 收到 SIGTERM，完成断点保存后主动退出（可恢复）
-EXIT_RESOURCE = 100         # 任务明确分类的资源错误（可重试，触发画像上调）
-EXIT_SOFT_RESOURCE = 101    # 软资源错误（代理并发/429/配额），走软资源令牌与退避
+EXIT_RESOURCE = 100         # 本机资源错误（内存/CPU 不足等，可重试，触发画像上调）
+EXIT_EXTERNAL_RESOURCE = 101  # 外部资源错误（代理/隧道、限流 429、配额、连接超时等）：指数退避重试
 EXIT_DATA_RISK = 110        # 数据风险：跳过项已写入 pending_skipped，可继续二刷
 EXIT_LOGIC = 1              # 逻辑错误的代表码（任务自报 logic 时使用；无自报时按 G5 兜底）
 EXIT_SIGKILL = 137          # 128+9 —— 需要归因：cgroup OOM / 调度器 SIGKILL / 外部 kill
 
-RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_SOFT_RESOURCE, EXIT_DATA_RISK}
+RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE, EXIT_DATA_RISK}
 
 
 def classify_exit_code(code: int | None) -> tuple[str, str]:
@@ -43,7 +43,7 @@ def classify_exit_code(code: int | None) -> tuple[str, str]:
         return Category.RESOURCE.value, "success"  # 成功不算失败，不该走到这里
     if code == EXIT_PREEMPTED:
         return Category.UNCLASSIFIED.value, "preempted"
-    if code in (EXIT_RESOURCE, EXIT_SOFT_RESOURCE):
+    if code in (EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE):
         return Category.RESOURCE.value, f"exit_code_{code}"
     if code == EXIT_DATA_RISK:
         return Category.LOGIC.value, "data_risk"

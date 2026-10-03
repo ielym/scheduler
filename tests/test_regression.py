@@ -89,35 +89,17 @@ def test_once_fires_once_then_removed(home, make_settings):
 def test_admission_scan_same_round_no_overcommit():
     cap = FakeCapacity(total_memory_mb=1000, total_cpu=4.0)
     ledger = resources.Ledger()
-    soft = resources.SoftResourcePool()
     items = [{"run_id": "r1", "job_id": "j1"}, {"run_id": "r2", "job_id": "j2"}]
-    declared = {"j1": (1.0, 800, {}), "j2": (1.0, 800, {})}
+    declared = {"j1": (1.0, 800), "j2": (1.0, 800)}
     res = admission.admission_scan(
         items,
         get_declared=lambda jid: declared[jid],
         get_profile=lambda jid: resources.Profile(declared_cpu=1.0, declared_memory_mb=800),
-        ledger=ledger, capacity=cap, soft_pool=soft, overshoot=1.0,
+        ledger=ledger, capacity=cap, overshoot=1.0,
     )
     # 容量 1000MB：两个 800MB 只能准出一个（修复前两个同时准出 → 1600MB 打爆）
     assert res.admitted == ["r1"]
-    assert "r2" in res.blocked_fixed
-
-
-def test_admission_scan_soft_same_round():
-    cap = FakeCapacity()
-    ledger = resources.Ledger()
-    soft = resources.SoftResourcePool()
-    soft.set_capacity("proxy", 2)
-    items = [{"run_id": "r1", "job_id": "j1"}, {"run_id": "r2", "job_id": "j2"}]
-    declared = {"j1": (0.1, 10, {"proxy": 2}), "j2": (0.1, 10, {"proxy": 2})}
-    res = admission.admission_scan(
-        items,
-        get_declared=lambda jid: declared[jid],
-        get_profile=lambda jid: resources.Profile(declared_cpu=0.1, declared_memory_mb=10),
-        ledger=ledger, capacity=cap, soft_pool=soft, overshoot=1.0,
-    )
-    assert res.admitted == ["r1"]
-    assert "r2" in res.blocked_soft
+    assert "r2" in res.blocked
 
 
 # ================= Bug3：画像 CPU 样本为平均核数 =================
@@ -159,16 +141,16 @@ def _preempt_setup(home, make_settings):
     svc = _svc(home, make_settings)
     svc.capacity = FakeCapacity(total_memory_mb=1000, total_cpu=4.0)
     svc.entries["low"] = _entry(home, "low", priority=10,
-                                resources={"cpu": 1.0, "memory_mb": 600, "soft": {}})
+                                resources={"cpu": 1.0, "memory_mb": 600})
     svc.entries["high"] = _entry(home, "high", priority=90,
-                                 resources={"cpu": 1.0, "memory_mb": 800, "soft": {}})
+                                 resources={"cpu": 1.0, "memory_mb": 800})
     return svc
 
 
 def test_preempt_uses_gap_not_total_need(home, make_settings):
     svc = _preempt_setup(home, make_settings)
     # 低优占 600MB（空闲 400MB），高优需 960（800×1.2 钳制后）→ 缺口 560 ≤ 600 可抢占
-    svc.ledger.reserve("low_run", 1.0, 600, {})
+    svc.ledger.reserve("low_run", 1.0, 600)
     re = RunningEntry(
         run={"run_id": "low_run", "job_id": "low", "priority": 10,
              "manual": False, "contract_exempt": False},
@@ -183,7 +165,7 @@ def test_preempt_uses_gap_not_total_need(home, make_settings):
 def test_preempt_no_gap_no_preempt(home, make_settings):
     svc = _preempt_setup(home, make_settings)
     # 空闲足够：高优需 960（800×1.2），仅占 40MB → 空闲 960 ≥ 需求 → 不应抢占
-    svc.ledger.reserve("low_run", 1.0, 40, {})
+    svc.ledger.reserve("low_run", 1.0, 40)
     re = RunningEntry(
         run={"run_id": "low_run", "job_id": "low", "priority": 10,
              "manual": False, "contract_exempt": False},
@@ -197,7 +179,7 @@ def test_preempt_no_gap_no_preempt(home, make_settings):
 
 def test_preempt_exempt_period_protects_resumed(home, make_settings):
     svc = _preempt_setup(home, make_settings)
-    svc.ledger.reserve("low_run", 1.0, 600, {})
+    svc.ledger.reserve("low_run", 1.0, 600)
     re = RunningEntry(
         run={"run_id": "low_run", "job_id": "low", "priority": 10,
              "manual": False, "contract_exempt": False},
@@ -215,9 +197,9 @@ def test_end_to_end_preempt_high_wins(home, make_settings):
     svc = _svc(home, make_settings)
     svc.capacity = FakeCapacity(total_memory_mb=1000, total_cpu=4.0)
     svc.entries["low"] = _entry(home, "low", priority=10, real_sleep=0.8, total=10,
-                                resources={"cpu": 1.0, "memory_mb": 600, "soft": {}})
+                                resources={"cpu": 1.0, "memory_mb": 600})
     svc.entries["high"] = _entry(home, "high", priority=90, real_sleep=0.01, total=1,
-                                 resources={"cpu": 1.0, "memory_mb": 800, "soft": {}})
+                                 resources={"cpu": 1.0, "memory_mb": 800})
 
     svc.trigger("low", trigger="interval")
     svc._tick_admission()
@@ -370,7 +352,7 @@ def test_staged_admission_one_by_one_until_healthy(home, make_settings):
     svc.capacity = FakeCapacity(total_memory_mb=1000, total_cpu=4.0)
     for n in ("a", "b", "c"):
         svc.entries[n] = _entry(home, n, real_sleep=0.5, total=2,
-                                resources={"cpu": 0.1, "memory_mb": 600, "soft": {}})
+                                resources={"cpu": 0.1, "memory_mb": 600})
     for n in ("a", "b", "c"):
         svc.trigger(n, trigger="manual")
 
@@ -477,34 +459,32 @@ def test_data_risk_gives_up_after_max_rounds(home, make_settings):
     assert any(d.get("act") == "terminal" and d.get("status") == "data_risk" for d in decisions)
 
 
-# ================= D6：软资源降额 =================
+# ================= D6：100/101 资源错误按退出码退避重试 =================
 
-def test_soft_degrade_and_restore(home, make_settings):
+def test_exit_101_classified_as_retryable_resource():
+    # 101 = 代理/隧道、限流、配额等外部资源错误：归类 resource，可重试
+    cat, reason = errors.classify_exit_code(errors.EXIT_EXTERNAL_RESOURCE)
+    assert cat == errors.Category.RESOURCE.value
+    assert errors.is_retryable_category(cat)
+    assert "101" in reason
+
+
+def test_finalize_101_schedules_backoff_retry(home, make_settings):
+    """外部资源错误(101) 不再有任何容量池：终态只负责指数退避后重入队。"""
     svc = _svc(home, make_settings)
-    svc.state.soft_capacities["proxy"] = 8
-    svc._restore_soft_capacities()
-    assert svc.soft_pool.capacity("proxy") == 8
-    for _ in range(svc.soft_degrade_threshold):
-        svc.monitor.record_soft_error("proxy")
-    svc._apply_soft_degrade()
-    assert svc.soft_pool.capacity("proxy") == 4  # 降额一半
-    # 冷却期后恢复
-    svc._soft_degraded_until["proxy"] = time.monotonic() - 1
-    svc._apply_soft_degrade()
-    assert svc.soft_pool.capacity("proxy") == 8
-
-
-def test_finalize_records_soft_error_on_101(home, make_settings):
-    svc = _svc(home, make_settings)
-    svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 64, "soft": {"proxy": 1}})
+    svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 64})
     re = RunningEntry(
         run={"run_id": "r1", "job_id": "ok", "dry_run": False, "duration_ms": 1000,
              "queued_at": runlog.now_iso(), "status": "resource", "trigger": "manual",
-             "exit_code": errors.EXIT_SOFT_RESOURCE},
-        spec=None, est_cpu=0.1, est_mem_mb=64, soft={"proxy": 1}, cgroup_name="ok/r1",
+             "attempt": 1, "exit_code": errors.EXIT_EXTERNAL_RESOURCE},
+        spec=None, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r1",
     )
     svc._finalize(re, runlog.STATUS_RESOURCE, mem_peak_mb=50, cpu_sec=0.5)
-    assert svc.monitor.soft_error_count("proxy") == 1
+    # 退避记录已写入，任务重新入队等待重试
+    assert "ok" in svc.state.backoffs
+    assert svc.state.backoffs["ok"]["attempts"] == 1
+    assert len(svc.state.wq) == 1
+    assert svc.state.wq[0]["attempt"] == 2
 
 
 # ================= D7：窗口收口每 tick 检查 =================

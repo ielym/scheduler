@@ -26,10 +26,7 @@
   },
   "resources": {
     "cpu": 0.5,
-    "memory_mb": 256,
-    "soft": {
-      "proxy": 1
-    }
+    "memory_mb": 256
   },
   "error_rules": {
     "resource_regex": [

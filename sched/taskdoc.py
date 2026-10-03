@@ -105,15 +105,11 @@ class ResourceDecl(BaseModel):
 
     cpu: float = 0.0
     memory_mb: int = 0
-    soft: dict[str, int] = Field(default_factory=dict)  # 软资源名 -> 并发占用量
 
     @model_validator(mode="after")
     def _check(self) -> "ResourceDecl":
         if self.cpu < 0 or (isinstance(self.memory_mb, bool) or self.memory_mb < 0):
             raise ValueError("resources.cpu / resources.memory_mb 不能为负")
-        for k, v in self.soft.items():
-            if not isinstance(k, str) or not isinstance(v, int) or isinstance(v, bool) or v < 0:
-                raise ValueError("resources.soft 必须是 {'资源名': 非负整数}")
         return self
 
 

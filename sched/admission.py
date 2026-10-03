@@ -3,22 +3,22 @@
 - 双轨制：base 轨道管严格性（priority 降序）；field 轨道管同层 FIFO（enqueued_at 升序）。
 - 饿死看门狗：等待超过阈值者临时提权，避免高优洪峰永久饿死低优（兜底退让，不兜底杀）。
 - 见缝插针：准出是全局扫描，高优等固定资源时，能塞进缝隙的低优仍可先跑（需求 2.2.3）。
-- 首个任务因固定资源不足：等待并尝试其它任务；软资源不足：时间换空间等待。
+- 首个任务因固定资源不足：等待并尝试其它任务。
+- 代理/配额等调度器无法感知真实容量的外部资源不参与准出判定：任务以 100/101
+  报错后按错误码退避重试，配合渐进式提交动态避让。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
-from . import resources, runlog
+from . import resources
 
 
 @dataclass
 class AdmissionResult:
     admitted: list[str]           # 本轮准出的 run_id
-    blocked_fixed: list[str]      # 因固定资源不足而等待的 run_id
-    blocked_soft: list[str]       # 因软资源不足而等待的 run_id
+    blocked: list[str]            # 因固定资源（CPU/内存）不足而等待的 run_id
     reasons: dict[str, str]       # run_id -> 未准出原因
 
 
@@ -66,17 +66,14 @@ def estimate_job(profile: resources.Profile, declared_cpu: float, declared_mem_m
 def can_admit(
     est_cpu: float,
     est_mem_mb: int,
-    soft_needs: dict[str, int],
     ledger: resources.Ledger,
     capacity: resources.Capacity,
-    soft_pool: resources.SoftResourcePool,
     hard_mem_reserve_ratio: float = 1.0,
     extra_cpu: float = 0.0,
     extra_mem_mb: int = 0,
-    extra_soft: dict[str, int] | None = None,
     external_mem_margin_mb: int = 0,
 ) -> tuple[bool, str]:
-    """固定资源按账本预留判定；软资源按令牌桶判定。
+    """固定资源（CPU/内存）按账本预留判定。
 
     extra_*：本轮扫描中已准出但尚未入账（reserve）的虚拟占用，防同轮 over-commit。
     external_mem_margin_mb：对非调度进程占用的感知——est 超过整机
@@ -96,13 +93,6 @@ def can_admit(
     free_cpu = capacity.total_cpu - reserved_cpu
     if est_cpu > 0 and reserved_cpu + est_cpu > capacity.total_cpu:
         return False, f"固定 CPU 不足（需 {est_cpu} 核，账本余 {max(0.0, round(free_cpu, 2))} 核）"
-    extra_soft = extra_soft or {}
-    for name, amt in soft_needs.items():
-        if soft_pool.capacity(name) <= 0:
-            return False, f"软资源 {name} 未配置容量"
-        avail = soft_pool.available(name) - extra_soft.get(name, 0)
-        if avail < amt:
-            return False, f"软资源 {name} 不足（需 {amt}，余 {avail}）"
     return True, ""
 
 
@@ -112,36 +102,29 @@ def admission_scan(
     get_profile,
     ledger: resources.Ledger,
     capacity: resources.Capacity,
-    soft_pool: resources.SoftResourcePool,
     overshoot: float,
     external_mem_margin_mb: int = 0,
 ) -> AdmissionResult:
-    """按双轨顺序扫描，尽量准出；软资源/固定资源不足的都留在队列继续等待（不失效）。
+    """按双轨顺序扫描，尽量准出；固定资源不足的留在队列继续等待（不失效）。
 
     扫描内维护「本轮虚拟账本」（pending_*）：本轮已准出者尚未入账（reserve 在 _admit），
     若不累计会导致同轮多个大任务同时通过判定，预留合计超容量（over-commit）。
     """
-    res = AdmissionResult([], [], [], {})
+    res = AdmissionResult([], [], {})
     pending_cpu, pending_mem = 0.0, 0
-    pending_soft: dict[str, int] = {}
     for it in items:
         rid = it["run_id"]
-        declared_cpu, declared_mem, soft = get_declared(it["job_id"])
+        declared_cpu, declared_mem = get_declared(it["job_id"])
         prof = get_profile(it["job_id"])
         est_cpu, est_mem = estimate_job(prof, declared_cpu, declared_mem, overshoot, capacity)
-        ok, reason = can_admit(est_cpu, est_mem, soft, ledger, capacity, soft_pool,
-                               extra_cpu=pending_cpu, extra_mem_mb=pending_mem, extra_soft=pending_soft,
+        ok, reason = can_admit(est_cpu, est_mem, ledger, capacity,
+                               extra_cpu=pending_cpu, extra_mem_mb=pending_mem,
                                external_mem_margin_mb=external_mem_margin_mb)
         if ok:
             res.admitted.append(rid)
             pending_cpu += est_cpu
             pending_mem += est_mem
-            for k, v in soft.items():
-                pending_soft[k] = pending_soft.get(k, 0) + v
         else:
-            if "固定" in reason or "CPU" in reason or "内存" in reason:
-                res.blocked_fixed.append(rid)
-            else:
-                res.blocked_soft.append(rid)
+            res.blocked.append(rid)
             res.reasons[rid] = reason
     return res

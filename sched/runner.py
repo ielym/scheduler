@@ -312,7 +312,7 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
         elif exit_code == errors.EXIT_PREEMPTED:
             status = runlog.STATUS_PREEMPTED
             reason = "抢占：断点已保存"
-        elif exit_code in (errors.EXIT_RESOURCE, errors.EXIT_SOFT_RESOURCE):
+        elif exit_code in (errors.EXIT_RESOURCE, errors.EXIT_EXTERNAL_RESOURCE):
             status = runlog.STATUS_RESOURCE
             reason = f"资源错误（退出码 {exit_code}）"
         elif exit_code == errors.EXIT_DATA_RISK:

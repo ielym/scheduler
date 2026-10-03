@@ -49,6 +49,10 @@ def scheduler_state_file() -> Path:
     return runtime_dir() / "scheduler_state.json"
 
 
+def admission_state_file() -> Path:
+    return runtime_dir() / "admission.json"
+
+
 def decisions_log() -> Path:
     return runtime_dir() / "decisions.jsonl"
 
@@ -117,10 +121,8 @@ class Settings(BaseModel):
     starvation_sec: float = 3600.0        # 饿死看门狗阈值（1h）
     preempt_exempt_sec: float = 60.0      # 任务启动后的抢占豁免期
     data_risk_max_reschedules: int = 3    # 110 数据风险二刷轮数上限
-    soft_degrade_threshold: int = 3       # 软资源错误计数达到该值触发降额
-    soft_degrade_window_sec: float = 600.0
-    soft_degrade_cooldown_sec: float = 300.0
-    hot_reload_sec: float = 30.0          # serve 主循环周期性热加载 jobs.json
+    hot_reload_sec: float = 30.0          # serve 主循环周期性热加载 jobs.json/tasks 目录
+    auto_admit_retry_sec: float = 300.0   # 新任务自动准入（跑五闸）失败后的重试冷却
 
     @field_validator("timezone")
     @classmethod

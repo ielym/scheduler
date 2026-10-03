@@ -1,11 +1,11 @@
 """命令行入口：sched <command>。
 
 命令：
-  register <name>        跑五道闸并注册任务
-  run <name>             手动触发一次
+  register <name>        立即对一个任务跑上线检查（五道闸）并纳入调度
+                         （常规无需使用：任务文件放进 tasks/ 后调度器会自动检查上线）
+  run <name>             立即运行一次（含声明不可断点恢复的任务的人工触发通道）
   list                    列出任务与下次触发
-  status                  全局队列/账本/软资源状态
-  set-soft <name> <n>     设置软资源容量
+  status                  队列/账本/上线检查状态
   serve                   前台常驻调度循环（Ctrl-C 退出）
 """
 
@@ -29,9 +29,9 @@ def cmd_register(args) -> int:
     try:
         r = svc.register_job(args.name)
     except Exception as e:
-        print(f"注册失败：{e}")
+        print(f"上线检查未通过：{e}")
         return 1
-    print(f"注册成功：{r['job_id']}")
+    print(f"上线检查通过，已纳入调度：{r['job_id']}")
     for g in r["gates"]:
         print(f"  - {g}")
     return 0
@@ -43,9 +43,9 @@ def cmd_run(args) -> int:
     try:
         r = svc.trigger(args.name, trigger="manual")
     except Exception as e:
-        print(f"触发失败：{e}")
+        print(f"运行失败：{e}")
         return 1
-    print(f"已入队：{r['run_id']} ({r['job_id']}, priority={r['priority']})")
+    print(f"已加入运行队列：{r['run_id']} ({r['job_id']}, priority={r['priority']})")
     return 0
 
 
@@ -61,20 +61,14 @@ def cmd_status(_args) -> int:
     svc = _svc()
     svc.refresh()
     st = svc.status()
-    print(f"jobs={st['jobs']} waiting={st['waiting']} running={st['running']}")
-    print(f"ledger reserved_mem={st['ledger_reserved_mem_mb']}MB actual_mem={st['ledger_actual_mem_mb']}MB")
-    for k, v in st["soft"].items():
-        print(f"  soft[{k}] cap={v['cap']} used={v['used']}")
-    return 0
-
-
-def cmd_set_soft(args) -> int:
-    svc = _svc()
-    svc.state.soft_capacities[args.name] = int(args.n)
-    svc.soft_pool.set_capacity(args.name, int(args.n))
-    from . import persist
-    persist.save_scheduler_state(svc.state)
-    print(f"soft[{args.name}] = {args.n}")
+    print(f"任务数={st['jobs']} 等待运行={st['waiting']} 运行中={st['running']}")
+    print(f"账本预留内存={st['ledger_reserved_mem_mb']}MB 实测内存={st['ledger_actual_mem_mb']}MB")
+    adm = st.get("admission") or {}
+    if adm.get("checking") or adm.get("failed"):
+        print(f"上线检查：检查中 {adm.get('checking', 0)} 个，未通过 {adm.get('failed', 0)} 个")
+        for name, rec in svc.admission_snapshot().items():
+            if rec.get("status") == "failed":
+                print(f"  [未通过] {name}：{rec.get('reason', '')}")
     return 0
 
 
@@ -119,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("run"); sp.add_argument("name"); sp.set_defaults(fn=cmd_run)
     sp = sub.add_parser("list"); sp.set_defaults(fn=cmd_list)
     sp = sub.add_parser("status"); sp.set_defaults(fn=cmd_status)
-    sp = sub.add_parser("set-soft"); sp.add_argument("name"); sp.add_argument("n", type=int); sp.set_defaults(fn=cmd_set_soft)
     sp = sub.add_parser("serve")
     sp.add_argument("--web", action="store_true", help="同时启动内嵌 Web 管理台（覆盖 settings.web.enabled）")
     sp.add_argument("--no-web", dest="no_web", action="store_true", help="强制不启动管理台")
