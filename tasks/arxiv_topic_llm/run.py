@@ -1,0 +1,615 @@
+"""arXiv 主题论文每日采集（T-3）：检索 -> 经 IP 隧道下载 PDF -> 上传 OSS。
+
+任务参数（每个任务一份独立副本，禁止跨任务共享）：
+    TOPIC : 主题名（用于 OSS / 本地缓存目录）
+    QUERY : arXiv search_query 主体（运行时统一追加 T-3 日期窗口）
+
+契约设计：
+- 检索日期在首次运行冻结进 resume_point["date"]；未完成跨天重试时日期不变。
+- 去重唯一以 OSS 对象存在性为准：每轮按日期前缀批量列举已有对象；
+  本地目录仅作下载暂存，上传成功即删，全部完成后清理当天暂存目录。
+- 检索清单分页落 cache/manifests/<date>.json，被抢占后从未完成页继续。
+- 单篇失败 skip_item 落 pending_skipped，本轮跑完以 110 请求二刷；
+  二刷成功清账，404 等永久失败转 dead_letter；连续多篇失败判定代理/网络
+  整体故障，101 快速退让交由调度器指数退避重试。
+- 所有访问 arxiv 的网络请求（API 检索 / PDF 下载）均走 ip-tunnel 隧道
+  （每次请求自动换 IP）；OSS 访问走 aliyun-oss CLI 的内网 endpoint。
+- SCHED_DRY_RUN=1 时零真实网络/上传，产物只写 cache/dry/ 与 results/。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from sched_task_sdk import SchedTask, Step, run_task
+
+# ===================== 任务参数（每份副本独立） =====================
+TOPIC = "LLM"
+QUERY = '(all:"large language model" OR all:LLM OR all:"post-training" OR all:"supervised fine-tuning" OR all:"in-context learning" OR all:"instruction tuning")'
+# ====================================================================
+
+OSS_BUCKET = "ielym-data"
+OSS_DIR_PREFIX = f"oss://{OSS_BUCKET}/academic/papers/{TOPIC}"
+LOCAL_CACHE_ROOT = Path("/mnt/data01/data/papers_cache")
+PAGE_SIZE = 100          # arXiv API 单页条数
+MAX_TOTAL = 2000         # 单日单主题硬上限，超出视为检索式异常（LOGIC 转人工）
+API_GAP_SEC = 3.0        # arXiv 官方建议页间约 3 秒
+CONSEC_FAIL_LIMIT = 5    # 连续 N 篇失败判定隧道/目标站点整体故障 -> 101
+PDF_CONNECT_TIMEOUT = 10
+PDF_READ_TIMEOUT = 30
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+RETRIABLE_HTTP_STATUS = {403, 407, 429, 500, 502, 503, 504}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+_VERSION_RE = re.compile(r"v\d+$")
+
+
+class ResourceError(RuntimeError):
+    """资源类错误（隧道不可用 / 限流 / 连接失败）：快速失败交调度器退让。"""
+
+
+def strip_version(arxiv_id: str) -> str:
+    return _VERSION_RE.sub("", arxiv_id.strip())
+
+
+class ArxivTopicTask(SchedTask):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ws = Path(self.workspace)
+        self.run_id = os.environ.get("SCHED_RUN_ID", "local")
+        self.dry = self.dry_run
+        self.root = self.ws / "cache" / "dry" if self.dry else self.ws / "cache"
+        self.manifest_dir = self.root / "manifests"
+        self.log_dir = self.ws / "cache" / "logs"
+        for d in (self.manifest_dir, self.log_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        self.log = self._build_logger()
+        self.local_day_dir = (
+            self.root / "papers_cache" / TOPIC
+            if self.dry
+            else LOCAL_CACHE_ROOT / TOPIC
+        )
+        self._proxies: dict | None = None
+
+    # ---------- 基础设施 ----------
+
+    def _build_logger(self) -> logging.Logger:
+        logger = logging.getLogger(f"arxiv_{TOPIC}_{self.run_id}")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        fh = logging.FileHandler(
+            self.log_dir / f"run-{self.run_id}.log", encoding="utf-8"
+        )
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+        logger.propagate = False
+        return logger
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(path)
+
+    def _done_path(self) -> Path:
+        return self.root / "done.json"
+
+    def _load_done(self) -> dict:
+        p = self._done_path()
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                self.log.warning("done.json 损坏，按空记录处理: %s", p)
+        return {}
+
+    def _t_minus_3(self) -> str:
+        return (datetime.now(SHANGHAI_TZ).date() - timedelta(days=3)).isoformat()
+
+    def _save_resume(self, date: str, phase: str, **extra) -> None:
+        rp = {"date": date, "phase": phase}
+        rp.update(extra)
+        self.state.resume_point = rp
+        self.state.flush()
+
+    def _fail_resource(self, message: str, code: int = 101) -> None:
+        self.log.error("资源错误，快速退让：%s", message)
+        self.state.mark_failed("resource", message)
+        self.state.flush()
+        sys.exit(code)
+
+    # ---------- 隧道代理 ----------
+
+    def _proxy_env(self) -> dict:
+        """供 arxiv CLI（urllib 读 HTTP(S)_PROXY 环境变量）使用的进程环境。"""
+        env = os.environ.copy()
+        env["HTTP_PROXY"] = self._proxies["http"]
+        env["HTTPS_PROXY"] = self._proxies["https"]
+        env["NO_PROXY"] = ""
+        return env
+
+    @staticmethod
+    def _oss_env() -> dict:
+        """OSS 走内网 endpoint，显式剥除代理变量，禁止经隧道转发。"""
+        banned = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                  "http_proxy", "https_proxy", "all_proxy"}
+        return {k: v for k, v in os.environ.copy().items() if k not in banned}
+
+    def _ensure_proxies(self) -> dict:
+        if self._proxies:
+            return self._proxies
+        last_err = "unknown"
+        for attempt in range(3):
+            try:
+                proc = subprocess.run(
+                    ["ip-tunnel", "export", "--raw"],
+                    capture_output=True, text=True, timeout=25,
+                )
+                if proc.returncode == 0:
+                    out = proc.stdout
+                    s = out[out.find("{"):out.rfind("}") + 1]
+                    cfg = json.loads(s)
+                    proxies = cfg.get("proxies") or {}
+                    if proxies.get("http") and proxies.get("https"):
+                        self._proxies = proxies
+                        self.log.info("已获取隧道代理配置（不落盘）")
+                        return proxies
+                    last_err = "隧道配置缺少 proxies 字段"
+                else:
+                    last_err = (proc.stderr or "export 非零退出").strip()[:160]
+            except Exception as exc:
+                last_err = f"{type(exc).__name__}: {exc}"
+            self.log.warning("取隧道代理失败(第%s次)：%s", attempt + 1, last_err)
+            time.sleep(2 * (2 ** attempt))
+        self._fail_resource(f"ip-tunnel export 连续失败: {last_err}")
+        return {}  # 不可达，仅为类型检查
+
+    # ---------- arXiv 检索 ----------
+
+    def _search_manifest(self, date: str):
+        """分页检索，生成器（页是可抢占步）；返回记录列表。"""
+        manifest_path = self.manifest_dir / f"{date}.json"
+        records: list[dict] = []
+        start = 0
+        if manifest_path.exists():
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if old.get("complete"):
+                self.log.info("复用已完成检索清单：%s（%d 篇）", date, len(old["records"]))
+                return old["records"]
+            records = old.get("records", [])
+            start = len(records)
+            self.log.info("从断点续检 %s：已有 %d 篇", date, start)
+
+        ymd = date.replace("-", "")
+        full_query = (
+            f"{QUERY} AND submittedDate:[{ymd}0000 TO {ymd}2359]"
+        )
+        while True:
+            if start >= MAX_TOTAL:
+                raise ValueError(
+                    f"LOGIC: 命中数超过硬上限 {MAX_TOTAL}，疑似检索式异常: "
+                    f"topic={TOPIC} date={date}"
+                )
+            yield Step("search_page", {"date": date, "start": start})
+            cmd = [
+                "arxiv", "--query", full_query,
+                "--start", str(start),
+                "--max-results", str(PAGE_SIZE),
+                "--sort-by", "submittedDate",
+                "--sort-order", "descending",
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=60,
+                    env=self._proxy_env(),
+                )
+            except Exception as exc:
+                self._fail_resource(f"arxiv 检索进程异常(start={start}): {exc}")
+            if proc.returncode != 0:
+                self._fail_resource(
+                    f"arxiv 检索失败(start={start}): "
+                    f"{(proc.stderr or proc.stdout or '')[:200]}"
+                )
+            try:
+                envelope = json.loads(proc.stdout)
+                page = envelope.get("records") or []
+            except Exception as exc:
+                self._fail_resource(f"arxiv 响应解析失败(start={start}): {exc}")
+
+            records.extend(page)
+            self._atomic_write_json(
+                manifest_path, {"date": date, "complete": False, "records": records}
+            )
+            self._save_resume(
+                date, "search", start=start + len(page), found=len(records)
+            )
+            self.log.info("检索 %s start=%d 本页 %d 篇 / 累计 %d 篇",
+                          date, start, len(page), len(records))
+            if len(page) < PAGE_SIZE:
+                self._atomic_write_json(
+                    manifest_path, {"date": date, "complete": True, "records": records}
+                )
+                break
+            start += PAGE_SIZE
+            time.sleep(API_GAP_SEC)
+        return records
+
+    def _dry_search(self, date: str):
+        """dry 模式：两页假数据，保证信号能在中途命中。"""
+        records = []
+        for page in range(2):
+            yield Step("search_page_dry", {"date": date, "page": page})
+            time.sleep(0.3)
+            records.extend([
+                {
+                    "source_id": f"dry{page}{i:02d}v1",
+                    "pdf_url": f"https://arxiv.org/pdf/dry{page}{i:02d}v1",
+                    "title": f"dry paper {page}-{i}",
+                }
+                for i in range(4)
+            ])
+            self._save_resume(date, "search", start=len(records), found=len(records))
+            self.log.info("[DRY] 检索第 %d 页，累计 %d 篇", page + 1, len(records))
+        return records
+
+    # ---------- OSS ----------
+
+    def _oss_prefix(self, date: str) -> str:
+        return f"{OSS_DIR_PREFIX}/{date}/"
+
+    def _list_oss_objects(self, date: str) -> set[str]:
+        if self.dry:
+            return set()
+        prefix = self._oss_prefix(date)
+        try:
+            proc = subprocess.run(
+                ["aliyun-oss", "ls", prefix, "-r", "--json"],
+                capture_output=True, text=True, timeout=60, env=self._oss_env(),
+            )
+        except Exception as exc:
+            self._fail_resource(f"OSS 列举进程异常: {exc}", code=100)
+        if proc.returncode != 0:
+            self._fail_resource(
+                f"OSS 列举失败: {(proc.stderr or proc.stdout or '')[:200]}",
+                code=100,
+            )
+        names: set[str] = set()
+        try:
+            envelope = json.loads(proc.stdout)
+            for line in (envelope.get("data") or "").splitlines():
+                parts = line.split()
+                # ossutil 表格行：日期 ... oss://bucket/key（ObjectName 在末列）
+                if not parts or not parts[-1].startswith("oss://"):
+                    continue
+                key = parts[-1]
+                if not key.startswith(prefix):
+                    continue
+                name = key[len(prefix):]
+                if name and not name.endswith("/"):
+                    names.add(name)
+        except Exception as exc:
+            self._fail_resource(f"OSS 列举结果解析失败: {exc}", code=100)
+        self.log.info("OSS %s 已有对象 %d 个", prefix, len(names))
+        return names
+
+    def _upload_pdf(self, local_file: Path, date: str) -> None:
+        cmd = ["aliyun-oss", "upload", str(local_file), self._oss_prefix(date),
+               "--json"]
+        last = "unknown"
+        for attempt in range(3):
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=180,
+                    env=self._oss_env(),
+                )
+                envelope = json.loads(proc.stdout)
+                if proc.returncode == 0 and envelope.get("ok"):
+                    return
+                last = str(envelope.get("error") or envelope)[:200]
+            except Exception as exc:
+                last = f"{type(exc).__name__}: {exc}"
+            self.log.warning("OSS 上传 %s 失败(第%s次)：%s",
+                             local_file.name, attempt + 1, last)
+            time.sleep(2 * (2 ** attempt))
+        raise ResourceError(f"OSS upload failed after retries: {last}")
+
+    # ---------- PDF 下载 ----------
+
+    def _download_pdf(self, record: dict, dest: Path) -> tuple[bool, str]:
+        """返回 (成功?, 原因)；404 原因以 fatal: 前缀表示永久失败。"""
+        url = record.get("pdf_url") or (
+            f"https://arxiv.org/pdf/{record.get('source_id', '')}"
+        )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp")
+        last = "unknown"
+        for attempt in range(3):
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+                with requests.get(
+                    url,
+                    proxies=self._proxies,
+                    timeout=(PDF_CONNECT_TIMEOUT, PDF_READ_TIMEOUT),
+                    headers={"User-Agent": USER_AGENT},
+                    stream=True,
+                ) as resp:
+                    if resp.status_code == 404:
+                        return False, "fatal: HTTP 404"
+                    if resp.status_code in RETRIABLE_HTTP_STATUS:
+                        raise RuntimeError(f"HTTP {resp.status_code}")
+                    resp.raise_for_status()
+                    with open(tmp, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=64 * 1024):
+                            if chunk:
+                                fh.write(chunk)
+                with open(tmp, "rb") as fh:
+                    magic = fh.read(5)
+                if magic != b"%PDF-":
+                    raise RuntimeError("返回内容不是 PDF（可能是拦截/校验页）")
+                tmp.replace(dest)
+                return True, ""
+            except Exception as exc:
+                last = f"{type(exc).__name__}: {exc}"
+                self.log.warning("PDF 下载 %s 失败(第%s次)：%s",
+                                 url, attempt + 1, last)
+                time.sleep(2 * (2 ** attempt))
+        return False, last
+
+    # ---------- pending_skipped 维护 ----------
+
+    def _remove_pending(self, item: str) -> None:
+        path = self.ws / "cache" / "pending_skipped.jsonl"
+        if not path.exists():
+            return
+        kept = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line).get("item") != item
+        ]
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            "\n".join(kept) + ("\n" if kept else ""), encoding="utf-8"
+        )
+        tmp.replace(path)
+
+    def _record_map(self, records: list[dict]) -> dict[str, dict]:
+        return {strip_version(r["source_id"]): r for r in records}
+
+    # ---------- 完成处理 ----------
+
+    def _finish_day(self, date: str, stats: dict) -> None:
+        done = self._load_done()
+        done[date] = {
+            "finished_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+            **stats,
+        }
+        self._atomic_write_json(self._done_path(), done)
+        latest_dir = (self.root / "results") if self.dry else (self.ws / "results")
+        self._atomic_write_json(
+            latest_dir / "latest.json", {"topic": TOPIC, "date": date, **stats}
+        )
+        # 本地仅暂存：全部上传确认后清理当天目录
+        day_dir = self.local_day_dir / date
+        if day_dir.exists():
+            for child in day_dir.iterdir():
+                if child.is_file():
+                    child.unlink()
+            try:
+                day_dir.rmdir()
+            except OSError:
+                pass
+        self.state.resume_point = {}
+        self.state.progress = 100
+        self.log.info("日期 %s 完成：%s", date, json.dumps(stats, ensure_ascii=False))
+
+    # ---------- 单篇处理 ----------
+
+    def _process_one(self, record: dict, date: str,
+                     oss_objects: set[str], stats: dict) -> None:
+        key = strip_version(record["source_id"])
+        name = f"{key}.pdf"
+        if name in oss_objects:
+            stats["already_existed"] += 1
+            return
+        if self.dry:
+            time.sleep(0.5)
+            self.log.info("[DRY] 下载并上传 %s", name)
+            return
+
+        dest = self.local_day_dir / date / name
+        ok, reason = self._download_pdf(record, dest)
+        if not ok:
+            if reason.startswith("fatal:"):
+                stats["dead_letter"] += 1
+                self.dead_letter(key, reason)
+                self._remove_pending(key)
+                self.log.error("永久失败转 dead_letter：%s (%s)", key, reason)
+            else:
+                stats["skipped"] += 1
+                self.skip_item(key, f"download: {reason[:200]}")
+                self.log.error("下载失败入二刷：%s (%s)", key, reason)
+            tmp = dest.with_name(dest.name + ".tmp")
+            if tmp.exists():
+                tmp.unlink()
+            return
+        try:
+            self._upload_pdf(dest, date)
+        except Exception as exc:
+            stats["skipped"] += 1
+            self.skip_item(key, f"upload: {str(exc)[:200]}")
+            self.log.error("上传失败入二刷：%s (%s)", key, exc)
+            return
+        finally:
+            if dest.exists():
+                dest.unlink()
+        oss_objects.add(name)
+        stats["uploaded"] += 1
+        self.log.info("已上传 %s", f"{self._oss_prefix(date)}{name}")
+
+    # ---------- 主流程 ----------
+
+    def steps(self, resume: dict):
+        if os.environ.get("SCHED_TRIGGER") == "second_pass":
+            yield from self._steps_second_pass(resume)
+        else:
+            yield from self._steps_main(resume)
+
+    def _steps_main(self, resume: dict):
+        resume = resume or {}
+        date = resume.get("date") or self._t_minus_3()
+
+        # dry 各闸进程独立，禁止因冒烟留下的 dry done 标记短路后续闸/演练
+        done = {} if self.dry else self._load_done()
+        if date in done:
+            self.log.info("日期 %s 已完成，当日不重跑", date)
+            latest_dir = (self.root / "results") if self.dry else (self.ws / "results")
+            self._atomic_write_json(
+                latest_dir / "latest.json",
+                {"topic": TOPIC, "date": date, "status": "already_done",
+                 **{k: v for k, v in done[date].items() if k != "finished_at"}},
+            )
+            self.state.resume_point = {}
+            return
+
+        self._save_resume(date, "init")
+        self.log.info("开始采集 topic=%s date=T-3=%s dry=%s", TOPIC, date, self.dry)
+        yield Step("prepare", {"date": date, "topic": TOPIC})
+
+        if self.dry:
+            records = yield from self._dry_search(date)
+        else:
+            self._ensure_proxies()
+            records = yield from self._search_manifest(date)
+
+        oss_objects = self._list_oss_objects(date)
+        stats = {"papers_found": len(records), "uploaded": 0,
+                 "already_existed": 0, "skipped": 0, "dead_letter": 0,
+                 "ok": True}
+        consec_fail = 0
+        records_by_key = self._record_map(records)
+        # dry 无 OSS 可对账，直接按断点 index 续跑以便验证续跑起点；
+        # 正式模式仍从头迭代，但以 OSS 对象存在性为准跳过已上传论文（权威去重）。
+        start_idx = 0
+        if self.dry and resume.get("phase") == "papers":
+            start_idx = int(resume.get("index", -1)) + 1
+            if start_idx > 0:
+                self.log.info("[DRY] 从断点 index=%d 续跑（共 %d 篇）",
+                              start_idx, len(records))
+        for idx, record in enumerate(records[start_idx:], start=start_idx):
+            name = f"{strip_version(record.get('source_id', '') )}.pdf"
+            yield Step("paper", {"id": name, "index": idx, "total": len(records)})
+            before = stats["uploaded"] + stats["already_existed"]
+            before_dead = stats["dead_letter"]
+            self._process_one(record, date, oss_objects, stats)
+            after = stats["uploaded"] + stats["already_existed"]
+            after_dead = stats["dead_letter"]
+            if self.dry:
+                consec_fail = 0  # dry 模拟处理全部视为成功
+            elif after > before or after_dead > before_dead:
+                consec_fail = 0  # 上传成功 / 404 转死信，均不计代理故障
+            else:
+                consec_fail += 1
+            self.state.progress = int((idx + 1) / max(len(records), 1) * 100)
+            self._save_resume(
+                date, "papers", last=name, index=idx, total=len(records),
+                uploaded=stats["uploaded"], skipped=stats["skipped"],
+            )
+            if consec_fail >= CONSEC_FAIL_LIMIT:
+                self._fail_resource(
+                    f"连续 {consec_fail} 篇论文处理失败，疑似隧道/目标站点故障，"
+                    f"已落 pending，退让后重跑 date={date}",
+                    code=101,
+                )
+
+        pending = [
+            rec for rec in self.read_pending_skipped()
+            if rec.get("item") in records_by_key
+        ]
+        if pending:
+            msg = f"{len(pending)} 篇待二刷 date={date}"
+            self.log.warning(msg)
+            self.state.mark_failed("data_risk", msg)
+            self.state.flush()
+            sys.exit(110)
+
+        self._finish_day(date, stats)
+
+    def _steps_second_pass(self, resume: dict):
+        date = (resume or {}).get("date")
+        if not date:
+            raise ValueError(
+                "LOGIC: second_pass 缺少 resume_point.date，无法定位二刷日期"
+            )
+        manifest_path = self.manifest_dir / f"{date}.json"
+        if not manifest_path.exists():
+            raise ValueError(f"LOGIC: second_pass 找不到检索清单 {manifest_path}")
+        records = json.loads(manifest_path.read_text(encoding="utf-8"))["records"]
+        records_by_key = self._record_map(records)
+        pending = self.read_pending_skipped()
+        self.log.info("二刷开始 date=%s 待补 %d 篇", date, len(pending))
+        if not self.dry:
+            self._ensure_proxies()
+        oss_objects = self._list_oss_objects(date)
+
+        stats = {"papers_found": len(records), "uploaded": 0,
+                 "already_existed": len(oss_objects), "skipped": 0,
+                 "dead_letter": 0, "ok": True, "second_pass": True}
+        consec_fail = 0
+        for idx, rec in enumerate(pending):
+            key = rec["item"]
+            name = f"{key}.pdf"
+            yield Step("retry_paper", {"id": name, "index": idx,
+                                       "total": len(pending)})
+            if name in oss_objects:
+                self._remove_pending(key)
+                continue
+            record = records_by_key.get(key, {"source_id": key})
+            before = stats["uploaded"]
+            self._process_one(record, date, oss_objects, stats)
+            if stats["uploaded"] > before or name in oss_objects:
+                consec_fail = 0
+            else:
+                consec_fail += 1
+            self._save_resume(
+                date, "second_pass", last=name, index=idx,
+                total=len(pending),
+            )
+            if consec_fail >= CONSEC_FAIL_LIMIT:
+                self._fail_resource(
+                    f"二刷连续 {consec_fail} 篇失败，疑似隧道故障 date={date}",
+                    code=101,
+                )
+
+        remaining = self.read_pending_skipped()
+        if remaining:
+            msg = f"二刷后仍有 {len(remaining)} 篇失败 date={date}"
+            self.log.warning(msg)
+            self.state.mark_failed("data_risk", msg)
+            self.state.flush()
+            sys.exit(110)
+
+        stats["uploaded"] = max(stats["uploaded"], 0)
+        self._finish_day(date, stats)
+
+
+if __name__ == "__main__":
+    sys.exit(run_task(ArxivTopicTask()))

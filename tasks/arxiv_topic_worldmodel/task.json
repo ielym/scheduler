@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "name": "arxiv-topic-worldmodel",
+  "description": "每日检索 arXiv T-3 日期 WorldModel 主题论文，经 IP 隧道下载 PDF 并上传 OSS（断点续跑/OSS 去重/失败二刷）。",
+  "entry": {
+    "file": "run.py",
+    "interpreter": "python3",
+    "args": [],
+    "cwd": "."
+  },
+  "schedule": {
+    "type": "interval",
+    "interval": 86400,
+    "start_time": "18:40",
+    "end_time": "23:00",
+    "allow_overrun": true,
+    "max_instances": 1,
+    "overflow": "skip"
+  },
+  "priority": 40,
+  "env": {},
+  "outputs": {
+    "expect": [
+      "results/latest.json"
+    ]
+  },
+  "resources": {
+    "cpu": 0.5,
+    "memory_mb": 256,
+    "soft": {
+      "proxy": 1
+    }
+  },
+  "error_rules": {
+    "resource_regex": [
+      "429",
+      "rate limit",
+      "proxy",
+      "tunnel",
+      "timeout",
+      "connection",
+      "440",
+      "441",
+      "407",
+      "515",
+      "516",
+      "517",
+      "reset",
+      "refused",
+      "unreachable"
+    ],
+    "logic_regex": [
+      "LOGIC:"
+    ]
+  },
+  "heartbeat": {
+    "timeout_sec": 120
+  },
+  "smoke": {
+    "mode": "dry",
+    "max_runtime_sec": 60,
+    "signal_after_sec": 1.5
+  },
+  "runtime": {
+    "user": "sched-run"
+  },
+  "contract_exempt": false
+}

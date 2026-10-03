@@ -4,3 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 data/
+
+# 任务运行时产物
+tasks/*/cache/
+tasks/*/results/
