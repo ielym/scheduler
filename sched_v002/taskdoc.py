@@ -137,6 +137,7 @@ class SmokeSpec(BaseModel):
     mode: Literal["dry", "real"] = "dry"
     max_runtime_sec: int = 60
     sample_size: int = 1
+    signal_after_sec: float = 1.5  # 断点闸首次运行后多久发 SIGTERM（重导入任务可调大）
 
 
 class RuntimeSpec(BaseModel):
@@ -177,9 +178,12 @@ class TaskDoc(BaseModel):
     @field_validator("env")
     @classmethod
     def _env_ok(cls, v: dict[str, str]) -> dict[str, str]:
+        from .runner import ENV_BLACKLIST
         for k, val in v.items():
             if not isinstance(k, str) or not isinstance(val, str):
                 raise ValueError("env 必须是字符串到字符串的映射")
+            if k in ENV_BLACKLIST:
+                raise ValueError(f"env 键在安全黑名单中（防注入提权）：{k}")
         return v
 
     @model_validator(mode="after")

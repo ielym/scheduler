@@ -38,12 +38,15 @@ def select_preempt_targets(
     need_cpu: float,
     need_mem_mb: int,
     need_soft: dict[str, int],
+    waiter_priority: int,
 ) -> list[RunningInfo]:
     """贪心近似最小集合覆盖：按 priority 升序（最低优先者先）逐个加入，直到释放足够。
 
-    不可抢占（manual / contract_exempt）直接跳过，绝不入选。
+    只允许抢占优先级严格低于等待者的任务（R1/R2/R10）：手动触发、contract_exempt、
+    同优先级或更高优先级均直接跳过，绝不入选。
     """
-    candidates = [r for r in running if not r.manual and not r.contract_exempt]
+    candidates = [r for r in running if not r.manual and not r.contract_exempt
+                  and r.priority < waiter_priority]
     candidates.sort(key=lambda r: (r.priority, r.started_monotonic))  # 低优先、先启动者先被抢
     chosen: list[RunningInfo] = []
     fcpu, fmem, fsoft = 0.0, 0, {}

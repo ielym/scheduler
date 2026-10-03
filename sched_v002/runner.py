@@ -33,6 +33,15 @@ def build_argv(task_dir: Path, entry_file: str, interpreter: str | None, args: l
     return ([interpreter] if interpreter else []) + [entry] + list(args)
 
 
+# 环境变量白名单透传（防调度器机密泄露到任务进程）；任务 env 黑名单（防注入提权/库劫持）
+ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "TZ", "LC_ALL", "PYTHONPATH", "PYTHONUNBUFFERED")
+ENV_BLACKLIST = frozenset({
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+    "PYTHONSTARTUP", "PYTHONINSPECT", "BASH_ENV", "ENV", "IFS",
+    "PATH",  # 防注入伪造解释器/工具链劫持
+})
+
+
 def build_env(
     task_dir: Path,
     job_id: str,
@@ -43,8 +52,9 @@ def build_env(
     extra: dict[str, str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, str]:
-    env = dict(os.environ)
-    env.update(extra or {})
+    env = {k: os.environ[k] for k in ENV_PASSTHROUGH if k in os.environ}
+    if extra:  # 黑名单键在注册期（taskdoc 校验）已被拒绝，此处兜底过滤
+        env.update({k: v for k, v in extra.items() if k not in ENV_BLACKLIST})
     env.update(
         {
             "SCHED_JOB_ID": job_id,
@@ -63,20 +73,22 @@ def build_env(
 
 
 def _drop_privileges(user: str | None):
-    """preexec_fn：把子进程降权到 run_user（v04 R31）。用户不存在/已是当前用户则跳过。"""
+    """preexec_fn：把子进程降权到 run_user。用户不存在/已是当前用户则跳过。
+
+    F6：setuid 失败改为上抛（通过 preexec_fn 机制暴露为 OSError 到 Popen），
+    绝不静默以调度器身份执行任务代码。
+    """
     if not user:
         return
     try:
         pw = pwd.getpwnam(user)
     except KeyError:
-        return
+        # 上抛 KeyError（Popen 以 SubprocessError 暴露），测试环境用空 run_user 跳过
+        raise
     if pw.pw_uid == os.getuid():
         return
-    try:
-        os.setgid(pw.pw_gid)
-        os.setuid(pw.pw_uid)
-    except OSError:
-        pass
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
 
 
 @dataclass
@@ -200,10 +212,8 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
                     pass
 
             while True:
-                rc = proc.poll()
-                if rc is not None:
-                    exit_code = rc
-                    break
+                # 先查调度信号再查进程状态：避免 SIGTERM 后进程先退出、
+                # rc 先到导致 cancel/preempt 语义被退出码兜底覆盖（F7）
                 if spec.cancel.is_set():
                     scheduler_signaled = True
                     _terminate(proc, spec.cancel_grace_sec)
@@ -215,6 +225,16 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
                     scheduler_signaled = True
                     _terminate(proc, spec.preempt_grace_sec)
                     exit_code = proc.returncode
+                    break
+                rc = proc.poll()
+                if rc is not None:
+                    exit_code = rc
+                    if spec.cancel.is_set():
+                        # 竞态：stop()/cancel 的 SIGTERM 与进程退出几乎同时发生
+                        kind, reason, scheduler_signaled = "killed", "被手动终止", True
+                    elif spec.preempt.is_set() and rc not in (0, errors.EXIT_PREEMPTED):
+                        scheduler_signaled = True
+                        exit_code = errors.EXIT_PREEMPTED  # 抢占窗口内退出按抢占语义归因
                     break
                 time.sleep(POLL_INTERVAL_SEC)
     except FileNotFoundError as e:
@@ -231,7 +251,7 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
     duration_ms = int((time.monotonic() - t0) * 1000)
 
     # 任务 SDK 写入的精确错误分类（state.json.last_error.category），优先于退出码兜底
-    state_category = _read_last_error_category(spec.task_dir)
+    state_category = _read_last_error_category(spec.task_dir, spec.run_id)
 
     # 终态判定
     if kind == "exited":
@@ -301,24 +321,31 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
     )
 
 
-def _read_last_error_category(task_dir: Path) -> str:
-    """读取任务 SDK 写入 state.json 的 last_error.category（精确分类通道）。"""
+def _read_last_error_category(task_dir: Path, run_id: str = "") -> str:
+    """读取任务 SDK 写入的 last_error.category（精确分类通道）。
+
+    F4：优先读实例级 cache/runs/<run_id>/state.json，回落 legacy cache/state.json。
+    """
     import json
 
-    p = task_dir / "cache" / "state.json"
-    if not p.exists():
-        return ""
-    try:
-        st = json.loads(p.read_text("utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return ""
-    if not isinstance(st, dict):
-        return ""
-    last_error = st.get("last_error")
-    if isinstance(last_error, dict):
-        cat = last_error.get("category")
-        if isinstance(cat, str):
-            return cat
+    candidates = []
+    if run_id:
+        candidates.append(task_dir / "cache" / "runs" / run_id / "state.json")
+    candidates.append(task_dir / "cache" / "state.json")
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            st = json.loads(p.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(st, dict):
+            continue
+        last_error = st.get("last_error")
+        if isinstance(last_error, dict):
+            cat = last_error.get("category")
+            if isinstance(cat, str):
+                return cat
     return ""
 
 

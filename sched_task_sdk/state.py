@@ -18,32 +18,62 @@ def now_iso() -> str:
 
 
 class StateStore:
-    """任务工作目录下 cache/state.json 的原子读写。工作目录来自 SCHED_WORKSPACE。"""
+    """任务工作目录下的状态原子读写。工作目录来自 SCHED_WORKSPACE。
+
+    布局（F4 多实例隔离）：
+    - 实例级心跳/错误状态：cache/runs/<SCHED_RUN_ID>/state.json（并发实例互不干扰）
+    - 任务级断点 resume_point：cache/resume_point.json（跨运行共享，供恢复续跑）
+    无 SCHED_RUN_ID（本地调试）时实例级状态落在 cache/runs/local/state.json。
+    """
 
     def __init__(self, workspace: Path | None = None):
-        ws = workspace or Path(os.environ.get("SCHED_WORKSPACE") or os.getcwd())
-        self.path = Path(ws) / "cache" / "state.json"
+        ws = Path(workspace or Path(os.environ.get("SCHED_WORKSPACE") or os.getcwd()))
+        run_id = os.environ.get("SCHED_RUN_ID") or "local"
+        self.path = ws / "cache" / "runs" / run_id / "state.json"
+        self.resume_path = ws / "cache" / "resume_point.json"
+        self.legacy_path = ws / "cache" / "state.json"
 
     def load(self) -> dict:
-        if not self.path.exists():
-            return {}
-        try:
-            return json.loads(self.path.read_text("utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            return {}
+        for p in (self.path, self.legacy_path):
+            if p.exists():
+                try:
+                    return json.loads(p.read_text("utf-8"))
+                except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                    continue
+        return {}
+
+    def load_resume_point(self) -> dict:
+        """任务级断点：优先 cache/resume_point.json，回落 legacy state.json 的 resume_point。"""
+        if self.resume_path.exists():
+            try:
+                obj = json.loads(self.resume_path.read_text("utf-8"))
+                if isinstance(obj, dict):
+                    return obj.get("resume_point") or {}
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                pass
+        legacy = self.load()
+        rp = legacy.get("resume_point")
+        return rp if isinstance(rp, dict) else {}
 
     def save(self, obj: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        lock = self.path.with_name(self.path.name + ".lock")
+        self._atomic_write(self.path, obj)
+
+    def save_resume_point(self, resume_point: dict) -> None:
+        self._atomic_write(self.resume_path, {"resume_point": resume_point})
+
+    @staticmethod
+    def _atomic_write(path: Path, obj: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = path.with_name(path.name + ".lock")
         fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            f, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix="state.", suffix=".tmp")
+            f, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="state.", suffix=".tmp")
             with os.fdopen(f, "w", encoding="utf-8") as fh:
                 json.dump(obj, fh, ensure_ascii=False, indent=2)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            os.replace(tmp, path)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
@@ -61,7 +91,8 @@ class TaskState:
         self.next_action: str = raw.get("next_action", "")
         self.progress: int = int(raw.get("progress") or 0)
         self.loop_count: int = int(raw.get("loop_count") or 0)
-        self.resume_point: dict[str, Any] = raw.get("resume_point") or {}
+        # resume_point 是任务级断点（跨运行共享），从独立文件读取（F4）
+        self.resume_point: dict[str, Any] = self.store.load_resume_point()
         self.metrics: dict[str, Any] = raw.get("metrics") or {}
         self.last_error: dict[str, Any] = raw.get("last_error") or {}
         self.started_at: str = raw.get("started_at") or now_iso()
@@ -76,6 +107,7 @@ class TaskState:
         with self._lock:
             self.touch()
             self.store.save(self.as_dict())
+            self.store.save_resume_point(self.resume_point)
 
     def as_dict(self) -> dict:
         return {

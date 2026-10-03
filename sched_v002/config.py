@@ -97,6 +97,8 @@ class ResourceConfig(BaseModel):
     overload_ratio: float = 2.0      # 实际/预估 >2.0 视为超限
     overload_sustain_sec: int = 60   # 持续判定窗口
     sample_interval_sec: int = 3     # monitor 采样间隔
+    # 准出时对非调度进程占用的感知（R14）：est_mem > MemAvailable - margin → 退让等待
+    external_safety_margin_mb: int = 512
 
 
 class Settings(BaseModel):

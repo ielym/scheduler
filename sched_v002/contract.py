@@ -33,8 +33,12 @@ class GateResult:
 
 def _spawn_bounded(doc: taskdoc.TaskDoc, task_dir: Path, run_id: str, env_extra: dict[str, str], timeout_sec: int,
                    signal_after_sec: float | None = None, memory_high: int | None = None,
-                   memory_max: int | None = None, cpu_quota: float | None = None) -> dict:
-    """拉起入口，返回 {exit_code, memory_peak_mb, cpu_usec, timed_out, signaled}。"""
+                   memory_max: int | None = None, cpu_quota: float | None = None,
+                   run_user: str | None = None) -> dict:
+    """拉起入口，返回 {exit_code, memory_peak_mb, cpu_usec, timed_out, signaled}。
+
+    F6：注册期闸门与正式运行同等降权（run_user 非空时 preexec 降权，失败即闸失败）。
+    """
     argv = runner.build_argv(task_dir, doc.entry.file, doc.entry.interpreter, list(doc.entry.args))
     env = runner.build_env(task_dir, "contract", run_id, "contract", 1, time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                            dict(doc.env), dry_run=(env_extra.get("SCHED_DRY_RUN") == "1"))
@@ -54,6 +58,7 @@ def _spawn_bounded(doc: taskdoc.TaskDoc, task_dir: Path, run_id: str, env_extra:
             argv, cwd=str(workdir), env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, close_fds=True,
+            preexec_fn=(lambda: runner._drop_privileges(run_user)) if run_user else None,
         )
         if cgrp.available:
             cgrp.add_process(proc.pid)
@@ -93,16 +98,32 @@ def _spawn_bounded(doc: taskdoc.TaskDoc, task_dir: Path, run_id: str, env_extra:
     }
 
 
-def _read_state(task_dir: Path) -> dict:
+def _read_state(task_dir: Path, run_id: str = "") -> dict:
+    """读实例级状态并叠加任务级断点（F4 布局）。
+
+    实例级：cache/runs/<run_id>/state.json（回落 legacy cache/state.json）；
+    resume_point 以 cache/resume_point.json 为准（任务级断点跨运行共享）。
+    """
     import json
 
-    p = task_dir / "cache" / "state.json"
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text("utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+    def _load(p: Path) -> dict:
+        if not p.exists():
+            return {}
+        try:
+            obj = json.loads(p.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return obj if isinstance(obj, dict) else {}
+
+    st: dict = {}
+    if run_id:
+        st = _load(task_dir / "cache" / "runs" / run_id / "state.json")
+    if not st:
+        st = _load(task_dir / "cache" / "state.json")
+    rp = _load(task_dir / "cache" / "resume_point.json").get("resume_point")
+    if isinstance(rp, dict) and rp:
+        st["resume_point"] = rp
+    return st
 
 
 class ContractGates:
@@ -120,10 +141,11 @@ class ContractGates:
         return GateResult("gate1_static", True, "schema v2 合法")
 
     def gate_contract(self, doc: taskdoc.TaskDoc, task_dir: Path) -> GateResult:
-        res = _spawn_bounded(doc, task_dir, "probe", {CONTRACT_PROBE_ENV: "1"}, timeout_sec=30)
+        res = _spawn_bounded(doc, task_dir, "probe", {CONTRACT_PROBE_ENV: "1"}, timeout_sec=30,
+                             run_user=self.settings.run_user or None)
         if res["exit_code"] != 0:
             return GateResult("gate2_contract", False, f"契约自检退出码非 0：{res['exit_code']}", {"probe": res})
-        st = _read_state(task_dir)
+        st = _read_state(task_dir, "probe")
         need = ("status", "current_step", "schema_version", "resume_point")
         missing = [k for k in need if k not in st]
         if missing:
@@ -138,6 +160,7 @@ class ContractGates:
             memory_high=int(self.capacity.total_memory_mb * 1024 * 1024 * 0.9),
             memory_max=int(self.capacity.total_memory_mb * 1024 * 1024),
             cpu_quota=self.capacity.total_cpu,
+            run_user=self.settings.run_user or None,
         )
         if res["timed_out"]:
             return GateResult("gate3_smoke", False, f"冒烟超时（>{doc.smoke.max_runtime_sec}s）", {"smoke": res})
@@ -165,11 +188,12 @@ class ContractGates:
         # 1) 跑一段然后 SIGTERM
         res1 = _spawn_bounded(
             doc, task_dir, "ckpt1", {"SCHED_DRY_RUN": "1"},
-            timeout_sec=60, signal_after_sec=1.5,
+            timeout_sec=60, signal_after_sec=doc.smoke.signal_after_sec,
             memory_max=int(self.capacity.total_memory_mb * 1024 * 1024),
             cpu_quota=self.capacity.total_cpu,
+            run_user=self.settings.run_user or None,
         )
-        st1 = _read_state(task_dir)
+        st1 = _read_state(task_dir, "ckpt1")
         if res1["exit_code"] != errors.EXIT_PREEMPTED and st1.get("status") != "preempted":
             return GateResult("gate5_checkpoint", False,
                               f"打断后未按 99/抢占语义退出（exit={res1['exit_code']}, status={st1.get('status')}）",
@@ -183,8 +207,9 @@ class ContractGates:
             timeout_sec=60,
             memory_max=int(self.capacity.total_memory_mb * 1024 * 1024),
             cpu_quota=self.capacity.total_cpu,
+            run_user=self.settings.run_user or None,
         )
-        st2 = _read_state(task_dir)
+        st2 = _read_state(task_dir, "ckpt2")
         if res2["exit_code"] != 0 or st2.get("status") not in ("success", "intentional_exit"):
             return GateResult("gate5_checkpoint", False,
                               f"恢复跑未正常收尾（exit={res2['exit_code']}, status={st2.get('status')}）",
@@ -205,8 +230,8 @@ class ContractGates:
         return results
 
 
-def run_gates(doc: taskdoc.TaskDoc, task_dir: Path) -> tuple[bool, list[GateResult], dict[str, Any]]:
-    gates = ContractGates()
+def run_gates(doc: taskdoc.TaskDoc, task_dir: Path, settings=None) -> tuple[bool, list[GateResult], dict[str, Any]]:
+    gates = ContractGates(settings)
     results = gates.run_all(doc, task_dir)
     ok = all(r.ok for r in results)
     profile = {}

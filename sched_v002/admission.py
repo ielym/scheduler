@@ -37,7 +37,9 @@ def order_waiting(items: list[dict], starvation_sec: float, now_iso: str) -> lis
         pri = int(it.get("priority") or 0)
         enq = it.get("enqueued_at") or ""
         if _waited(enq) >= starvation_sec:
-            pri = 10_000
+            # 饿死看门狗提权钳制在值域 0~100 之上 1 级（=101）：
+            # 保证优先于普通排队，又不越界到天级别（P2 修复）
+            pri = 101
         return (-pri, enq)
 
     return sorted(items, key=_rank)
@@ -72,16 +74,25 @@ def can_admit(
     extra_cpu: float = 0.0,
     extra_mem_mb: int = 0,
     extra_soft: dict[str, int] | None = None,
+    external_mem_margin_mb: int = 0,
 ) -> tuple[bool, str]:
     """固定资源按账本预留判定；软资源按令牌桶判定。
 
     extra_*：本轮扫描中已准出但尚未入账（reserve）的虚拟占用，防同轮 over-commit。
+    external_mem_margin_mb：对非调度进程占用的感知（R14）——est 超过整机
+    MemAvailable - margin 时退让等待（不拒绝）。0 = 关闭该判定（测试用）。
     """
     reserved_mem = ledger.reserved_mem_mb() + extra_mem_mb
     reserved_cpu = ledger.reserved_cpu() + extra_cpu
     free_mem = capacity.total_memory_mb * hard_mem_reserve_ratio - reserved_mem
     if est_mem_mb > 0 and reserved_mem + est_mem_mb > capacity.total_memory_mb * hard_mem_reserve_ratio:
         return False, f"固定内存不足（需 {est_mem_mb}MB，账本余 {max(0, int(free_mem))}MB）"
+    if est_mem_mb > 0 and external_mem_margin_mb > 0:
+        avail_fn = getattr(capacity, "available_memory_mb", None)
+        real_avail = avail_fn() if callable(avail_fn) else None
+        if real_avail is not None and est_mem_mb > real_avail - external_mem_margin_mb:
+            return False, (f"整机可用内存不足（需 {est_mem_mb}MB，MemAvailable 余 "
+                           f"{max(0, real_avail - external_mem_margin_mb)}MB，含非调度进程占用）")
     free_cpu = capacity.total_cpu - reserved_cpu
     if est_cpu > 0 and reserved_cpu + est_cpu > capacity.total_cpu:
         return False, f"固定 CPU 不足（需 {est_cpu} 核，账本余 {max(0.0, round(free_cpu, 2))} 核）"
@@ -103,6 +114,7 @@ def admission_scan(
     capacity: resources.Capacity,
     soft_pool: resources.SoftResourcePool,
     overshoot: float,
+    external_mem_margin_mb: int = 0,
 ) -> AdmissionResult:
     """按双轨顺序扫描，尽量准出；软资源/固定资源不足的都留在队列继续等待（不失效）。
 
@@ -118,7 +130,8 @@ def admission_scan(
         prof = get_profile(it["job_id"])
         est_cpu, est_mem = estimate_job(prof, declared_cpu, declared_mem, overshoot, capacity)
         ok, reason = can_admit(est_cpu, est_mem, soft, ledger, capacity, soft_pool,
-                               extra_cpu=pending_cpu, extra_mem_mb=pending_mem, extra_soft=pending_soft)
+                               extra_cpu=pending_cpu, extra_mem_mb=pending_mem, extra_soft=pending_soft,
+                               external_mem_margin_mb=external_mem_margin_mb)
         if ok:
             res.admitted.append(rid)
             pending_cpu += est_cpu

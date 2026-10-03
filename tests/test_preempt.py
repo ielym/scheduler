@@ -10,26 +10,37 @@ def _ri(run_id, priority, cpu, mem, soft, manual=False, exempt=False):
 
 def test_select_min_priority_first():
     running = [
-        _ri("high", 90, 2.0, 200, {}),
         _ri("low", 10, 1.0, 100, {}),
         _ri("mid", 50, 1.5, 150, {}),
     ]
-    targets = preempt.select_preempt_targets(running, need_cpu=1.5, need_mem_mb=300, need_soft={})
-    # 按 priority 升序：low(10) → mid(50) 即可满足 mem 100+150=250 <300? 需要 low+mid+? 
-    # need mem 300：low(100)+mid(150)=250 不够，还需 high(200)=450 但 high 优先级高已排最后
-    # 贪心顺序 low(100) -> mid(150)->250 仍 <300 -> high(200)->450 够
-    assert [t.run_id for t in targets] == ["low", "mid", "high"]
+    # 等待者 priority=90：low(10)→mid(50) 即可补足，按升序逐个点名
+    targets = preempt.select_preempt_targets(running, need_cpu=1.5, need_mem_mb=200, need_soft={},
+                                             waiter_priority=90)
+    assert [t.run_id for t in targets] == ["low", "mid"]
+
+
+def test_select_never_preempts_higher_or_equal_priority():
+    # R1/R10：等待者 priority=50，运行中 P=90（更高）与 P=50（同级）均不得入选
+    running = [
+        _ri("high", 90, 2.0, 200, {}),
+        _ri("eq", 50, 1.5, 150, {}),
+    ]
+    targets = preempt.select_preempt_targets(running, need_cpu=1.0, need_mem_mb=100, need_soft={},
+                                             waiter_priority=50)
+    assert targets == []
 
 
 def test_select_skips_manual():
     running = [_ri("manual_low", 10, 2.0, 500, {}, manual=True)]
-    targets = preempt.select_preempt_targets(running, need_cpu=2.0, need_mem_mb=500, need_soft={})
+    targets = preempt.select_preempt_targets(running, need_cpu=2.0, need_mem_mb=500, need_soft={},
+                                             waiter_priority=90)
     assert targets == []
 
 
 def test_select_not_enough_returns_empty():
     running = [_ri("x", 10, 0.5, 10, {})]
-    targets = preempt.select_preempt_targets(running, need_cpu=1.0, need_mem_mb=100, need_soft={})
+    targets = preempt.select_preempt_targets(running, need_cpu=1.0, need_mem_mb=100, need_soft={},
+                                             waiter_priority=90)
     assert targets == []
 
 

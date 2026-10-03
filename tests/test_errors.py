@@ -21,9 +21,11 @@ def test_classify_sigkill_pending():
     assert "sigkill" in reason
 
 
-def test_classify_logic_fallback():
-    cat, _ = errors.classify_exit_code(1)
-    assert cat == "logic"
+def test_classify_g5_unclassified_fallback():
+    # G5：无任务自报分类时，未知非 0 退出码（含通用 1）一律按 resource 重试
+    cat, reason = errors.classify_exit_code(1)
+    assert cat == "unclassified"
+    assert "unclassified" in reason
 
 
 def test_is_retryable():

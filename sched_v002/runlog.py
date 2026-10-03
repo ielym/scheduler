@@ -55,7 +55,8 @@ def _iso_seconds_between(a: str, b: str) -> float:
 
 
 def new_run_id() -> str:
-    return f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(2)}"
+    # 时间戳 + 32bit 随机：同秒多 run 碰撞概率 ~1/4G（原 16bit 同秒碰撞风险过高）
+    return f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(4)}"
 
 
 def run_log_path(job_id: str) -> Path:

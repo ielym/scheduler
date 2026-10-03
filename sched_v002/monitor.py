@@ -50,18 +50,17 @@ class Monitor:
             seen.add(obs.run_id)
             hb_timeout = obs.heartbeat_timeout_sec or self.heartbeat_timeout_sec
             # manual 任务同样受心跳监测（防无限占用资源），仅阈值放宽；
-            # 超限退让对 manual 豁免（手动任务由触发者负责）
+            # 超限退让对 manual「放宽不豁免」：阈值 ×2，超过仍优雅抢占（P2 修复）
             if obs.heartbeat_age_sec > hb_timeout:
                 actions.append(MonitorAction("heartbeat_kill", obs.run_id,
                                              f"心跳超时（{obs.heartbeat_age_sec:.0f}s > {hb_timeout}s）"))
                 continue
-            if obs.manual:
-                continue
-            if obs.est_mem_mb > 0 and obs.actual_mem_mb is not None and obs.actual_mem_mb > obs.est_mem_mb * self.overload_ratio:
+            ratio = self.overload_ratio * (2 if obs.manual else 1)
+            if obs.est_mem_mb > 0 and obs.actual_mem_mb is not None and obs.actual_mem_mb > obs.est_mem_mb * ratio:
                 self._overload_cnt[obs.run_id] = self._overload_cnt.get(obs.run_id, 0) + 1
                 if self._overload_cnt[obs.run_id] >= self.overload_sustain_ticks:
                     actions.append(MonitorAction("overload_preempt", obs.run_id,
-                                                 f"实测 {obs.actual_mem_mb}MB > 预估 {obs.est_mem_mb}MB × {self.overload_ratio}，持续超限"))
+                                                 f"实测 {obs.actual_mem_mb}MB > 预估 {obs.est_mem_mb}MB × {ratio}，持续超限"))
             else:
                 self._overload_cnt.pop(obs.run_id, None)
         # 清理已不在运行列表的计数

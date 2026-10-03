@@ -226,7 +226,9 @@ def test_end_to_end_preempt_high_wins(home, make_settings):
         time.sleep(0.05)
     assert svc.running, "low 应已运行"
     # 等 low 真正启动（写出 state.json = 已装 SIGTERM 处理器），避免启动竞态
-    low_state = svc.entries["low"].task_dir / "cache" / "state.json"
+    # F4：状态文件在 cache/runs/<run_id>/state.json
+    low_run_id = next(iter(svc.running)) if svc.running else ""
+    low_state = svc.entries["low"].task_dir / "cache" / "runs" / low_run_id / "state.json"
     deadline = time.time() + 10
     while not low_state.exists() and time.time() < deadline:
         time.sleep(0.05)
@@ -305,7 +307,8 @@ def test_g5_unclassified_treated_as_resource(home, make_settings):
     assert out.exit_code == 1
     # G5：未分类错误一律按资源错误处理（可重试），而非转人工
     assert out.status == runlog.STATUS_RESOURCE
-    st = json.loads((home / "tasks" / "unclass" / "cache" / "state.json").read_text())
+    # F4：实例级状态在 cache/runs/<run_id>/state.json
+    st = json.loads((home / "tasks" / "unclass" / "cache" / "runs" / "r1" / "state.json").read_text())
     assert st["last_error"]["category"] == "unclassified"
 
 
@@ -381,10 +384,11 @@ def test_staged_admission_one_by_one_until_healthy(home, make_settings):
     svc._tick_admission()
     assert len(svc.running) == 1
 
-    # 等待任务真正启动（写出 state.json 心跳），避免心跳超时干扰门禁
+    # 等待任务真正启动（写出实例级 state.json 心跳），避免心跳超时干扰门禁
+    # F4：心跳在 cache/runs/<run_id>/state.json
     task_dir = svc.entries[svc.running[first_rid].run["job_id"]].task_dir
     deadline = time.time() + 10
-    while not (task_dir / "cache" / "state.json").exists() and time.time() < deadline:
+    while not (task_dir / "cache" / "runs" / first_rid / "state.json").exists() and time.time() < deadline:
         time.sleep(0.05)
 
     # 观察期过后放开（_tick_monitor 推进）
@@ -394,7 +398,6 @@ def test_staged_admission_one_by_one_until_healthy(home, make_settings):
     assert svc._staged_released is True
 
     # 首个任务完成后，后续任务可正常准出
-    re = svc.running[first_rid]
     deadline = time.time() + 15
     while first_rid in svc.running and time.time() < deadline:
         time.sleep(0.1)

@@ -36,6 +36,8 @@ def test_runner_preempt_exits_99_and_saves_checkpoint(home, make_settings):
     assert out.exit_code == 99
 
     # 断点已落盘，且下一步可恢复
-    st = json.loads((task_dir / "cache" / "state.json").read_text())
+    # F4：实例级状态在 cache/runs/<run_id>/state.json；断点在 cache/resume_point.json
+    st = json.loads((task_dir / "cache" / "runs" / "r_pre" / "state.json").read_text())
     assert st["status"] == "preempted"
-    assert st.get("resume_point")
+    rp = json.loads((task_dir / "cache" / "resume_point.json").read_text())
+    assert rp.get("resume_point")

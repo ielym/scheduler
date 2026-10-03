@@ -100,15 +100,24 @@ class SchedulerService:
         self._stopping.set()
         if self._loop_thread:
             self._loop_thread.join(timeout=5)
+        # F7：优雅停机不直接 _finalize，而是对每个 worker 线程发 cancel → 等它自然收敛到
+        # worker 里的 _finalize（终态唯一定点）；只有超时才兜底。
         with self._lock:
+            live_workers: list[tuple[str, threading.Thread]] = [
+                (rid, re.thread) for rid, re in list(self.running.items())
+                if getattr(re, "thread", None) is not None
+            ]
             for rid, re in list(self.running.items()):
                 re.spec.cancel.set()
-        # 兜底整组终止并落终态
-        for rid, re in list(self.running.items()):
-            pgid = getattr(re.spec, "pgid", None)
-            if pgid and runner.pgid_alive(int(pgid)):
-                runner.kill_process_group(int(pgid), self.settings.runner.kill_grace_sec)
-            self._finalize(re, runlog.STATUS_INTERRUPTED, "服务停止")
+        for rid, t in live_workers:
+            t.join(timeout=self.settings.runner.kill_grace_sec)
+            if t.is_alive():
+                # 线程 join 超时：活杀进程组，但终态仍交给 worker 线程（它随后会按 rc 判定）
+                re = self.running.get(rid)
+                if re:
+                    pgid = getattr(re.spec, "pgid", None)
+                    if pgid and runner.pgid_alive(int(pgid)):
+                        runner.kill_process_group(int(pgid), self.settings.runner.kill_grace_sec)
         persist.save_scheduler_state(self.state)
         persist.save_active(self._active_snapshot())
 
@@ -133,7 +142,7 @@ class SchedulerService:
             raise taskdoc.TaskDocError(f"任务目录不存在：{task_dir}")
         doc = taskdoc.load_task_doc(task_dir)
         # 五道闸
-        ok, results, profile = contract.run_gates(doc, task_dir)
+        ok, results, profile = contract.run_gates(doc, task_dir, settings=self.settings)
         if not ok:
             msgs = [f"{r.gate}: {r.reason}" for r in results if not r.ok]
             raise taskdoc.TaskDocError(msgs)
@@ -224,7 +233,7 @@ class SchedulerService:
                     self.engine.advance(jid, e.schedule(), now)
                     continue
                 # overflow=queue：照常入队，由准出侧的并发上限把关
-            self._enqueue(e, trigger="interval")
+            self._enqueue(e, trigger=("once" if doc.schedule.type == "once" else "interval"))
             self.engine.advance(jid, e.schedule(), now)
             if self.engine.next_run_time(jid) is None:
                 # once 到期后 next_fire 为 None：从触发引擎摘除，防止重复到期
@@ -239,7 +248,10 @@ class SchedulerService:
 
     def _tick_admission(self) -> None:
         with self._lock:
-            items = list(self.state.wq)
+            # 冷却/退避期任务留在 WQ 但不参与本轮扫描：
+            # 否则其虚拟占用会阻塞本轮其他任务，且每 tick 空转 pop/enqueue（N3）
+            items = [it for it in self.state.wq
+                     if not self._in_cooldown(it["job_id"]) and not self._in_backoff(it["job_id"])]
         if not items:
             self._staged_run_id = None
             return
@@ -253,6 +265,7 @@ class SchedulerService:
             capacity=self.capacity,
             soft_pool=self.soft_pool,
             overshoot=self.settings.resource.overshoot,
+            external_mem_margin_mb=self.settings.resource.external_safety_margin_mb,
         )
         admitted = list(res.admitted)
         # 渐进式提交（R13）：存在固定资源等待者时，冷启动一次只准出 1 项，
@@ -344,12 +357,19 @@ class SchedulerService:
         cgroup_name = f"{it['job_id']}/{run_id}"
         mem_high = int(est_mem * 1024 * 1024 * self.settings.resource.memory_high_ratio)
         mem_max = int(est_mem * 1024 * 1024 * self.settings.resource.memory_max_ratio)
+        # 降权用户：settings.run_user 为空 = 全局明确禁用降权（测试环境）；
+        # 否则任务级 runtime.user 优先，回落全局 settings.run_user（死字段接线）
+        if not self.settings.run_user:
+            run_user = ""
+        else:
+            run_user = (doc.runtime.user or "") if doc.runtime else ""
+            run_user = run_user or self.settings.run_user
         spec = runner.RunSpec(
             job_id=it["job_id"], run_id=run_id, task_dir=Path(it["task_dir"]),
             entry_file=doc.entry.file, interpreter=doc.entry.interpreter, args=list(doc.entry.args),
             cwd=doc.entry.cwd, env=dict(doc.env), trigger=it["trigger"], attempt=int(it["attempt"]),
             scheduled_at=it["scheduled_at"], expect_outputs=list(doc.outputs.expect),
-            dry_run=bool(it.get("dry_run")), run_user=self.settings.run_user,
+            dry_run=bool(it.get("dry_run")), run_user=run_user,
             cgroup_name=cgroup_name, memory_high=mem_high, memory_max=mem_max, cpu_quota=est_cpu,
             cancel_grace_sec=self.settings.runner.kill_grace_sec,
             preempt_grace_sec=self.settings.runner.grace_sec,
@@ -383,7 +403,7 @@ class SchedulerService:
             "started_at": outcome.started_at, "finished_at": outcome.finished_at,
             "duration_ms": outcome.duration_ms, "outputs": outcome.outputs,
             "stdout_log": outcome.stdout_log, "stderr_log": outcome.stderr_log,
-            "state_snapshot": self._read_task_state(Path(re.run["task_dir"]))[0],
+            "state_snapshot": self._read_task_state(Path(re.run["task_dir"]), re.run.get("run_id", ""))[0],
             "error": outcome.reason,
         })
         self._finalize(re, outcome.status, outcome.reason, mem_peak_mb=outcome.memory_peak_mb,
@@ -418,8 +438,9 @@ class SchedulerService:
         if gap_cpu <= 0 and gap_mem <= 0 and not any(gap_soft.values()):
             return  # 空闲已足够，无需抢占（等待可能是账本竞态，下轮准出即可）
         running_infos = [preempt.make_running_info(re.run, re.est_cpu, re.est_mem_mb, re.soft)
-                         for re in self.running.values()]
-        targets = preempt.select_preempt_targets(running_infos, gap_cpu, gap_mem, gap_soft)
+                         for re in list(self.running.values())]
+        targets = preempt.select_preempt_targets(running_infos, gap_cpu, gap_mem, gap_soft,
+                                                 waiter_priority=int(top.get("priority") or 0))
         for t in targets:
             re = self.running.get(t.run_id)
             if re is None:
@@ -435,7 +456,8 @@ class SchedulerService:
         prof = self.profiles.get(it["job_id"], decl_cpu, decl_mem)
         est_cpu, est_mem = admission.estimate_job(prof, decl_cpu, decl_mem,
                                                   self.settings.resource.overshoot, self.capacity)
-        ok, reason = admission.can_admit(est_cpu, est_mem, soft, self.ledger, self.capacity, self.soft_pool)
+        ok, reason = admission.can_admit(est_cpu, est_mem, soft, self.ledger, self.capacity, self.soft_pool,
+                                         external_mem_margin_mb=self.settings.resource.external_safety_margin_mb)
         return (not ok) and ("固定" in reason or "CPU" in reason or "内存" in reason)
 
     def _estimate_for(self, it: dict) -> tuple[float, int]:
@@ -456,8 +478,11 @@ class SchedulerService:
         with self._lock:
             running = list(self.running.values())
         for re in running:
-            st, age = self._read_task_state(Path(re.run["task_dir"]))
+            st, age = self._read_task_state(Path(re.run["task_dir"]), re.run.get("run_id", ""))
             actual = self._cgroup_live_mem(re.cgroup_name)
+            if actual is not None:
+                # 账本实测值刷新（cpu 速率不逐 tick 采样，仅内存；status 用于对账）
+                self.ledger.set_actual(re.run["run_id"], 0.0, actual)
             e = self.entries.get(re.run["job_id"])
             hb_timeout = None
             if e is not None and e.doc is not None:
@@ -573,6 +598,10 @@ class SchedulerService:
             # 数据风险（110）二刷闭环（R21）：跳过项已落 pending_skipped，
             # 延迟重入队二刷；连续达上限仍 110 才转人工
             self._handle_data_risk(rec)
+            return
+        if status == runlog.STATUS_KILLED and self._stopping.is_set():
+            # F7：优雅停机导致的 killed 属服务中断而非任务失败 → 断点重入队，不转人工
+            self._requeue_resume(rec)
             return
         # failed / killed / preempt_failed → 逻辑错误或数据风险，转人工（不再自动重试）
         persist.append_decision({"ts": runlog.now_iso(), "act": "terminal", "run_id": rec["run_id"],
@@ -760,17 +789,23 @@ class SchedulerService:
         r = e.doc.resources
         return float(r.cpu), int(r.memory_mb), dict(r.soft)
 
-    def _read_task_state(self, task_dir: Path) -> tuple[dict, float]:
-        p = task_dir / "cache" / "state.json"
-        if not p.exists():
-            return {}, 1e9
-        try:
-            import json
-            st = json.loads(p.read_text("utf-8"))
-            age = max(0.0, time.time() - p.stat().st_mtime)
-            return (st if isinstance(st, dict) else {}), age
-        except (json.JSONDecodeError, OSError):
-            return {}, 1e9
+    def _read_task_state(self, task_dir: Path, run_id: str = "") -> tuple[dict, float]:
+        """读任务实例级状态。F4：优先 cache/runs/<run_id>/state.json，回落 legacy。"""
+        candidates = []
+        if run_id:
+            candidates.append(task_dir / "cache" / "runs" / run_id / "state.json")
+        candidates.append(task_dir / "cache" / "state.json")
+        for p in candidates:
+            if not p.exists():
+                continue
+            try:
+                import json
+                st = json.loads(p.read_text("utf-8"))
+                age = max(0.0, time.time() - p.stat().st_mtime)
+                return (st if isinstance(st, dict) else {}), age
+            except (json.JSONDecodeError, OSError):
+                continue
+        return {}, 1e9
 
     def _cgroup_live_mem(self, name: str) -> int | None:
         c = cgroup.Cgroup(name)
@@ -808,7 +843,9 @@ class SchedulerService:
         sched = doc.schedule
         if sched.type != "interval" or not (sched.start_time and sched.end_time) or sched.allow_overrun:
             return
-        for re in list(self.running.values()):
+        with self._lock:
+            running = list(self.running.values())
+        for re in running:
             rec = re.run
             started = rec.get("started_at") or rec.get("scheduled_at")
             try:
