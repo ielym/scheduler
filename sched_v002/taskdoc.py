@@ -1,0 +1,260 @@
+"""【协议 A】任务目录与 task.json（schema v2）的解析与校验。
+
+v2 在 v1 基础上新增调度体系所需的声明：resources（资源预估）、error_rules（错误分类补充）、
+heartbeat（心跳超时）、smoke（冒烟参数）、runtime（非 root 执行）、diff_check、contract_exempt。
+保持纯手动模型：调度器绝不自动发现、绝不生成骨架。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from . import store
+
+SCHEMA_VERSION = 2
+SUPPORTED_VERSIONS = {1, 2}
+TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+INTERPRETER_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")
+TIME_OF_DAY_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
+
+
+class TaskDocError(Exception):
+    def __init__(self, errors: list[str] | str):
+        self.errors = [errors] if isinstance(errors, str) else errors
+        super().__init__("; ".join(self.errors))
+
+
+class EntrySpec(BaseModel):
+    file: str
+    interpreter: str | None = "python3"
+    args: list[str] = Field(default_factory=list)
+    cwd: str = "."
+
+    @field_validator("file")
+    @classmethod
+    def _file_ok(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("entry.file 不能为空")
+        return v
+
+    @field_validator("interpreter")
+    @classmethod
+    def _interp_ok(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not INTERPRETER_RE.match(v):
+            raise ValueError(f"entry.interpreter 非法：{v!r}（只能是命令名，不能带路径）")
+        return v
+
+    @field_validator("args")
+    @classmethod
+    def _args_ok(cls, v: list[str]) -> list[str]:
+        for a in v:
+            if not isinstance(a, str):
+                raise ValueError("entry.args 只能是字符串数组")
+        return v
+
+
+class ScheduleSpec(BaseModel):
+    type: Literal["interval", "once", "manual"] = "manual"
+    interval: int | None = None
+    once_at: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    weekdays: list[int] = Field(default_factory=list)
+    allow_overrun: bool = False
+    max_instances: int = 1
+    overflow: Literal["skip", "queue"] = "skip"
+
+    @model_validator(mode="after")
+    def _check(self) -> "ScheduleSpec":
+        if self.type == "interval":
+            if not self.interval or self.interval <= 0:
+                raise ValueError("schedule.type=interval 时 schedule.interval 必须为正整数秒")
+            if (self.start_time is None) != (self.end_time is None):
+                raise ValueError("schedule.start_time 与 schedule.end_time 必须同时提供；都不填 = 全天")
+            if self.start_time is not None:
+                if not TIME_OF_DAY_RE.match(str(self.start_time)) or not TIME_OF_DAY_RE.match(str(self.end_time)):
+                    raise ValueError("schedule.start_time/end_time 必须是 HH:MM 或 HH:MM:SS")
+            for d in self.weekdays:
+                if not isinstance(d, int) or isinstance(d, bool) or d < 1 or d > 7:
+                    raise ValueError("schedule.weekdays 只能是 1..7 的整数（1=周一，7=周日）")
+            if self.weekdays:
+                self.weekdays = sorted(set(self.weekdays))
+        elif self.type == "once" and not self.once_at:
+            raise ValueError("schedule.type=once 时必须提供 schedule.once_at（ISO8601）")
+        if not isinstance(self.max_instances, int) or isinstance(self.max_instances, bool):
+            raise ValueError("schedule.max_instances 必须是整数（1~20）")
+        if not 1 <= self.max_instances <= 20:
+            raise ValueError(f"schedule.max_instances 必须在 1~20 之间，当前 {self.max_instances!r}")
+        return self
+
+
+class OutputsSpec(BaseModel):
+    expect: list[str] = Field(default_factory=list)
+
+
+class ResourceDecl(BaseModel):
+    """任务声明的资源预估（gate 4 容量判定 + 账本预留）。0 = 未知，交给冒烟/画像补全。"""
+
+    cpu: float = 0.0
+    memory_mb: int = 0
+    soft: dict[str, int] = Field(default_factory=dict)  # 软资源名 -> 并发占用量
+
+    @model_validator(mode="after")
+    def _check(self) -> "ResourceDecl":
+        if self.cpu < 0 or (isinstance(self.memory_mb, bool) or self.memory_mb < 0):
+            raise ValueError("resources.cpu / resources.memory_mb 不能为负")
+        for k, v in self.soft.items():
+            if not isinstance(k, str) or not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise ValueError("resources.soft 必须是 {'资源名': 非负整数}")
+        return self
+
+
+class ErrorRules(BaseModel):
+    resource_regex: list[str] = Field(default_factory=list)
+    logic_regex: list[str] = Field(default_factory=list)
+
+
+class HeartbeatSpec(BaseModel):
+    timeout_sec: int = 120
+
+    @field_validator("timeout_sec")
+    @classmethod
+    def _hb_ok(cls, v: int) -> int:
+        if isinstance(v, bool) or v < 5:
+            raise ValueError("heartbeat.timeout_sec 必须 >= 5")
+        return v
+
+
+class SmokeSpec(BaseModel):
+    mode: Literal["dry", "real"] = "dry"
+    max_runtime_sec: int = 60
+    sample_size: int = 1
+
+
+class RuntimeSpec(BaseModel):
+    user: str = "sched-run"  # 非 root 执行用户；空 = 以调度器运行用户执行
+
+
+class TaskDoc(BaseModel):
+    schema_version: int = SCHEMA_VERSION
+    name: str = ""
+    description: str = ""
+    entry: EntrySpec
+    schedule: ScheduleSpec = Field(default_factory=ScheduleSpec)
+    priority: int = 0
+    env: dict[str, str] = Field(default_factory=dict)
+    outputs: OutputsSpec = Field(default_factory=OutputsSpec)
+    resources: ResourceDecl = Field(default_factory=ResourceDecl)
+    error_rules: ErrorRules = Field(default_factory=ErrorRules)
+    heartbeat: HeartbeatSpec = Field(default_factory=HeartbeatSpec)
+    smoke: SmokeSpec = Field(default_factory=SmokeSpec)
+    runtime: RuntimeSpec = Field(default_factory=RuntimeSpec)
+    diff_check: bool = False
+    contract_exempt: bool = False  # True：只能手动触发，禁止自动调度（不可断点恢复的任务）
+
+    @field_validator("schema_version")
+    @classmethod
+    def _version_ok(cls, v: int) -> int:
+        if v not in SUPPORTED_VERSIONS:
+            raise ValueError(f"schema_version 不支持：{v}（支持 {sorted(SUPPORTED_VERSIONS)}）")
+        return v
+
+    @field_validator("priority")
+    @classmethod
+    def _priority_ok(cls, v: int) -> int:
+        if isinstance(v, bool) or not (0 <= v <= 100):
+            raise ValueError("priority 必须在 0~100 之间")
+        return v
+
+    @field_validator("env")
+    @classmethod
+    def _env_ok(cls, v: dict[str, str]) -> dict[str, str]:
+        for k, val in v.items():
+            if not isinstance(k, str) or not isinstance(val, str):
+                raise ValueError("env 必须是字符串到字符串的映射")
+        return v
+
+    @model_validator(mode="after")
+    def _check_exempt(self) -> "TaskDoc":
+        if self.contract_exempt and self.schedule.type != "manual":
+            raise ValueError("contract_exempt=true 的任务只能 schedule.type=manual（禁止自动触发）")
+        return self
+
+    def display_name(self) -> str:
+        return self.name or self.entry.file
+
+
+def _rel_within(task_dir: Path, rel: str, field: str) -> Path:
+    if not rel:
+        raise TaskDocError(f"{field} 不能为空")
+    p = Path(rel)
+    if p.is_absolute():
+        raise TaskDocError(f"{field} 必须是相对路径：{rel}")
+    if ".." in p.parts:
+        raise TaskDocError(f"{field} 不能包含 '..'：{rel}")
+    base = task_dir.resolve()
+    target = (base / p).resolve()
+    if target != base and base not in target.parents:
+        raise TaskDocError(f"{field} 越出了任务目录：{rel}")
+    return target
+
+
+def validate_task_id(task_id: str) -> str:
+    if not TASK_ID_RE.match(task_id or ""):
+        raise TaskDocError(f"任务 id 非法：{task_id!r}（字母数字下划线短横，1-64 位）")
+    if task_id.startswith("_") or task_id.startswith("."):
+        raise TaskDocError(f"任务 id 不能以 '_' 或 '.' 开头：{task_id!r}")
+    return task_id
+
+
+def parse_task_json(raw: Any, task_dir: Path) -> TaskDoc:
+    if not isinstance(raw, dict):
+        raise TaskDocError("task.json 顶层必须是对象")
+    try:
+        doc = TaskDoc.model_validate(raw)
+    except ValidationError as e:
+        msgs = []
+        for err in e.errors():
+            loc = ".".join(str(x) for x in err["loc"]) or "(root)"
+            msgs.append(f"{loc}: {err['msg']}")
+        raise TaskDocError(msgs) from e
+
+    entry_path = _rel_within(task_dir, doc.entry.file, "entry.file")
+    if not entry_path.exists():
+        raise TaskDocError(f"entry.file 不存在：{doc.entry.file}")
+    if doc.entry.interpreter is None and not os.access(entry_path, os.X_OK):
+        raise TaskDocError(f"entry.interpreter 为 null 时 entry.file 必须具备可执行权限")
+    _rel_within(task_dir, doc.entry.cwd or ".", "entry.cwd")
+    for i, item in enumerate(doc.outputs.expect):
+        _rel_within(task_dir, item, f"outputs.expect[{i}]")
+    return doc
+
+
+def load_task_doc(task_dir: Path) -> TaskDoc:
+    validate_task_id(task_dir.name)
+    if not task_dir.is_dir():
+        raise TaskDocError(f"任务目录不存在：{task_dir}")
+    tj = task_dir / "task.json"
+    if not tj.exists():
+        raise TaskDocError(f"缺少 task.json：{tj}")
+    try:
+        raw = json.loads(store.read_text(tj))
+    except json.JSONDecodeError as e:
+        raise TaskDocError(f"task.json 不是合法 JSON：{e}") from e
+    return parse_task_json(raw, task_dir)
+
+
+def effective(task_dir: Path, doc: TaskDoc) -> dict[str, Any]:
+    return {
+        "schedule": doc.schedule.model_dump(),
+        "priority": doc.priority,
+        "resources": doc.resources.model_dump(),
+    }

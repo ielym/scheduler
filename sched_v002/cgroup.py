@@ -1,0 +1,152 @@
+"""cgroup v2 生命周期管理（独立复刻）。
+
+为每个 run 建立独立 cgroup，通过 memory.high（软限节流）+ memory.max（硬兜底）双水位
+实现资源硬边界，并读取 memory.current / memory.peak / cpu.stat / memory.events 作为
+monitor 与画像的唯一权威数据源。无法使用 cgroup 时降级为 no-op（L3 降标准）。
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+FALLBACK_ROOT = CGROUP_ROOT / "scheduler_v002"
+
+
+def _cgroup_fs_mounted() -> bool:
+    return (CGROUP_ROOT / "cgroup.controllers").exists()
+
+
+def _writable(path: Path) -> bool:
+    return os.access(path, os.W_OK)
+
+
+class Cgroup:
+    """一个 run 的 cgroup 控制句柄。所有写操作失败时静默降级（不影响调度主流程）。"""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.path = FALLBACK_ROOT / name if _cgroup_fs_mounted() else None
+        self.available = False
+        if self.path is not None:
+            try:
+                self.path.mkdir(parents=True, exist_ok=True)
+                self.available = _writable(self.path)
+            except OSError:
+                self.available = False
+
+    # ---- 资源上限 ----
+    def set_limits(self, memory_high: int | None, memory_max: int | None, cpu_quota: float | None) -> None:
+        if not self.available:
+            return
+        if memory_high is not None:
+            self._write("memory.high", str(int(memory_high)))
+        if memory_max is not None:
+            self._write("memory.max", str(int(memory_max)))
+        if cpu_quota is not None:
+            # cpu.max: "QUOTA PERIOD"，quota 微秒；"max" = 不限
+            if cpu_quota <= 0:
+                self._write("cpu.max", "max")
+            else:
+                self._write("cpu.max", f"{int(cpu_quota * 100000)} 100000")
+
+    def add_process(self, pid: int) -> None:
+        if not self.available:
+            return
+        self._write("cgroup.procs", str(int(pid)))
+
+    def kill_all(self) -> None:
+        if not self.available:
+            return
+        self._write("cgroup.kill", "1")
+
+    # ---- 观测 ----
+    def read_current_mem(self) -> int | None:
+        return self._read_int("memory.current")
+
+    def read_peak_mem(self) -> int | None:
+        return self._read_int("memory.peak")
+
+    def read_oom_kill_count(self) -> int | None:
+        return self._read_int("memory.events", key="oom_kill")
+
+    def read_cpu_usage_usec(self) -> int | None:
+        v = self._read_int("cpu.stat", key="usage_usec")
+        return v
+
+    def procs(self) -> list[int]:
+        if not self.available:
+            return []
+        try:
+            txt = (self.path / "cgroup.procs").read_text()
+        except OSError:
+            return []
+        return [int(x) for x in txt.split()]
+
+    def remove(self) -> None:
+        if not self.path or not self.path.exists():
+            return
+        try:
+            self.kill_all()
+            time.sleep(0.05)
+            self.path.rmdir()
+        except OSError:
+            pass
+
+    # ---- 内部 ----
+    def _write(self, fname: str, value: str) -> None:
+        try:
+            (self.path / fname).write_text(value)
+        except OSError:
+            pass
+
+    def _read_int(self, fname: str, key: str | None = None) -> int | None:
+        if not self.available:
+            return None
+        try:
+            txt = (self.path / fname).read_text()
+        except OSError:
+            return None
+        if key is None:
+            try:
+                return int(txt.strip())
+            except ValueError:
+                return None
+        for line in txt.splitlines():
+            k, _, v = line.partition(" ")
+            if k == key:
+                try:
+                    return int(v)
+                except ValueError:
+                    return None
+        return None
+
+
+def _delegate_controllers() -> bool:
+    """在 cgroup2 里为调度器子树启用 memory/cpu 控制器（需要 root）。"""
+    if not _cgroup_fs_mounted():
+        return False
+    try:
+        FALLBACK_ROOT.mkdir(parents=True, exist_ok=True)
+        subtree = CGROUP_ROOT / "cgroup.subtree_control"
+        cur = subtree.read_text().strip() if subtree.exists() else ""
+        for c in ("memory", "cpu"):
+            if f"+{c}" not in cur:
+                subtree.write_text(cur + f" +{c}" if cur else f"+{c}")
+        return True
+    except OSError:
+        return False
+
+
+def ensure_scheduler_subtree() -> bool:
+    if not _cgroup_fs_mounted():
+        return False
+    if _writable(FALLBACK_ROOT) or FALLBACK_ROOT.exists():
+        return True
+    return _delegate_controllers()
+
+
+def new_cgroup(name: str) -> Cgroup:
+    return Cgroup(name)
