@@ -321,3 +321,16 @@ echo "data/" >> .gitignore && git add .gitignore && git commit -m "chore: ignore
 | 判定 | **不满足完成标准**。须完成 4.1（A、B）+ 4.5（R23）并复审通过后方可宣称达标；4.2 建议同批整改，4.3/4.4 可排期 |
 
 > 本报告为第三轮独立复审证据，修复后请以第四轮复审闭环验证矩阵全绿。
+
+---
+
+## 6. 修复完成记录（2026-10-03）
+
+第三轮全部问题已按第 4 章方案修复完毕，本地提交 `b4a2504`：
+
+- **P0-A/B**：manual 不再豁免抢占（仅 contract_exempt 保留）；资源错误默认无限退避重试，`max_resource_attempts>0` 才封顶转人工。R1/R16/R17/R20 硬缺口关闭。
+- **P1-C~G**：upsert 保序 + serve 热加载（`hot_reload_sec`）；-9 三态归因；error_rules 经 `SCHED_ERROR_RULES` 注入并由 SDK 读取；run_user 前置校验含 useradd 指引；闸5 心跳契约 + 心跳误杀重入队一次。
+- **P2/P3**：stdout 截断、jsonl 轮转、单实例 flock + cmd_serve 友好报错、cgroup 降级告警、二刷支撑、重入队字段工厂；死配置清理、调度参数入 Settings、`_reconcile` 清理遗留 cgroup、`Capacity.refresh()`。
+- **P2① 根治**：worker 在 `running.pop` 之后才落盘终态，按 running 追踪线程会漏——fixture finalizer 改为 join 全部新建线程；生产 `data/` 污染已清除并验证全量跑后保持干净。
+- **测试**：更新 4 处固化错误预期的旧测试，新增 `tests/test_round3_fixes.py` 17 项回归；全量 **115 passed**。
+- **R23 遗留**：`.gitignore` 已加 `data/`，本地已提交；但仓库未配置远端，**推送远端需由运维提供 remote URL 后执行 `git push`**。
