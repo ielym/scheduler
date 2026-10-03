@@ -26,7 +26,7 @@ import re
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -74,18 +74,36 @@ USER_AGENT = (
 _VERSION_RE = re.compile(r"v\d+$")
 
 
-def _hard_call(func, deadline: float, *args, **kwargs):
-    """硬墙钟调用：墙钟到点即放弃等待并抛 FutureTimeout。
+class DeadlineTimeout(RuntimeError):
+    """硬墙钟超时：drip 连接的底层读线程仍活着，但主流程不再等。"""
 
-    被放弃的底层读线程无法强杀，但其 socket 自带静默超时（45/60s），
-    最迟多活一个静默超时后自然消亡；shutdown(wait=False) 不阻塞主流程。
+
+def _hard_call(func, deadline: float, *args, **kwargs):
+    """硬墙钟调用：墙钟到点即放弃等待并抛 DeadlineTimeout。
+
+    必须使用 daemon 线程：线程池（ThreadPoolExecutor）的工作线程是
+    非 daemon 且被 concurrent.futures 注册到解释器退出钩子，任务 sys.exit
+    时解释器会 join 这些被放弃、仍卡在 ssl read 的线程（各等满 60s 静默
+    超时），导致退出悬挂 1-2 分钟——期间心跳线程（daemon）已随关闭阶段
+    停止 flush，被调度器误判心跳超时强杀。daemon 线程随进程直接消失，
+    socket fd 由内核回收，不留挂尾。
     """
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-dl")
-    future = pool.submit(func, *args, **kwargs)
-    try:
-        return future.result(timeout=deadline)
-    finally:
-        pool.shutdown(wait=False)
+    box: dict = {}
+
+    def _work() -> None:
+        try:
+            box["value"] = func(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - 跨线程回传任意异常
+            box["error"] = exc
+
+    t = threading.Thread(target=_work, name="pdf-dl", daemon=True)
+    t.start()
+    t.join(timeout=deadline)
+    if t.is_alive():
+        raise DeadlineTimeout(f"{getattr(func, '__name__', func)} 超过 {deadline:.0f}s 墙钟")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 class ResourceError(RuntimeError):
@@ -425,7 +443,7 @@ class ArxivTopicTask(SchedTask):
         try:
             res = _hard_call(http_request, PDF_FULL_DEADLINE_SEC,
                              "GET", url, cred=cred, retries=0, timeout=45.0)
-        except FutureTimeout:
+        except DeadlineTimeout:
             res = {"ok": False, "status": 0, "body": None}
         if res.get("status") == 404:
             return False, "fatal: HTTP 404"
