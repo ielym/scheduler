@@ -22,7 +22,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from . import config, persist, registry, runlog, store, taskdoc
 
@@ -72,6 +72,29 @@ class CreateReq(BaseModel):
 
 class FileReq(BaseModel):
     content: str
+
+
+class SettingsReq(BaseModel):
+    # 均可选：只提交要改的字段；未提交的保持原值
+    timezone: str | None = None
+    cooldown_sec: int | None = None
+    max_resource_attempts: int | None = None
+    resource_backoff_base_sec: int | None = None
+    resource_backoff_cap_sec: int | None = None
+    auto_admit_retry_sec: float | None = None
+
+
+# 只暴露用户需要感知、且允许在线热更新的参数；其余（grace/kill/心跳/cgroup/端口等）
+# 属引擎内部参数，不在管理台出现。
+def _public_settings(s) -> dict:
+    return {
+        "timezone": s.timezone,
+        "cooldown_sec": s.runner.cooldown_sec,
+        "max_resource_attempts": s.runner.max_resource_attempts,
+        "resource_backoff_base_sec": s.runner.resource_backoff_base_sec,
+        "resource_backoff_cap_sec": s.runner.resource_backoff_cap_sec,
+        "auto_admit_retry_sec": s.auto_admit_retry_sec,
+    }
 
 
 def _write_task_file(path: Path, text: str) -> int:
@@ -129,6 +152,7 @@ _SKELETON_RUN_PY = '''"""最小任务骨架（管理台自动生成）。更丰�
   SIGTERM 命中"块处理中"，验证 99 抢占语义；真实逻辑上线后可去掉人为 sleep。
 - 逻辑错误用 raise ValueError("LOGIC: ...")（配合 task.json logic_regex）；
   资源错误 flush 后 sys.exit(100|101)；数据风险 sys.exit(110) 请求二刷。
+  代理断连/响应截断等"换个连接就好"的瞬时故障先就地重试 3~4 次，连续失败再 101。
 - 交付物原子写到 results/final.json（outputs.expect 缺失会被判 failed）。
 """
 
@@ -253,15 +277,7 @@ def create_app(svc) -> FastAPI:
                 "available_memory_mb": cap.available_memory_mb(),
                 "total_cpu": cap.total_cpu,
             },
-            "settings": {
-                "timezone": svc.settings.timezone,
-                "cooldown_sec": svc.settings.runner.cooldown_sec,
-                "grace_sec": svc.settings.runner.grace_sec,
-                "kill_grace_sec": svc.settings.runner.kill_grace_sec,
-                "heartbeat_timeout_sec": svc.settings.runner.heartbeat_timeout_sec,
-                "max_resource_attempts": svc.settings.runner.max_resource_attempts,
-                "hot_reload_sec": svc.settings.hot_reload_sec,
-            },
+            "settings": _public_settings(svc.settings),
             "started_at": svc.started_at,
         }
 
@@ -290,6 +306,24 @@ def create_app(svc) -> FastAPI:
             ]
             cooldowns = dict(svc.state.cooldowns)
             backoffs = dict(svc.state.backoffs)
+        # 给每个等待项附上"上次运行结果"：用户在队列页就能看到到底因为什么在等待
+        for it in waiting:
+            latest = runlog.query_runs(job_id=it["job_id"], limit=1)
+            if not latest:
+                continue
+            rec = latest[0]
+            msg = ""
+            snap = rec.get("state_snapshot") or {}
+            le = snap.get("last_error") or {}
+            if isinstance(le, dict):
+                msg = str(le.get("message") or "")
+            it["last"] = {
+                "status": rec.get("status"),
+                "exit_code": rec.get("exit_code"),
+                "reason": rec.get("reason") or "",
+                "message": msg,
+                "finished_at": rec.get("finished_at") or rec.get("started_at") or "",
+            }
         return {"waiting": waiting, "running": _running_snapshot(svc),
                 "cooldowns": cooldowns, "backoffs": backoffs}
 
@@ -356,6 +390,38 @@ def create_app(svc) -> FastAPI:
         persist.append_decision({"ts": runlog.now_iso(), "act": "web_set_enabled",
                                  "job_id": job_id, "enabled": req.enabled})
         return {"ok": True, "job_id": job_id, "enabled": req.enabled}
+
+    # ---------- 运行参数（少数可感知参数，面板改完立即热更新，无需重启） ----------
+
+    @app.post("/api/settings")
+    def update_settings(req: SettingsReq):
+        data = svc.settings.model_dump()
+        patch = {k: v for k, v in req.model_dump().items() if v is not None}
+        runner_keys = ("cooldown_sec", "max_resource_attempts",
+                       "resource_backoff_base_sec", "resource_backoff_cap_sec")
+        runner_patch = {k: patch.pop(k) for k in runner_keys if k in patch}
+        if runner_patch:
+            data["runner"] = {**data.get("runner", {}), **runner_patch}
+        data.update(patch)
+        try:
+            new_settings = config.Settings.model_validate(data)
+        except ValidationError as e:
+            msgs = "; ".join(f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}" for err in e.errors())
+            raise HTTPException(400, msgs)
+        r = new_settings.runner
+        if r.cooldown_sec < 0 or r.max_resource_attempts < 0:
+            raise HTTPException(400, "间隔/重试次数不能为负数")
+        if r.resource_backoff_base_sec < 10 or r.resource_backoff_cap_sec < 10:
+            raise HTTPException(400, "退避秒数不能小于 10")
+        if r.resource_backoff_base_sec > r.resource_backoff_cap_sec:
+            raise HTTPException(400, "退避起始秒数不能大于封顶秒数")
+        if new_settings.auto_admit_retry_sec < 10:
+            raise HTTPException(400, "上线检查重试间隔不能小于 10 秒")
+        config.save_settings(new_settings)
+        svc.apply_settings(new_settings)
+        persist.append_decision({"ts": runlog.now_iso(), "act": "web_update_settings",
+                                 "changes": sorted(patch.keys()) + sorted(runner_patch.keys())})
+        return {"ok": True, "settings": _public_settings(new_settings)}
 
     # ---------- 任务源码文件 ----------
 

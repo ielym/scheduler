@@ -487,6 +487,34 @@ def test_finalize_101_schedules_backoff_retry(home, make_settings):
     assert svc.state.wq[0]["attempt"] == 2
 
 
+def test_backoff_uses_settings_base_and_cap(home, make_settings):
+    """退避起始/封顶由运行参数控制，可在管理台热更新。"""
+    settings = make_settings(run_user="", runner=config.RunnerConfig(
+        resource_backoff_base_sec=10, resource_backoff_cap_sec=30))
+    svc = SchedulerService(settings)
+    svc.entries["ok"] = _entry(home, "ok", resources={"cpu": 0.1, "memory_mb": 64})
+    re = RunningEntry(
+        run={"run_id": "r1", "job_id": "ok", "dry_run": False, "duration_ms": 1000,
+             "queued_at": runlog.now_iso(), "status": "resource", "trigger": "manual",
+             "attempt": 1, "exit_code": errors.EXIT_EXTERNAL_RESOURCE},
+        spec=None, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r1",
+    )
+    svc._finalize(re, runlog.STATUS_RESOURCE, mem_peak_mb=50, cpu_sec=0.5)
+    decs = [json.loads(l) for l in config.decisions_log().read_text().splitlines() if l.strip()]
+    assert decs[-1]["act"] == "retry_enqueue"
+    assert decs[-1]["backoff_sec"] == 10
+    # 封顶：attempt 足够大时不超过 cap
+    re2 = RunningEntry(
+        run={"run_id": "r2", "job_id": "ok", "dry_run": False, "duration_ms": 1000,
+             "queued_at": runlog.now_iso(), "status": "resource", "trigger": "manual",
+             "attempt": 9, "exit_code": errors.EXIT_EXTERNAL_RESOURCE},
+        spec=None, est_cpu=0.1, est_mem_mb=64, cgroup_name="ok/r2",
+    )
+    svc._finalize(re2, runlog.STATUS_RESOURCE, mem_peak_mb=50, cpu_sec=0.5)
+    decs = [json.loads(l) for l in config.decisions_log().read_text().splitlines() if l.strip()]
+    assert decs[-1]["backoff_sec"] == 30
+
+
 # ================= D7：窗口收口每 tick 检查 =================
 
 def test_close_expired_windows_in_monitor_tick(home, make_settings):

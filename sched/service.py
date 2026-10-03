@@ -190,6 +190,20 @@ class SchedulerService:
                     self.engine.upsert(jid, e.schedule())
         return {"jobs": len(entries), "ok": sum(1 for e in entries.values() if e.ok)}
 
+    def apply_settings(self, new_settings: config.Settings) -> None:
+        """管理台热更新设置：替换设置对象并同步派生状态，无需重启 serve。
+
+        只暴露用户可感知的少数参数（时区/成功冷却/资源退避/重试上限/准入重试间隔）；
+        web 端口、cgroup 系数等内部参数不走此通道。
+        """
+        with self._lock:
+            self.settings = new_settings
+            self.engine._tz = ZoneInfo(new_settings.timezone)
+            self.preempt_exempt_sec = float(new_settings.preempt_exempt_sec)
+            self.data_risk_max_reschedules = int(new_settings.data_risk_max_reschedules)
+            self.admission_retry_sec = float(new_settings.auto_admit_retry_sec)
+            self.staged_observe_sec = max(2.0, 2.0 * new_settings.resource.sample_interval_sec)
+
     def register_job(self, name: str) -> dict:
         taskdoc.validate_task_id(name)
         task_dir = config.tasks_dir() / name
@@ -869,7 +883,9 @@ class SchedulerService:
                                      "job_id": jid,
                                      "reason": f"资源错误已达配置上限 {max_attempts} 次（max_resource_attempts），转人工"})
             return
-        backoff = min(300 * (2 ** min(attempts - 1, 20)), 3600)
+        base = max(1, int(self.settings.runner.resource_backoff_base_sec))
+        cap = max(base, int(self.settings.runner.resource_backoff_cap_sec))
+        backoff = min(base * (2 ** min(attempts - 1, 20)), cap)
         not_before = (datetime.now().astimezone() + timedelta(seconds=backoff)).isoformat(timespec="seconds")
         new_rec = self._new_run_record(rec, attempt=attempts + 1, resume_ref=False)
         self.state.backoffs[jid] = {"not_before": not_before, "attempts": attempts}

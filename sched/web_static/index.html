@@ -103,6 +103,12 @@
   .hint { color:var(--dim); font-size:11.5px; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .grow { flex:1; }
+  .pager { display:flex; gap:10px; align-items:center; padding:9px 15px; border-top:1px solid var(--line); }
+  .setrow { display:grid; grid-template-columns:230px 210px 1fr; gap:12px; align-items:center;
+            padding:9px 0; border-bottom:1px solid var(--line); }
+  .setrow:last-child { border-bottom:0; }
+  .setrow .lab { font-weight:600; }
+  .setrow input { width:130px; }
   code { background:var(--panel2); padding:1px 5px; border-radius:4px; font-size:11.5px; }
 </style>
 </head>
@@ -146,6 +152,30 @@ const STATUS_BADGE = {
 };
 const badge = s => `<span class="badge ${STATUS_BADGE[s]||"b-dim"}">${esc(s||"-")}</span>`;
 const GB_MB = m => m >= 1024 ? (m/1024).toFixed(1)+"GB" : m+"MB";
+const hhmmss = iso => (iso||"").replace(/^.*T/,"").replace(/[+-].*$/,"").slice(0,8);
+
+// ---------------- 分页（所有展开列表统一兜底，默认每页 50 条） ----------------
+const PAGE_SIZE = 50;
+const PG = {};   // 各列表当前页码，按 key 记忆
+function pageSlice(items, key) {
+  const pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  PG[key] = Math.min(Math.max(1, PG[key] || 1), pages);
+  const p = PG[key];
+  return { rows: items.slice((p-1)*PAGE_SIZE, p*PAGE_SIZE), p, pages };
+}
+function pagerHtml(total, p, pages, key) {
+  return `<div class="pager"><span class="hint">共 ${total} 条，第 ${p}/${pages} 页（每页 ${PAGE_SIZE} 条）</span>
+    <span class="grow"></span>
+    <button class="act" data-pg="${key}|prev" ${p<=1?"disabled":""}>上一页</button>
+    <button class="act" data-pg="${key}|next" ${p>=pages?"disabled":""}>下一页</button></div>`;
+}
+function bindPager(rerender) {
+  document.querySelectorAll("[data-pg]").forEach(b => b.onclick = () => {
+    const [key, dir] = b.dataset.pg.split("|");
+    PG[key] = (PG[key] || 1) + (dir === "next" ? 1 : -1);
+    rerender();
+  });
+}
 
 // ---------------- 弹窗 ----------------
 function modal(title, bodyHtml, footHtml="", wide=false) {
@@ -264,13 +294,49 @@ async function tabOverview() {
         <div class="sub">实测 ${d.ledger_actual_mem_mb}MB · 占整机 ${ledPct}%</div>
         <div class="bar"><i class="${ledPct>85?'err':ledPct>65?'warn':''}" style="width:${ledPct}%"></i></div></div>
     </div>
-    <div class="panel"><h2>运行参数</h2><div style="padding:12px 15px" class="hint">
-      时区 ${esc(d.settings.timezone)} · 成功冷却 ${d.settings.cooldown_sec}s · 抢占宽限 ${d.settings.grace_sec}s ·
-      终止宽限 ${d.settings.kill_grace_sec}s · 心跳超时 ${d.settings.heartbeat_timeout_sec}s ·
-      资源错误重试上限 ${d.settings.max_resource_attempts===0?"不封顶（指数退避至 1h）":d.settings.max_resource_attempts} ·
-      热加载 ${d.settings.hot_reload_sec}s · serve 启动 ${esc(d.started_at||"-")}</div></div>
+    <div class="panel"><h2>运行参数<span class="spacer"></span>
+      <span class="hint">改完点「保存」立即生效，不用重启 · serve 启动于 ${esc(d.started_at||"-")}</span></h2>
+      <div style="padding:6px 15px 14px">
+        <div class="setrow">
+          <div class="lab">时区</div>
+          <input type="text" data-k="timezone" value="${esc(d.settings.timezone)}">
+          <div class="hint">任务计划时刻按此时区解释，例如 Asia/Shanghai</div></div>
+        <div class="setrow">
+          <div class="lab">成功后冷却（秒）</div>
+          <input type="number" min="0" data-k="cooldown_sec" value="${d.settings.cooldown_sec}">
+          <div class="hint">同一个任务成功跑完后，至少隔这么久才允许再次自动运行</div></div>
+        <div class="setrow">
+          <div class="lab">外部资源出错后的等待（秒）</div>
+          <div class="row">先等 <input type="number" min="10" style="width:90px" data-k="resource_backoff_base_sec" value="${d.settings.resource_backoff_base_sec}">
+            再试，连续失败翻倍，最多等 <input type="number" min="10" style="width:90px" data-k="resource_backoff_cap_sec" value="${d.settings.resource_backoff_cap_sec}"></div>
+          <div class="hint">代理隧道/VPN 被掐断、被限流等（任务退出码 101）时适用。任务自己会先换连接/换出口 IP 就地重试几次，仍失败才按这里等待</div></div>
+        <div class="setrow">
+          <div class="lab">资源错误重试上限（次）</div>
+          <input type="number" min="0" data-k="max_resource_attempts" value="${d.settings.max_resource_attempts}">
+          <div class="hint">0 = 不放弃，按上面的节奏一直自动重试；填正数，达到次数后转人工，不再自动重试</div></div>
+        <div class="setrow">
+          <div class="lab">上线检查失败重试间隔（秒）</div>
+          <input type="number" min="10" data-k="auto_admit_retry_sec" value="${d.settings.auto_admit_retry_sec}">
+          <div class="hint">新任务自动上线检查没通过时，隔这么久自动重查；只要改了任务文件就会立即重查，不用等</div></div>
+        <div style="padding-top:12px" class="row">
+          <button class="act primary" id="set-save">保存并立即生效</button>
+          <span class="hint">抢占宽限、心跳超时、内存水位这些引擎内部参数无需感知，已隐藏</span></div>
+      </div></div>
     ${admPanel}`;
   document.querySelectorAll("[data-files]").forEach(b => b.onclick = () => openEditor(b.dataset.files, "task.json"));
+  $("#set-save").onclick = async () => {
+    const body = {};
+    document.querySelectorAll("#view [data-k]").forEach(inp => {
+      const v = inp.value.trim();
+      if (v === "") return;
+      body[inp.dataset.k] = inp.type === "number" ? Number(v) : v;
+    });
+    try {
+      await post("/api/settings", body);
+      toast("运行参数已保存并立即生效", "ok");
+      loadTab();
+    } catch (e) { toast("保存失败：" + e.message, "err"); }
+  };
 }
 
 async function tabJobs() {
@@ -279,6 +345,10 @@ async function tabJobs() {
   const unreg = tasks.filter(t => !regIds.has(t.id));
   const row = j => {
     const sch = j.schedule||{};
+    const isManual = (sch.type || "manual") === "manual";
+    const runBtn = isManual
+      ? `<button class="act primary" data-run="${esc(j.job_id)}" ${j.ok?"":"disabled"}>立即运行一次</button>`
+      : `<span class="hint" title="自动调度任务由调度器按计划运行，无需手动触发">按计划自动运行</span>`;
     return `<tr>
       <td class="mono"><b>${esc(j.job_id)}</b><div class="hint">${esc(j.name||"")}</div></td>
       <td>${j.priority}</td>
@@ -291,7 +361,7 @@ async function tabJobs() {
       <td><label class="switch"><input type="checkbox" ${j.enabled?"checked":""} data-en="${esc(j.job_id)}">
           <span class="slider"></span></label></td>
       <td>
-        <button class="act primary" data-run="${esc(j.job_id)}" ${j.ok?"":"disabled"}>立即运行一次</button>
+        ${runBtn}
         <button class="act" data-files="${esc(j.job_id)}">文件</button>
       </td></tr>`;
   };
@@ -354,32 +424,53 @@ async function tabJobs() {
 
 async function tabQueue() {
   const q = await api("/api/queue");
-  const w = q.waiting.map(it => `<tr>
+  const lastCell = it => {
+    const l = it.last;
+    if (!l) return '<span class="hint">首次运行</span>';
+    const text = l.message || l.reason || "";
+    return `${badge(l.status)}<div class="hint" style="max-width:340px" title="${esc(text)}">${esc(text.slice(0,120))}</div>
+      <div class="hint">${esc(hhmmss(l.finished_at))}</div>`;
+  };
+  const waitCell = it => {
+    const b = q.backoffs[it.job_id];
+    if (b) return `<span class="badge b-warn" title="任务报了外部资源错误（如代理被掐断），按总览页设置的节奏等待后自动重试">
+      外部资源等待 · ${esc(hhmmss(b.not_before))} 自动重试</span>`;
+    const c = q.cooldowns[it.job_id];
+    if (c) return `<span class="badge b-dim">成功冷却中 · ${esc(hhmmss(c))}</span>`;
+    return '<span class="hint">排队等待调度</span>';
+  };
+  const wRow = it => `<tr>
     <td class="mono">${esc(it.job_id)}</td><td>${it.priority}</td>
-    <td>${badge(it.trigger==="manual"?"waiting":it.trigger)}<span class="hint"> ${esc(it.trigger)}</span></td>
+    <td><span class="hint">${it.trigger==="manual"?"手动运行":it.trigger==="interval"?"按计划":"自动"}</span></td>
     <td>${it.attempt}</td><td>${it.resume_point_ref?'<span class="badge b-blue">断点恢复</span>':""}</td>
-    <td class="mono">${esc(it.queued_at||"")}</td>
-    <td>${q.backoffs[it.job_id]?`<span class="badge b-warn">退避至 ${esc(q.backoffs[it.job_id].not_before||"")}</span>`:""}
-        ${q.cooldowns[it.job_id]?`<span class="badge b-dim">冷却至 ${esc(q.cooldowns[it.job_id])}</span>`:""}</td></tr>`).join("");
-  const r = q.running.map(it => `<tr>
-    <td class="mono">${esc(it.job_id)}</td><td>${badge("running")} ${esc(it.trigger)}${it.manual?"(手动运行)":""}</td>
+    <td class="mono">${esc(hhmmss(it.queued_at))}</td><td>${waitCell(it)}</td><td>${lastCell(it)}</td></tr>`;
+  const rRow = it => `<tr>
+    <td class="mono">${esc(it.job_id)}</td><td>${badge("running")} ${it.trigger==="manual"?"手动运行":"按计划"}</td>
     <td class="mono">${esc(it.run_id)}</td><td>${it.pid}</td><td>${it.est_cpu} 核 / ${it.est_mem_mb}MB</td>
-    <td class="mono">${esc(it.started_at||"")}</td></tr>`).join("");
+    <td class="mono">${esc(hhmmss(it.started_at))}</td></tr>`;
+  const wp = pageSlice(q.waiting, "q-wait");
+  const rp = pageSlice(q.running, "q-run");
   $("#view").innerHTML = `
-    <div class="panel"><h2>等待运行（${q.waiting.length}）</h2>
-      <table><thead><tr><th>任务</th><th>优先级</th><th>触发方式</th><th>尝试</th><th>恢复</th><th>入队时刻</th><th>退避/冷却</th></tr></thead>
-      <tbody>${w||'<tr><td colspan="7" class="hint" style="padding:16px">没有等待运行的任务</td></tr>'}</tbody></table></div>
+    <div class="panel"><h2>等待运行（${q.waiting.length}）
+      <span class="spacer"></span><span class="hint">尝试次数 = 失败后第几次自动重试；外部资源等待期间不会重复执行</span></h2>
+      <table><thead><tr><th>任务</th><th>优先级</th><th>触发方式</th><th>第几次尝试</th><th>恢复</th><th>入队时刻</th><th>等待状态</th><th>上次失败原因</th></tr></thead>
+      <tbody>${wp.rows.map(wRow).join("") || '<tr><td colspan="8" class="hint" style="padding:16px">没有等待运行的任务</td></tr>'}</tbody></table>
+      ${q.waiting.length > PAGE_SIZE ? pagerHtml(q.waiting.length, wp.p, wp.pages, "q-wait") : ""}</div>
     <div class="panel"><h2>运行中（${q.running.length}）</h2>
       <table><thead><tr><th>任务</th><th>状态</th><th>run_id</th><th>pid</th><th>预估资源</th><th>开始</th></tr></thead>
-      <tbody>${r||'<tr><td colspan="6" class="hint" style="padding:16px">无运行中任务</td></tr>'}</tbody></table></div>`;
+      <tbody>${rp.rows.map(rRow).join("") || '<tr><td colspan="6" class="hint" style="padding:16px">无运行中任务</td></tr>'}</tbody></table>
+      ${q.running.length > PAGE_SIZE ? pagerHtml(q.running.length, rp.p, rp.pages, "q-run") : ""}</div>`;
+  bindPager(loadTab);
 }
 
 async function tabRuns() {
   const jobId = $("#rf-job")?.value || ""; const status = $("#rf-status")?.value || "";
-  const qs = new URLSearchParams(); if (jobId) qs.set("job_id",jobId); if (status) qs.set("status",status); qs.set("limit","200");
+  const qs = new URLSearchParams(); if (jobId) qs.set("job_id",jobId); if (status) qs.set("status",status); qs.set("limit","1000");
   const runs = await api("/api/runs?"+qs.toString());
-  $("#view").innerHTML = `
-    <div class="panel"><h2>运行历史（最近 200 条）</h2>
+  const render = () => {
+    const pg = pageSlice(runs, "runs");
+    $("#view").innerHTML = `
+    <div class="panel"><h2>运行历史（${runs.length} 条）</h2>
       <div style="padding:10px 15px" class="row">
         <input type="text" id="rf-job" placeholder="按 job_id 过滤" value="${esc(jobId)}" style="width:200px">
         <select id="rf-status">
@@ -389,30 +480,40 @@ async function tabRuns() {
         </select>
         <button class="act" id="rf-go">查询</button></div>
       <table><thead><tr><th>job</th><th>状态</th><th>exit</th><th>trigger</th><th>attempt</th><th>原因</th><th>时刻</th><th></th></tr></thead>
-      <tbody>${runs.map(r=>`<tr>
+      <tbody>${pg.rows.map(r=>`<tr>
         <td class="mono">${esc(r.job_id)}</td><td>${badge(r.status)}</td><td>${esc(r.exit_code)}</td>
         <td>${esc(r.trigger)}</td><td>${esc(r.attempt)}</td>
         <td class="hint" style="max-width:300px">${esc((r.reason||"").slice(0,100))}</td>
         <td class="mono">${esc(r.finished_at||r.started_at||"")}</td>
         <td><button class="act" data-rd="${esc(r.job_id)}|${esc(r.run_id)}">详情/日志</button></td></tr>`).join("")
-        ||'<tr><td colspan="8" class="hint" style="padding:16px">无记录</td></tr>'}</tbody></table></div>`;
-  $("#rf-go").onclick = loadTab;
-  $("#rf-job").onkeydown = e => { if (e.key==="Enter") loadTab(); };
-  $("#rf-status").onchange = loadTab;
-  document.querySelectorAll("[data-rd]").forEach(b => b.onclick = () => {
-    const [j,rid] = b.dataset.rd.split("|"); openRun(j,rid);
-  });
+        ||'<tr><td colspan="8" class="hint" style="padding:16px">无记录</td></tr>'}</tbody></table>
+      ${runs.length > PAGE_SIZE ? pagerHtml(runs.length, pg.p, pg.pages, "runs") : ""}</div>`;
+    $("#rf-go").onclick = () => { PG.runs = 1; loadTab(); };
+    $("#rf-job").onkeydown = e => { if (e.key==="Enter") { PG.runs = 1; loadTab(); } };
+    $("#rf-status").onchange = () => { PG.runs = 1; loadTab(); };
+    document.querySelectorAll("[data-rd]").forEach(b => b.onclick = () => {
+      const [j,rid] = b.dataset.rd.split("|"); openRun(j,rid);
+    });
+    bindPager(render);
+  };
+  render();
 }
 
 async function tabDecisions() {
-  const items = await api("/api/decisions?limit=300");
-  $("#view").innerHTML = `<div class="panel"><h2>决策审计 decisions.jsonl（最近 300 条）</h2>
+  const items = await api("/api/decisions?limit=2000");
+  const render = () => {
+    const pg = pageSlice(items, "decisions");
+    $("#view").innerHTML = `<div class="panel"><h2>调度决策记录（最近 ${items.length} 条）</h2>
     <table><thead><tr><th>时刻</th><th>动作</th><th>job/run</th><th>详情</th></tr></thead><tbody>
-    ${items.map(d=>`<tr><td class="mono">${esc(d.ts||"")}</td>
+    ${pg.rows.map(d=>`<tr><td class="mono">${esc(d.ts||"")}</td>
       <td><span class="badge ${d.act==="terminal"?"b-err":/enqueue|admit/.test(d.act)?"b-blue":/preempt/.test(d.act)?"b-warn":"b-dim"}">${esc(d.act)}</span></td>
       <td class="mono">${esc(d.job_id||"")} ${d.run_id?`<span class="hint">${esc(d.run_id)}</span>`:""}</td>
       <td class="hint" style="max-width:520px">${esc(JSON.stringify(Object.fromEntries(Object.entries(d).filter(([k])=>!["ts","act","job_id","run_id"].includes(k)))))}</td></tr>`).join("")
-      ||'<tr><td colspan="4" class="hint" style="padding:16px">无决策记录</td></tr>'}</tbody></table></div>`;
+      ||'<tr><td colspan="4" class="hint" style="padding:16px">无决策记录</td></tr>'}</tbody></table>
+    ${items.length > PAGE_SIZE ? pagerHtml(items.length, pg.p, pg.pages, "decisions") : ""}</div>`;
+    bindPager(render);
+  };
+  render();
 }
 
 async function tabProfiles() {
@@ -441,7 +542,12 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
 const tick = async () => {
   try { const d = await fetch("/api/overview").then(r=>r.json());
     $("#meta").textContent = `jobs=${d.jobs} · waiting=${d.waiting} · running=${d.running} · ${d.started_at||""}`;
-    if (cur === "overview" || cur === "queue") loadTab();
+    if (cur === "overview" || cur === "queue") {
+      // 用户正在表单/过滤框里输入时不自动重绘，避免冲掉焦点和未保存内容
+      const ae = document.activeElement;
+      const editing = ae && ["INPUT","TEXTAREA","SELECT"].includes(ae.tagName) && $("#view").contains(ae);
+      if (!editing) loadTab();
+    }
   } catch { $("#meta").textContent = "管理台未连接（serve 是否带 --web 启动？）"; }
 };
 tick(); setInterval(tick, 3000);

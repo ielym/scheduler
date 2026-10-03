@@ -75,8 +75,14 @@ class RunnerConfig(BaseModel):
     cooldown_sec: int = 60
     grace_sec: int = 40
     # 资源类错误最大重试次数；0 = 不设上限（R17 退让而非扑杀，默认永不放弃）。
-    # 仅当运维确认某任务的"资源错误"实际不可恢复时，才显式配置封顶转人工。
+    # 仅当运维确认某任务的"资源质量长期不可用"时，才显式配置封顶转人工。
     max_resource_attempts: int = 0
+    # 外部资源错误（退出码 100/101：代理被掐断、限流、网络抖动等）退避序列：
+    # 等待 base 秒后重试，连续失败翻倍，最长等待 cap 秒。
+    # 这类问题多为单连接/单出口 IP 的瞬时故障，任务侧应先就地快速重试（换连接/换 IP），
+    # 只有连续失败才以退出码 101 交给调度器做长退避，避免一次抖动就白等一小时。
+    resource_backoff_base_sec: int = 300
+    resource_backoff_cap_sec: int = 3600
 
 
 # 资源阈值阶梯（v04 R29，并经评估建议改为 memory.high 软限 + memory.max 硬限双水位）

@@ -216,23 +216,41 @@ class ArxivTopicTask(SchedTask):
                 "--sort-by", "submittedDate",
                 "--sort-order", "descending",
             ]
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=60,
-                    env=self._proxy_env(),
-                )
-            except Exception as exc:
-                self._fail_resource(f"arxiv 检索进程异常(start={start}): {exc}")
-            if proc.returncode != 0:
-                self._fail_resource(
-                    f"arxiv 检索失败(start={start}): "
-                    f"{(proc.stderr or proc.stdout or '')[:200]}"
-                )
-            try:
-                envelope = json.loads(proc.stdout)
-                page = envelope.get("records") or []
-            except Exception as exc:
-                self._fail_resource(f"arxiv 响应解析失败(start={start}): {exc}")
+            # 隧道代理每次连接自动换出口 IP，实测会间歇性在传输中途掐断响应
+            # （IncompleteRead / JSON 在任意位置截断）——属于单连接瞬时故障，
+            # 不能一次抖动就退出码 101 白等一小时：先就地快速重试（每次新连接=新 IP），
+            # 连续 4 次仍失败才判定外部资源确实不可用，交调度器按退避节奏处理。
+            page = None
+            last_fetch_err = ""
+            for fetch_attempt in range(4):
+                proc = None
+                try:
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=60,
+                        env=self._proxy_env(),
+                    )
+                except Exception as exc:
+                    last_fetch_err = f"arxiv 检索进程异常(start={start}): {exc}"
+                if proc is not None and proc.returncode != 0:
+                    last_fetch_err = (
+                        f"arxiv 检索失败(start={start}): "
+                        f"{(proc.stderr or proc.stdout or '')[:200]}"
+                    )
+                elif proc is not None:
+                    try:
+                        envelope = json.loads(proc.stdout)
+                        page = envelope.get("records") or []
+                        break
+                    except Exception as exc:
+                        last_fetch_err = f"arxiv 响应解析失败(start={start}): {exc}"
+                if fetch_attempt < 3:
+                    self.log.warning(
+                        "arxiv 抓取瞬时失败(第%s/4次)，换新隧道连接重试：%s",
+                        fetch_attempt + 1, last_fetch_err[:160],
+                    )
+                    time.sleep(2 * (2 ** fetch_attempt))
+            if page is None:
+                self._fail_resource(f"arxiv 连续 4 次抓取失败: {last_fetch_err}")
 
             records.extend(page)
             self._atomic_write_json(
