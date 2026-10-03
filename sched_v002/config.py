@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import secrets
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -64,31 +63,20 @@ def sched_user_conf() -> Path:
     return home() / "deploy" / "sched-run.conf"
 
 
-class HttpConfig(BaseModel):
-    host: str = "0.0.0.0"
-    port: int = 8787
-
-
-class AuthConfig(BaseModel):
-    enabled: bool = False
-    token: str = ""
-    allow_loopback_without_token: bool = True
-
-
 class RunnerConfig(BaseModel):
-    max_workers: int = 20
     kill_grace_sec: int = 10
     heartbeat_timeout_sec: int = 120
-    wait_max_sec: int = 300
     cooldown_sec: int = 60
     grace_sec: int = 40
+    # 资源类错误最大重试次数；0 = 不设上限（R17 退让而非扑杀，默认永不放弃）。
+    # 仅当运维确认某任务的"资源错误"实际不可恢复时，才显式配置封顶转人工。
+    max_resource_attempts: int = 0
 
 
 # 资源阈值阶梯（v04 R29，并经评估建议改为 memory.high 软限 + memory.max 硬限双水位）
 class ResourceConfig(BaseModel):
     # 画像三级窗口
     window_samples: int = 8          # 最近 N 次正式 run
-    decay: float = 0.5               # 三级画像迭代权重（越个例权重越低）
     overshoot: float = 1.2           # 画像上浮系数（P95 ×1.2）
     # cgroup 双水位（进程内软限 + 硬兜底，比例基于画像预估值）
     memory_high_ratio: float = 1.5   # memory.high = 预估值 ×1.5（软限节流）
@@ -103,14 +91,19 @@ class ResourceConfig(BaseModel):
 
 class Settings(BaseModel):
     timezone: str = "Asia/Shanghai"
-    http: HttpConfig = Field(default_factory=HttpConfig)
-    auth: AuthConfig = Field(default_factory=AuthConfig)
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     resource: ResourceConfig = Field(default_factory=ResourceConfig)
-    retention_days: int = 90
     max_log_mb: int = 32
     # 非 root 执行用户（v04 R31）；为空 = 以调度器运行用户直接执行
     run_user: str = "sched-run"
+    # ---- 调度行为参数（原为模块级硬编码，第三轮审查后统一入 Settings）----
+    starvation_sec: float = 3600.0        # 饿死看门狗阈值（1h）
+    preempt_exempt_sec: float = 60.0      # 任务启动后的抢占豁免期
+    data_risk_max_reschedules: int = 3    # 110 数据风险二刷轮数上限
+    soft_degrade_threshold: int = 3       # 软资源错误计数达到该值触发降额
+    soft_degrade_window_sec: float = 600.0
+    soft_degrade_cooldown_sec: float = 300.0
+    hot_reload_sec: float = 30.0          # serve 主循环周期性热加载 jobs.json
 
     @field_validator("timezone")
     @classmethod
@@ -123,9 +116,7 @@ class Settings(BaseModel):
 
 
 def default_settings() -> Settings:
-    s = Settings()
-    s.auth.token = secrets.token_urlsafe(32)
-    return s
+    return Settings()
 
 
 def ensure_layout() -> None:
@@ -149,12 +140,7 @@ def load_settings() -> Settings:
     try:
         s = Settings.model_validate(raw)
     except Exception:
-        keep = ((raw.get("auth") or {}).get("token") or "") if isinstance(raw.get("auth"), dict) else ""
-        s = Settings()
-        s.auth.token = keep or secrets.token_urlsafe(32)
-        store.save_json(settings_file(), s.model_dump())
-    if not s.auth.token:
-        s.auth.token = secrets.token_urlsafe(32)
+        s = default_settings()
         store.save_json(settings_file(), s.model_dump())
     return s
 

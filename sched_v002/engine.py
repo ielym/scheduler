@@ -120,7 +120,22 @@ class TriggerEngine:
         self._next: dict[str, datetime | None] = {}
 
     def upsert(self, job_id: str, schedule: dict[str, Any]) -> None:
-        self._next[job_id] = next_fire(schedule, datetime.now(self._tz))
+        """注册/刷新触发配置。
+
+        保序规则：若该任务已有"未到期"的下次触发，且不晚于按新配置算出的
+        下次触发，则保留原时刻——避免热加载（refresh）把 interval 任务的
+        触发时间整体重置为 now+interval，导致注册频繁时任务永不触发。
+        """
+        now = datetime.now(self._tz)
+        nxt = next_fire(schedule, now)
+        cur = self._next.get(job_id)
+        if cur is not None and nxt is not None and cur > now and cur <= nxt:
+            return
+        if cur is None and nxt is None:
+            # 已失效的 once 任务重复刷新时不再留下 None 残留
+            self._next.pop(job_id, None)
+            return
+        self._next[job_id] = nxt
 
     def remove(self, job_id: str) -> None:
         self._next.pop(job_id, None)

@@ -49,9 +49,9 @@ def test_overload_requires_sustain():
     assert acts[0].kind == "overload_preempt"
 
 
-def test_soft_error_rate_window():
+def test_soft_error_count_window():
     m = monitor.Monitor(heartbeat_timeout_sec=120, overload_ratio=2.0,
                         overload_sustain_ticks=3, tick_interval_sec=1.0)
-    assert m.soft_error_rate("proxy") == 0
+    assert m.soft_error_count("proxy") == 0
     m.record_soft_error("proxy")
-    assert m.soft_error_rate("proxy") == 1
+    assert m.soft_error_count("proxy") == 1

@@ -44,9 +44,30 @@ class SchedTask:
         self.workspace = Path(os.environ.get("SCHED_WORKSPACE") or (workspace or os.getcwd()))
         self.resource_regex: list[str] = []
         self.logic_regex: list[str] = []
+        # P1-E：task.json 的 error_rules 经调度器注入（SCHED_ERROR_RULES）；
+        # 任务代码在 __init__ 之后自行赋值仍可覆盖
+        self._load_error_rules_from_env()
         self._stop_requested = False
         self._heartbeat_thread: threading.Thread | None = None
         self._exit_code = 0
+
+    def _load_error_rules_from_env(self) -> None:
+        import json
+        raw = os.environ.get("SCHED_ERROR_RULES", "")
+        if not raw:
+            return
+        try:
+            rules = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(rules, dict):
+            return
+        res = [str(r) for r in (rules.get("resource_regex") or []) if r]
+        logic_ = [str(r) for r in (rules.get("logic_regex") or []) if r]
+        if res:
+            self.resource_regex = res
+        if logic_:
+            self.logic_regex = logic_
 
     def contract_probe(self) -> int:
         """契约自检（闸2）：只写出合法 state.json 即退出 0，不发任何业务副作用。"""
@@ -122,12 +143,27 @@ class SchedTask:
         return self._exit(self._code_for_category(cat))
 
     def skip_item(self, item_id: str, reason: str) -> None:
-        """把一条数据处理失败记入 pending_skipped（二刷），不因单条数据卡住整体。"""
+        """把一条数据处理失败记入 pending_skipped（二刷），不因单条数据卡住整体。
+
+        P3：同一 item 重复 skip 去重（重试多轮只记一条，避免二刷重复处理）。
+        """
+        if any(r.get("item") == item_id for r in self.read_pending_skipped()):
+            return
         append_jsonl(self.workspace / _pending_skipped_path, {"item": item_id, "reason": reason})
+
+    def read_pending_skipped(self) -> list[dict[str, Any]]:
+        """读取待二刷的跳过项（P2⑧）。任务在二刷轮（SCHED_TRIGGER=second_pass）消费：
+            for rec in task.read_pending_skipped():
+                retry(rec["item"])   # 成功后可 dead_letter 清账或自行记录处理结果
+        """
+        return read_jsonl(self.workspace / _pending_skipped_path)
 
     def dead_letter(self, item_id: str, reason: str) -> None:
         """明确判死的数据进 dead_letter，避免无限重试。"""
-        append_jsonl(self.workspace / _dead_letter_path, {"item": item_id, "reason": reason})
+        append_jsonl(self._dead_letter_path(), {"item": item_id, "reason": reason})
+
+    def _dead_letter_path(self) -> Path:
+        return self.workspace / _dead_letter_path
 
     @property
     def dry_run(self) -> bool:
@@ -182,6 +218,28 @@ def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
         f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
         f.flush()
         os.fsync(f.fileno())
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    import json
+
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text("utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+    except (OSError, UnicodeDecodeError):
+        return out
+    return out
 
 
 def run_task(task: SchedTask) -> int:

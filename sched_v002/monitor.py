@@ -72,7 +72,8 @@ class Monitor:
     def record_soft_error(self, resource_name: str) -> None:
         self._soft_errors.setdefault(resource_name, []).append(time.monotonic())
 
-    def soft_error_rate(self, resource_name: str, window_sec: float = 600.0) -> int:
+    def soft_error_count(self, resource_name: str, window_sec: float = 600.0) -> int:
+        """窗口内软资源错误计数（原误命名 soft_error_rate，返回的是计数而非比率）。"""
         cutoff = time.monotonic() - window_sec
         lst = self._soft_errors.get(resource_name, [])
         self._soft_errors[resource_name] = [t for t in lst if t >= cutoff]

@@ -1,7 +1,7 @@
 """【协议 A】任务目录与 task.json（schema v2）的解析与校验。
 
 v2 在 v1 基础上新增调度体系所需的声明：resources（资源预估）、error_rules（错误分类补充）、
-heartbeat（心跳超时）、smoke（冒烟参数）、runtime（非 root 执行）、diff_check、contract_exempt。
+heartbeat（心跳超时）、smoke（冒烟参数）、runtime（非 root 执行）、contract_exempt。
 保持纯手动模型：调度器绝不自动发现、绝不生成骨架。
 """
 
@@ -136,7 +136,6 @@ class HeartbeatSpec(BaseModel):
 class SmokeSpec(BaseModel):
     mode: Literal["dry", "real"] = "dry"
     max_runtime_sec: int = 60
-    sample_size: int = 1
     signal_after_sec: float = 1.5  # 断点闸首次运行后多久发 SIGTERM（重导入任务可调大）
 
 
@@ -158,7 +157,6 @@ class TaskDoc(BaseModel):
     heartbeat: HeartbeatSpec = Field(default_factory=HeartbeatSpec)
     smoke: SmokeSpec = Field(default_factory=SmokeSpec)
     runtime: RuntimeSpec = Field(default_factory=RuntimeSpec)
-    diff_check: bool = False
     contract_exempt: bool = False  # True：只能手动触发，禁止自动调度（不可断点恢复的任务）
 
     @field_validator("schema_version")

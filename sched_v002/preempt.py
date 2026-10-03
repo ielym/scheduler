@@ -19,8 +19,8 @@ class RunningInfo:
     progress: int = 0
     started_monotonic: float = 0.0
     exempt_until_monotonic: float = 0.0
-    manual: bool = False       # 手动触发的不可抢占任务
-    contract_exempt: bool = False  # 声明不可断点恢复的手动任务
+    manual: bool = False       # 手动触发标记（仅用于 monitor 放宽判定，不影响抢占资格）
+    contract_exempt: bool = False  # 声明不可断点恢复的手动任务（不可被抢占）
 
 
 def freed_by(targets: list[RunningInfo]) -> tuple[float, int, dict[str, int]]:
@@ -42,10 +42,13 @@ def select_preempt_targets(
 ) -> list[RunningInfo]:
     """贪心近似最小集合覆盖：按 priority 升序（最低优先者先）逐个加入，直到释放足够。
 
-    只允许抢占优先级严格低于等待者的任务（R1/R2/R10）：手动触发、contract_exempt、
-    同优先级或更高优先级均直接跳过，绝不入选。
+    只允许抢占优先级严格低于等待者的任务（R1/R2/R10）：contract_exempt（R3 不可恢复
+    任务，被抢无法恢复）与同优先级或更高优先级者直接跳过，绝不入选。
+
+    manual 触发的可恢复任务不再豁免（第三轮审查 P0-A，违反 R1/R2）：其注册时同样
+    通过闸5 验证了断点恢复能力，被抢后走与其他任务一致的恢复路径。
     """
-    candidates = [r for r in running if not r.manual and not r.contract_exempt
+    candidates = [r for r in running if not r.contract_exempt
                   and r.priority < waiter_priority]
     candidates.sort(key=lambda r: (r.priority, r.started_monotonic))  # 低优先、先启动者先被抢
     chosen: list[RunningInfo] = []

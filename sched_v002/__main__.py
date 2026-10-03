@@ -81,7 +81,12 @@ def cmd_set_soft(args) -> int:
 def cmd_serve(_args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     svc = _svc()
-    svc.start()
+    try:
+        svc.start()
+    except RuntimeError as e:
+        # 单实例锁冲突等启动期错误：面向运维的友好报错，而非 traceback
+        print(f"启动失败：{e}", file=sys.stderr)
+        return 1
     print("调度器已启动（Ctrl-C 退出）")
     try:
         while True:

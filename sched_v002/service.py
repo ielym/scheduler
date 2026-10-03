@@ -10,12 +10,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import logging
+import os
+import pwd
 import shutil
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -28,8 +32,6 @@ from .engine import TriggerEngine
 log = logging.getLogger("sched.service")
 
 TICK_SEC = 1.0
-STARVATION_SEC = 3600.0          # 饿死看门狗阈值（1h）
-MAX_ATTEMPTS = 5                  # 资源错误最大重试次数（之后转人工）
 
 
 @dataclass
@@ -46,6 +48,10 @@ class RunningEntry:
 
 
 class SchedulerService:
+    # 全部实例的弱引用集合：测试 fixture 在撤销 SCHED_HOME 前强制 join worker 线程，
+    # 防止 daemon 线程的异步持久化把测试数据写进生产 data/ 目录（第三轮审查 P2①）
+    _instances: "weakref.WeakSet[SchedulerService]" = weakref.WeakSet()
+
     def __init__(self, settings: config.Settings | None = None):
         self.settings = settings or config.load_settings()
         self.entries: dict[str, registry.JobEntry] = {}
@@ -67,6 +73,8 @@ class SchedulerService:
         self._stopping = threading.Event()
         self._loop_thread: threading.Thread | None = None
         self.started_at = ""
+        # 单实例锁（P2④）：防止同一 SCHED_HOME 双 serve 双跑任务
+        self._instance_lock_fd: int = -1
         # 渐进式提交（R13）：有固定资源等待者且无运行中任务时，一次只准出 1 项，
         # 观察其健康后才放开后续准出。
         self._staged_run_id: str | None = None
@@ -75,19 +83,47 @@ class SchedulerService:
         self._staged_released: bool = False
         self.staged_observe_sec = max(2.0, 2.0 * self.settings.resource.sample_interval_sec)
         # 抢占后的恢复保护期：被抢任务重入队后短期内不再被抢
-        self.preempt_exempt_sec = 60.0
+        self.preempt_exempt_sec = float(self.settings.preempt_exempt_sec)
         # 数据风险（110）二刷上限：连续达上限仍 110 转人工
-        self.data_risk_max_reschedules = 3
+        self.data_risk_max_reschedules = int(self.settings.data_risk_max_reschedules)
         # 软资源降额（R11）：窗口内软资源错误过多 → 临时降额，冷却后恢复
         self._soft_degraded_until: dict[str, float] = {}
-        self.soft_degrade_threshold = 3
-        self.soft_degrade_window_sec = 600.0
-        self.soft_degrade_cooldown_sec = 300.0
+        self.soft_degrade_threshold = int(self.settings.soft_degrade_threshold)
+        self.soft_degrade_window_sec = float(self.settings.soft_degrade_window_sec)
+        self.soft_degrade_cooldown_sec = float(self.settings.soft_degrade_cooldown_sec)
+        SchedulerService._instances.add(self)
 
     # ================= 生命周期 =================
+    def _acquire_instance_lock(self) -> bool:
+        """runtime/scheduler.lock 独占 flock；同一 SCHED_HOME 只允许一个 serve 实例。"""
+        lock_path = config.runtime_dir() / "scheduler.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._instance_lock_fd = fd
+        return True
+
+    def _release_instance_lock(self) -> None:
+        if self._instance_lock_fd >= 0:
+            try:
+                fcntl.flock(self._instance_lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._instance_lock_fd)
+                self._instance_lock_fd = -1
+
     def start(self) -> None:
         config.ensure_layout()
-        cgroup.ensure_scheduler_subtree()
+        if not self._acquire_instance_lock():
+            raise RuntimeError("已有调度器实例在运行（runtime/scheduler.lock 被占用），拒绝双实例启动")
+        # P2⑥：cgroup 不可用时显式告警（防打爆只剩账本预估，无硬边界）
+        if not cgroup.ensure_scheduler_subtree():
+            log.warning("cgroup v2 不可用：任务无内存/CPU 硬边界，仅账本预估防打爆（降级运行）")
+            persist.append_decision({"ts": runlog.now_iso(), "act": "cgroup_degraded",
+                                     "reason": "cgroup 不可用，无硬资源边界"})
         self.refresh()
         self._restore_soft_capacities()
         self._reconcile()
@@ -120,6 +156,7 @@ class SchedulerService:
                         runner.kill_process_group(int(pgid), self.settings.runner.kill_grace_sec)
         persist.save_scheduler_state(self.state)
         persist.save_active(self._active_snapshot())
+        self._release_instance_lock()
 
     # ================= 注册/刷新 =================
     def refresh(self) -> dict:
@@ -141,6 +178,16 @@ class SchedulerService:
         if not task_dir.is_dir():
             raise taskdoc.TaskDocError(f"任务目录不存在：{task_dir}")
         doc = taskdoc.load_task_doc(task_dir)
+        # P1-F：run_user 不存在时给出可操作的部署指引（而非闸门深处 SubprocessError）
+        run_user = (doc.runtime.user or "") if doc.runtime else ""
+        run_user = run_user or (self.settings.run_user or "")
+        if run_user:
+            try:
+                pwd.getpwnam(run_user)
+            except KeyError:
+                raise taskdoc.TaskDocError(
+                    f"运行用户 {run_user!r} 不存在：请先创建（useradd -r -m -s /usr/sbin/nologin {run_user}），"
+                    f"或在 task.json 的 runtime.user / settings.json 的 run_user 中改用已有用户/置空")
         # 五道闸
         ok, results, profile = contract.run_gates(doc, task_dir, settings=self.settings)
         if not ok:
@@ -210,8 +257,16 @@ class SchedulerService:
 
     # ================= 主循环 =================
     def _loop(self) -> None:
+        last_refresh = time.monotonic()
         while not self._stopping.wait(TICK_SEC):
             try:
+                # P1-C 热加载：周期性重读 jobs.json，serve 运行中注册/修改的任务即时生效
+                # （engine.upsert 已保序，不会重置 interval 任务未到期的触发时刻）
+                if time.monotonic() - last_refresh >= max(1.0, float(self.settings.hot_reload_sec)):
+                    self.refresh()
+                    if isinstance(self.capacity, resources.Capacity):
+                        self.capacity.refresh()
+                    last_refresh = time.monotonic()
                 self._tick_triggers()
                 self._tick_admission()
                 self._tick_preempt()
@@ -256,7 +311,7 @@ class SchedulerService:
             self._staged_run_id = None
             return
         self._apply_soft_degrade()
-        ordered = admission.order_waiting(items, STARVATION_SEC, runlog.now_iso())
+        ordered = admission.order_waiting(items, self.settings.starvation_sec, runlog.now_iso())
         res = admission.admission_scan(
             ordered,
             get_declared=lambda jid: self._declared(jid),
@@ -305,7 +360,7 @@ class SchedulerService:
                     persist.append_decision({"ts": runlog.now_iso(), "act": "soft_capacity_restore",
                                              "resource": name, "capacity": cap})
                 continue
-            if self.monitor.soft_error_rate(name, self.soft_degrade_window_sec) >= self.soft_degrade_threshold:
+            if self.monitor.soft_error_count(name, self.soft_degrade_window_sec) >= self.soft_degrade_threshold:
                 new_cap = max(1, int(cap) // 2)
                 self.soft_pool.set_capacity(name, new_cap)
                 self._soft_degraded_until[name] = now + self.soft_degrade_cooldown_sec
@@ -373,6 +428,9 @@ class SchedulerService:
             cgroup_name=cgroup_name, memory_high=mem_high, memory_max=mem_max, cpu_quota=est_cpu,
             cancel_grace_sec=self.settings.runner.kill_grace_sec,
             preempt_grace_sec=self.settings.runner.grace_sec,
+            error_rules={"resource_regex": doc.error_rules.resource_regex,
+                         "logic_regex": doc.error_rules.logic_regex},
+            max_log_bytes=int(self.settings.max_log_mb) * 1024 * 1024,
         )
         it["status"] = runlog.STATUS_RUNNING
         it["started_at"] = runlog.now_iso()
@@ -422,34 +480,48 @@ class SchedulerService:
         if not items:
             return
         now_mono = time.monotonic()
-        # 找出最高优先的、因固定资源被阻塞的等待项
+        # 因固定资源被阻塞的等待项（按优先级降序逐个服务：P3 修复——次优等待者的
+        # 可满足缺口同轮处理，而非只服务最高优者）
         blocked = [it for it in items if self._fixed_blocked(it)]
         if not blocked:
             return
-        top = max(blocked, key=lambda it: int(it.get("priority") or 0))
-        need_cpu, need_mem = self._estimate_for(top)
-        _, _, soft_need = self._declared(top["job_id"])
-        # 按真实缺口计算：需求 - 当前账本空闲（部分空闲场景下只需补足差额）
-        free_cpu = self.capacity.total_cpu - self.ledger.reserved_cpu()
-        free_mem = self.capacity.total_memory_mb - self.ledger.reserved_mem_mb()
-        gap_cpu = max(0.0, need_cpu - free_cpu)
-        gap_mem = max(0, need_mem - free_mem)
-        gap_soft = {k: max(0, v - self.soft_pool.available(k)) for k, v in soft_need.items()}
-        if gap_cpu <= 0 and gap_mem <= 0 and not any(gap_soft.values()):
-            return  # 空闲已足够，无需抢占（等待可能是账本竞态，下轮准出即可）
+        blocked.sort(key=lambda it: -int(it.get("priority") or 0))
         running_infos = [preempt.make_running_info(re.run, re.est_cpu, re.est_mem_mb, re.soft)
                          for re in list(self.running.values())]
-        targets = preempt.select_preempt_targets(running_infos, gap_cpu, gap_mem, gap_soft,
-                                                 waiter_priority=int(top.get("priority") or 0))
-        for t in targets:
-            re = self.running.get(t.run_id)
-            if re is None:
-                continue
-            if re.exempt_until_monotonic > now_mono:
-                continue  # 豁免等待期内不动
-            re.spec.preempt.set()
-            persist.append_decision({"ts": runlog.now_iso(), "act": "preempt", "run_id": t.run_id,
-                                     "job_id": t.job_id, "for_job": top["job_id"]})
+        chosen: set[str] = set()
+        freed_cpu, freed_mem = 0.0, 0
+        freed_soft: dict[str, int] = {}
+        for top in blocked:
+            need_cpu, need_mem = self._estimate_for(top)
+            _, _, soft_need = self._declared(top["job_id"])
+            # 按真实缺口计算：需求 - 当前账本空闲 - 本轮已抢占将释放的量（部分空闲场景只补差额）
+            free_cpu = self.capacity.total_cpu - self.ledger.reserved_cpu() + freed_cpu
+            free_mem = self.capacity.total_memory_mb - self.ledger.reserved_mem_mb() + freed_mem
+            gap_cpu = max(0.0, need_cpu - free_cpu)
+            gap_mem = max(0, need_mem - free_mem)
+            gap_soft = {k: max(0, v - (self.soft_pool.available(k) + freed_soft.get(k, 0)))
+                        for k, v in soft_need.items()}
+            if gap_cpu <= 0 and gap_mem <= 0 and not any(gap_soft.values()):
+                continue  # 空闲已足够，无需抢占（等待可能是账本竞态，下轮准出即可）
+            targets = preempt.select_preempt_targets(
+                running_infos, gap_cpu, gap_mem, gap_soft,
+                waiter_priority=int(top.get("priority") or 0))
+            for t in targets:
+                if t.run_id in chosen:
+                    continue
+                re = self.running.get(t.run_id)
+                if re is None:
+                    continue
+                if re.exempt_until_monotonic > now_mono:
+                    continue  # 豁免等待期内不动
+                re.spec.preempt.set()
+                chosen.add(t.run_id)
+                freed_cpu += t.est_cpu
+                freed_mem += t.est_mem_mb
+                for k, v in t.soft.items():
+                    freed_soft[k] = freed_soft.get(k, 0) + v
+                persist.append_decision({"ts": runlog.now_iso(), "act": "preempt", "run_id": t.run_id,
+                                         "job_id": t.job_id, "for_job": top["job_id"]})
 
     def _fixed_blocked(self, it: dict) -> bool:
         decl_cpu, decl_mem, soft = self._declared(it["job_id"])
@@ -499,6 +571,8 @@ class SchedulerService:
             if re is None:
                 continue
             if act.kind == "heartbeat_kill":
+                # 心跳超时：cancel 前写入原因，终态按 interrupted 语义重入队一次（P1-G）
+                re.spec.cancel_reason = act.reason
                 re.spec.cancel.set()
                 persist.append_decision({"ts": runlog.now_iso(), "act": "heartbeat_kill", "run_id": act.run_id,
                                          "reason": act.reason})
@@ -603,9 +677,58 @@ class SchedulerService:
             # F7：优雅停机导致的 killed 属服务中断而非任务失败 → 断点重入队，不转人工
             self._requeue_resume(rec)
             return
+        if status == runlog.STATUS_KILLED and "心跳超时" in (rec.get("error") or ""):
+            # P1-G：心跳超时误判（如长步骤未刷新状态）按 interrupted 语义重入队一次；
+            # 连续两次心跳超时才转人工（真正卡死的任务不会无限循环）
+            rounds = int(rec.get("hb_requeues") or 0)
+            if rounds < 1:
+                new_rec = self._new_run_record(rec, hb_requeues=rounds + 1)
+                with self._lock:
+                    self.state.enqueue(new_rec)
+                persist.save_scheduler_state(self.state)
+                persist.append_decision({"ts": runlog.now_iso(), "act": "heartbeat_requeue",
+                                         "run_id": new_rec["run_id"], "job_id": jid, "round": rounds + 1})
+                return
         # failed / killed / preempt_failed → 逻辑错误或数据风险，转人工（不再自动重试）
         persist.append_decision({"ts": runlog.now_iso(), "act": "terminal", "run_id": rec["run_id"],
                                  "job_id": jid, "status": status, "reason": rec.get("reason", "")})
+
+    def _new_run_record(self, rec: dict, trigger: str | None = None, attempt: int | None = None,
+                        resume_ref: bool = False, data_risk_rounds: int | None = None,
+                        hb_requeues: int | None = None) -> dict:
+        """重入队统一工厂：清空上轮运行痕迹（pid/日志/耗时/错误等），只保留调度语义字段。
+
+        P2⑨：原先各处理分支手工 dict(rec) 拷贝，error/stdout_log/wait_ms 等残留上轮失败痕迹。
+        """
+        new_rec = dict(rec)
+        new_rec["run_id"] = runlog.new_run_id()
+        new_rec["status"] = runlog.STATUS_WAITING
+        new_rec["queued_at"] = runlog.now_iso()
+        new_rec["enqueued_at"] = runlog.now_iso()
+        new_rec["scheduled_at"] = runlog.now_iso()
+        new_rec["started_at"] = ""
+        new_rec["finished_at"] = ""
+        new_rec["exit_code"] = None
+        new_rec["pid"] = None
+        new_rec["pgid"] = None
+        new_rec["reason"] = ""
+        new_rec["error"] = ""
+        new_rec["stdout_log"] = ""
+        new_rec["stderr_log"] = ""
+        new_rec["wait_ms"] = 0
+        new_rec["duration_ms"] = 0
+        new_rec["resume_point_ref"] = resume_ref
+        new_rec.pop("_started_monotonic", None)
+        new_rec.pop("_exempt_until_monotonic", None)
+        if trigger is not None:
+            new_rec["trigger"] = trigger
+        if attempt is not None:
+            new_rec["attempt"] = attempt
+        if data_risk_rounds is not None:
+            new_rec["data_risk_rounds"] = data_risk_rounds
+        if hb_requeues is not None:
+            new_rec["hb_requeues"] = hb_requeues
+        return new_rec
 
     def _handle_data_risk(self, rec: dict) -> None:
         jid = rec["job_id"]
@@ -615,19 +738,7 @@ class SchedulerService:
                                      "job_id": jid, "status": "data_risk",
                                      "reason": f"连续 {rounds} 次数据风险（110），转人工"})
             return
-        new_rec = dict(rec)
-        new_rec["run_id"] = runlog.new_run_id()
-        new_rec["status"] = runlog.STATUS_WAITING
-        new_rec["queued_at"] = runlog.now_iso()
-        new_rec["enqueued_at"] = runlog.now_iso()
-        new_rec["started_at"] = ""
-        new_rec["finished_at"] = ""
-        new_rec["exit_code"] = None
-        new_rec["pid"] = None
-        new_rec["pgid"] = None
-        new_rec["reason"] = ""
-        new_rec["trigger"] = "second_pass"
-        new_rec["data_risk_rounds"] = rounds + 1
+        new_rec = self._new_run_record(rec, trigger="second_pass", data_risk_rounds=rounds + 1)
         with self._lock:
             self.state.enqueue(new_rec)
         persist.save_scheduler_state(self.state)
@@ -635,27 +746,23 @@ class SchedulerService:
                                  "run_id": new_rec["run_id"], "job_id": jid, "round": rounds + 1})
 
     def _handle_retry(self, rec: dict, category: str) -> None:
+        """资源错误退避重试（R15/R16/R17/R20：退让而非扑杀）。
+
+        P0-B：默认不再设重试次数上限——指数退避封顶 1h，任务在资源释放后自然获得
+        准出（总目标：所有已提交任务最终都能被正确执行）。仅当运维显式配置
+        settings.runner.max_resource_attempts > 0 时才封顶转人工（止损逃生舱）。
+        """
         jid = rec["job_id"]
         attempts = int(rec.get("attempt") or 1)
-        if attempts >= MAX_ATTEMPTS:
+        max_attempts = int(self.settings.runner.max_resource_attempts)
+        if max_attempts > 0 and attempts >= max_attempts:
             persist.append_decision({"ts": runlog.now_iso(), "act": "giveup", "run_id": rec["run_id"],
-                                     "job_id": jid, "reason": "资源错误已达最大重试，转人工"})
+                                     "job_id": jid,
+                                     "reason": f"资源错误已达配置上限 {max_attempts} 次（max_resource_attempts），转人工"})
             return
-        backoff = min(300 * (2 ** (attempts - 1)), 3600)
-        from datetime import timedelta
+        backoff = min(300 * (2 ** min(attempts - 1, 20)), 3600)
         not_before = (datetime.now().astimezone() + timedelta(seconds=backoff)).isoformat(timespec="seconds")
-        new_rec = dict(rec)
-        new_rec["run_id"] = runlog.new_run_id()
-        new_rec["attempt"] = attempts + 1
-        new_rec["status"] = runlog.STATUS_WAITING
-        new_rec["queued_at"] = runlog.now_iso()
-        new_rec["enqueued_at"] = runlog.now_iso()
-        new_rec["started_at"] = ""
-        new_rec["finished_at"] = ""
-        new_rec["exit_code"] = None
-        new_rec["pid"] = None
-        new_rec["pgid"] = None
-        new_rec["resume_point_ref"] = False
+        new_rec = self._new_run_record(rec, attempt=attempts + 1, resume_ref=False)
         self.state.backoffs[jid] = {"not_before": not_before, "attempts": attempts}
         with self._lock:
             self.state.enqueue(new_rec)
@@ -668,17 +775,7 @@ class SchedulerService:
         e = self.entries.get(jid)
         if e is None or not e.ok or e.doc is None:
             return
-        new_rec = dict(rec)
-        new_rec["run_id"] = runlog.new_run_id()
-        new_rec["status"] = runlog.STATUS_WAITING
-        new_rec["queued_at"] = runlog.now_iso()
-        new_rec["enqueued_at"] = runlog.now_iso()
-        new_rec["started_at"] = ""
-        new_rec["finished_at"] = ""
-        new_rec["exit_code"] = None
-        new_rec["pid"] = None
-        new_rec["pgid"] = None
-        new_rec["resume_point_ref"] = True
+        new_rec = self._new_run_record(rec, resume_ref=True)
         if exempt_sec > 0:
             # 恢复保护期：被抢占者重入队后短期内不再被抢（豁免等待期）
             new_rec["_exempt_until_monotonic"] = time.monotonic() + exempt_sec
@@ -716,6 +813,13 @@ class SchedulerService:
             task_dir = p.get("task_dir", "")
             if pgid and runner.pgid_alive(int(pgid)) and self._pid_belongs_to(p.get("pid"), task_dir):
                 runner.kill_process_group(int(pgid), self.settings.runner.kill_grace_sec)
+            # P3：清理上次运行遗留的 cgroup（含仍在组内的孤儿进程，经 cgroup.kill 安全终止）
+            cg_name = p.get("cgroup_name") or f"{p.get('job_id')}/{p.get('run_id')}"
+            if p.get("job_id") and p.get("run_id"):
+                try:
+                    cgroup.Cgroup(cg_name).remove()
+                except Exception:
+                    pass
             rec = {"exit_code": None, "outputs": [], "state_snapshot": {}, "error": "", "resources": {},
                    "wait_ms": 0, "duration_ms": 0}
             rec.update(p)
@@ -750,18 +854,7 @@ class SchedulerService:
                 persist.append_decision({"ts": runlog.now_iso(), "act": "recover_skip", "job_id": jid,
                                          "run_id": rec.get("run_id"), "reason": "任务不可用/未注册"})
                 continue
-            new_rec = dict(rec)
-            new_rec["run_id"] = runlog.new_run_id()
-            new_rec["status"] = runlog.STATUS_WAITING
-            new_rec["queued_at"] = runlog.now_iso()
-            new_rec["enqueued_at"] = runlog.now_iso()
-            new_rec["started_at"] = ""
-            new_rec["finished_at"] = ""
-            new_rec["exit_code"] = None
-            new_rec["pid"] = None
-            new_rec["pgid"] = None
-            new_rec["reason"] = ""
-            new_rec["resume_point_ref"] = True
+            new_rec = self._new_run_record(rec, resume_ref=True)
             with self._lock:
                 self.state.enqueue(new_rec)
             persist.append_decision({"ts": runlog.now_iso(), "act": "recover_enqueue",
@@ -813,7 +906,6 @@ class SchedulerService:
         return (cur // (1024 * 1024)) if cur is not None else None
 
     def _set_cooldown(self, job_id: str, sec: int) -> None:
-        from datetime import timedelta
         self.state.cooldowns[job_id] = (datetime.now().astimezone() + timedelta(seconds=sec)).isoformat(timespec="seconds")
         persist.save_scheduler_state(self.state)
 

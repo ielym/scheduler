@@ -32,12 +32,10 @@
   },
   "smoke": {
     "mode": "dry",
-    "max_runtime_sec": 60,
-    "sample_size": 1
+    "max_runtime_sec": 60
   },
   "runtime": {
     "user": "sched-run"
   },
-  "diff_check": false,
   "contract_exempt": false
 }

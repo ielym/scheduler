@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -74,9 +76,8 @@ def write_task(
         "resources": resources or {"cpu": 0.1, "memory_mb": 64, "soft": {}},
         "error_rules": {"resource_regex": [], "logic_regex": []},
         "heartbeat": {"timeout_sec": 120},
-        "smoke": {"mode": "dry", "max_runtime_sec": 60, "sample_size": 1},
-        "runtime": {"user": "sched-run"},
-        "diff_check": False,
+        "smoke": {"mode": "dry", "max_runtime_sec": 60},
+        "runtime": {"user": ""},  # 测试环境不降权（P1-F：置空 = 以调度器身份执行）
         "contract_exempt": contract_exempt,
     }
     (task_dir / "task.json").write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -85,9 +86,31 @@ def write_task(
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """每个测试独立的 SCHED_HOME 根目录。"""
+    """每个测试独立的 SCHED_HOME 根目录。
+
+    P2①：fixture 撤销前强制 join 测试期间新建的全部线程——worker 在
+    running.pop 之后才落盘终态（append_run/save_active），若按 running
+    追踪会漏掉「已 pop 但仍在写盘」的线程；monkeypatch 撤销后这些线程
+    会把测试数据写进生产 data/ 目录（本轮审查发现的实际污染来源）。
+    """
+    before = set(threading.enumerate())
     monkeypatch.setenv("SCHED_HOME", str(tmp_path))
-    return tmp_path
+    yield tmp_path
+    from sched_v002.service import SchedulerService
+
+    for svc in list(SchedulerService._instances):
+        try:
+            svc._stopping.set()
+        except Exception:
+            continue
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        alive = [t for t in threading.enumerate()
+                 if t is not threading.current_thread() and t not in before and t.is_alive()]
+        if not alive:
+            break
+        for t in alive:
+            t.join(timeout=max(0.1, deadline - time.monotonic()))
 
 
 @pytest.fixture

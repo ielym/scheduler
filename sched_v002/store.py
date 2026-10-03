@@ -57,11 +57,34 @@ def save_json(path: Path, obj: Any) -> None:
             raise
 
 
-def append_jsonl(path: Path, obj: Any) -> None:
-    """追加一行 JSON。O_APPEND 单次写原子，再加 flock 兜跨进程。"""
+# ---------- jsonl 尺寸轮转（防止 decisions/runs 审计日志无限增长打爆磁盘） ----------
+ROTATE_MAX_BYTES = 16 * 1024 * 1024   # 单档上限 16MB
+ROTATE_GENERATIONS = 3                # 保留 .1/.2/.3 共 3 个历史档
+
+
+def _rotate(path: Path) -> None:
+    """把 path 轮转为 path.1（旧档依次后移，超出代数即丢弃）。"""
+    for i in range(ROTATE_GENERATIONS - 1, 0, -1):
+        src = path.with_name(f"{path.name}.{i}")
+        if src.exists():
+            src.replace(path.with_name(f"{path.name}.{i + 1}"))
+    path.replace(path.with_name(f"{path.name}.1"))
+
+
+def append_jsonl(path: Path, obj: Any, max_bytes: int | None = None) -> None:
+    """追加一行 JSON。O_APPEND 单次写原子，再加 flock 兜跨进程。
+
+    超过 max_bytes（默认 ROTATE_MAX_BYTES）先轮转再追加，磁盘占用有界。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+    limit = ROTATE_MAX_BYTES if max_bytes is None else max_bytes
     with file_lock(path):
+        try:
+            if limit > 0 and path.exists() and path.stat().st_size >= limit:
+                _rotate(path)
+        except OSError:
+            pass
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
             f.flush()

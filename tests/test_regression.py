@@ -504,7 +504,7 @@ def test_finalize_records_soft_error_on_101(home, make_settings):
         spec=None, est_cpu=0.1, est_mem_mb=64, soft={"proxy": 1}, cgroup_name="ok/r1",
     )
     svc._finalize(re, runlog.STATUS_RESOURCE, mem_peak_mb=50, cpu_sec=0.5)
-    assert svc.monitor.soft_error_rate("proxy") == 1
+    assert svc.monitor.soft_error_count("proxy") == 1
 
 
 # ================= D7：窗口收口每 tick 检查 =================

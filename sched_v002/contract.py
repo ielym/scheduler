@@ -41,7 +41,10 @@ def _spawn_bounded(doc: taskdoc.TaskDoc, task_dir: Path, run_id: str, env_extra:
     """
     argv = runner.build_argv(task_dir, doc.entry.file, doc.entry.interpreter, list(doc.entry.args))
     env = runner.build_env(task_dir, "contract", run_id, "contract", 1, time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                           dict(doc.env), dry_run=(env_extra.get("SCHED_DRY_RUN") == "1"))
+                           dict(doc.env), dry_run=(env_extra.get("SCHED_DRY_RUN") == "1"),
+                           run_user=run_user,
+                           error_rules={"resource_regex": doc.error_rules.resource_regex,
+                                        "logic_regex": doc.error_rules.logic_regex})
     env.update(env_extra)
     workdir = task_dir if (doc.entry.cwd or ".") == "." else task_dir / doc.entry.cwd
 
@@ -126,6 +129,23 @@ def _read_state(task_dir: Path, run_id: str = "") -> dict:
     return st
 
 
+def _state_written_since(task_dir: Path, run_id: str, since_ts: float) -> bool:
+    """run 开始后任务是否写过 state.json（实例级或 legacy 任一更新即算）。
+
+    P1-G 心跳契约：区分「只在 SCHED_CONTRACT_PROBE 环境写状态的伪契约任务」——
+    这类任务正式运行期不写状态，120s 后会被 heartbeat_kill 且不可恢复。
+    """
+    candidates = [task_dir / "cache" / "runs" / run_id / "state.json",
+                  task_dir / "cache" / "state.json"]
+    for p in candidates:
+        try:
+            if p.exists() and p.stat().st_mtime >= since_ts - 1.0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 class ContractGates:
     def __init__(self, settings=None):
         from . import config
@@ -186,6 +206,7 @@ class ContractGates:
 
     def gate_checkpoint(self, doc: taskdoc.TaskDoc, task_dir: Path) -> GateResult:
         # 1) 跑一段然后 SIGTERM
+        t_start = time.time()
         res1 = _spawn_bounded(
             doc, task_dir, "ckpt1", {"SCHED_DRY_RUN": "1"},
             timeout_sec=60, signal_after_sec=doc.smoke.signal_after_sec,
@@ -197,6 +218,13 @@ class ContractGates:
         if res1["exit_code"] != errors.EXIT_PREEMPTED and st1.get("status") != "preempted":
             return GateResult("gate5_checkpoint", False,
                               f"打断后未按 99/抢占语义退出（exit={res1['exit_code']}, status={st1.get('status')}）",
+                              {"run": res1, "state": st1})
+        # P1-G 运行期心跳契约：ckpt1 期间必须写过 state.json（SDK 由心跳线程保证；
+        # 自研任务需在运行期产出状态），否则正式运行会在心跳超时后被杀且不可恢复
+        if not _state_written_since(task_dir, "ckpt1", t_start):
+            return GateResult("gate5_checkpoint", False,
+                              "运行期心跳契约不满足：正式运行未写 state.json"
+                              "（SDK 任务由心跳线程保证；自研任务需周期性更新状态文件）",
                               {"run": res1, "state": st1})
         rp1 = st1.get("resume_point") or {}
         if not isinstance(rp1, dict):

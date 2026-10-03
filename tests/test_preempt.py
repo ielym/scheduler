@@ -30,11 +30,16 @@ def test_select_never_preempts_higher_or_equal_priority():
     assert targets == []
 
 
-def test_select_skips_manual():
-    running = [_ri("manual_low", 10, 2.0, 500, {}, manual=True)]
+def test_select_skips_contract_exempt_but_not_manual():
+    # P0-A（R1/R2）：抢占资格一律由优先级决定；manual 可恢复任务不再豁免。
+    # 仅 contract_exempt（注册时声明不可断点恢复）仍不可被抢占。
+    running = [
+        _ri("manual_low", 10, 2.0, 500, {}, manual=True),
+        _ri("exempt_low", 10, 1.0, 100, {}, exempt=True),
+    ]
     targets = preempt.select_preempt_targets(running, need_cpu=2.0, need_mem_mb=500, need_soft={},
                                              waiter_priority=90)
-    assert targets == []
+    assert [t.run_id for t in targets] == ["manual_low"]
 
 
 def test_select_not_enough_returns_empty():

@@ -42,6 +42,11 @@ class Capacity:
         self.total_memory_mb = read_total_memory_mb()
         self.total_cpu = float(read_cpu_count())
 
+    def refresh(self) -> None:
+        """定期刷新整机容量（应对热插拔/容器配额变更；由 serve 热加载周期调用）。"""
+        self.total_memory_mb = read_total_memory_mb()
+        self.total_cpu = float(read_cpu_count())
+
     def available_memory_mb(self) -> int:
         """整机可用内存（含非调度器进程占用后的余量）。"""
         return read_available_memory_mb()

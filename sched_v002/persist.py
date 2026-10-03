@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
 
 from . import config, store, runlog
 
@@ -34,7 +33,6 @@ class SchedulerState:
     wq: list[dict] = field(default_factory=list)
     cooldowns: dict[str, str] = field(default_factory=dict)     # key(job 或 job/soft) -> iso 截止
     backoffs: dict[str, dict] = field(default_factory=dict)     # job_id -> {"until": iso, "attempts": n}
-    latch: dict[str, Any] = field(default_factory=dict)
     soft_capacities: dict[str, int] = field(default_factory=dict)
 
     def waiting_items(self) -> list[dict]:
@@ -58,7 +56,6 @@ def load_scheduler_state() -> SchedulerState:
         wq=raw.get("wq") or [],
         cooldowns=raw.get("cooldowns") or {},
         backoffs=raw.get("backoffs") or {},
-        latch=raw.get("latch") or {},
         soft_capacities=raw.get("soft_capacities") or {},
     )
 
