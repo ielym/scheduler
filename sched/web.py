@@ -5,9 +5,10 @@
   SchedulerService 实例。禁止另起 Web 进程：WQ/账本是 serve 的内存态，
   跨进程写 scheduler_state.json 会被 serve 下一次落盘覆盖。
 - 上线检查（五道闸）由调度器自动完成：tasks/ 出现新任务目录即后台检查，
-  通过自动纳入调度，失败在页面展示原因并自动重试，页面无注册按钮。
+  通过自动纳入调度；失败在页面展示原因，由创建者本地修改任务文件后自动重查，
+  页面无注册按钮、无定时自动重试。
+- 管理台不再提供任务文件查看/编辑：任务必须先在本地开发验证到生产级，再按目录名导入。
 - 「立即运行一次」只入队（service.trigger），绝不直接拉起任务进程。
-- 文件编辑仅限任务目录内的源码类文件，cache/results 运行时产物禁止经 Web 改写。
 """
 
 from __future__ import annotations
@@ -15,14 +16,13 @@ from __future__ import annotations
 import base64
 import hmac
 import ipaddress
-import os
 import threading
 import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from . import config, persist, registry, runlog, store, taskdoc
 
@@ -44,15 +44,11 @@ def validate_public_listen(cfg) -> None:
         return
     raise RuntimeError(
         f"管理台 host={cfg.host} 为非回环地址且 web.auth_token 为空：拒绝启动。\n"
-        "管理台可在线改任务代码并注册执行（等同 RCE）。二选一：\n"
+        "管理台可手动触发/停止任务执行。二选一：\n"
         "1) 在 data/settings.json 配置 web.auth_token（推荐）；\n"
         "2) 确需无密码公网暴露，显式设置 web.allow_public_no_auth=true（风险自负）。")
 
 STATIC_DIR = Path(__file__).resolve().parent / "web_static"
-
-_EDIT_ALLOWED_SUFFIX = {".py", ".json", ".txt", ".md", ".conf", ".cfg", ".ini", ".yaml", ".yml", ".sh", ".env"}
-_EDIT_DENY_PARTS = {"cache", "results", "__pycache__", ".git"}
-_MAX_FILE_BYTES = 1024 * 1024
 
 
 # 请求/响应模型必须定义在模块级：create_app 内的局部类配合延迟注解会让 FastAPI 无法解析类型。
@@ -66,157 +62,12 @@ class EnabledReq(BaseModel):
     enabled: bool
 
 
-class CreateReq(BaseModel):
-    id: str
+class ImportReq(BaseModel):
+    dir_name: str
 
 
-class FileReq(BaseModel):
-    content: str
-
-
-class SettingsReq(BaseModel):
-    # 均可选：只提交要改的字段；未提交的保持原值
-    timezone: str | None = None
-    cooldown_sec: int | None = None
-    max_resource_attempts: int | None = None
-    resource_backoff_base_sec: int | None = None
-    resource_backoff_cap_sec: int | None = None
-    auto_admit_retry_sec: float | None = None
-
-
-# 只暴露用户需要感知、且允许在线热更新的参数；其余（grace/kill/心跳/cgroup/端口等）
-# 属引擎内部参数，不在管理台出现。
-def _public_settings(s) -> dict:
-    return {
-        "timezone": s.timezone,
-        "cooldown_sec": s.runner.cooldown_sec,
-        "max_resource_attempts": s.runner.max_resource_attempts,
-        "resource_backoff_base_sec": s.runner.resource_backoff_base_sec,
-        "resource_backoff_cap_sec": s.runner.resource_backoff_cap_sec,
-        "auto_admit_retry_sec": s.auto_admit_retry_sec,
-    }
-
-
-def _write_task_file(path: Path, text: str) -> int:
-    """写任务源码并放开 0644。
-
-    store.write_text_atomic 基于 mkstemp（0600）原子替换，会把文件改成仅属主可读；
-    而闸门/正式运行要降权到 run_user（sched-run）执行，0600 会直接 Permission denied
-    （闸2 退出码 2）。凡经管理台写入的任务文件必须补 chmod。
-    """
-    store.write_text_atomic(path, text)
-    os.chmod(path, 0o644)
-    return len(text.encode("utf-8"))
-
-
-def _chown_tree(path: Path, user: str) -> str:
-    """把任务目录树属主改为降权执行用户（等价技能部署步骤 chown -R <user> tasks/<id>）。
-
-    任务运行时要在目录里写 cache/state 与 results；serve 非 root 时 chown 会失败，
-    调用方应把失败信息透传给用户，而不是静默继续（静默则闸2 必挂）。
-    """
-    import pwd
-    pw = pwd.getpwnam(user)
-    os.chown(path, pw.pw_uid, pw.pw_gid)
-    for root, dirs, files in os.walk(path):
-        for name in dirs + files:
-            os.chown(os.path.join(root, name), pw.pw_uid, pw.pw_gid)
-    return user
-
-
-# ---------------- 新建任务的最小骨架（与技能 assets/skeleton 同源思路，保持极简） ----------------
-
-_SKELETON_TASK_JSON = """{
-  "schema_version": 2,
-  "name": "%s",
-  "description": "",
-  "entry": {"file": "run.py", "interpreter": "python3", "args": [], "cwd": "."},
-  "schedule": {"type": "manual", "max_instances": 1, "overflow": "queue"},
-  "priority": 40,
-  "env": {},
-  "outputs": {"expect": ["results/final.json"]},
-  "resources": {"cpu": 0.2, "memory_mb": 128},
-  "error_rules": {"resource_regex": [], "logic_regex": ["LOGIC:"]},
-  "heartbeat": {"timeout_sec": 120},
-  "smoke": {"mode": "dry", "max_runtime_sec": 60, "signal_after_sec": 1.5},
-  "runtime": {"user": "%RUN_USER%"},
-  "contract_exempt": false
-}
-"""
-
-_SKELETON_RUN_PY = '''"""最小任务骨架（管理台自动生成）。更丰富的场景模板见 sched 技能 assets/templates。
-
-合规要点（勿删）：
-- 每完成一个最小工作单元就写 resume_point 并 flush；抢占后从游标幂等重放。
-- dry 路径每块 sleep 一小段：让注册闸5 在 signal_after_sec(默认1.5s) 发出的
-  SIGTERM 命中"块处理中"，验证 99 抢占语义；真实逻辑上线后可去掉人为 sleep。
-- 逻辑错误用 raise ValueError("LOGIC: ...")（配合 task.json logic_regex）；
-  资源错误 flush 后 sys.exit(100|101)；数据风险 sys.exit(110) 请求二刷。
-  代理断连/响应截断等"换个连接就好"的瞬时故障先就地重试 3~4 次，连续失败再 101。
-- 交付物原子写到 results/final.json（outputs.expect 缺失会被判 failed）。
-"""
-
-from __future__ import annotations
-
-import json
-import sys
-import time
-from pathlib import Path
-
-from sched_task_sdk import SchedTask, Step, run_task
-
-TOTAL_ITEMS = 4
-
-
-class MyTask(SchedTask):
-    def steps(self, resume: dict):
-        start = int((resume or {}).get("cursor", 0))
-        for i in range(start, TOTAL_ITEMS):
-            item_id = f"item-{i}"
-            yield Step("process", {"item": item_id})
-            if self.dry_run:
-                time.sleep(0.8)   # 仅为闸5 命中块中；真实任务删除
-                print(f"[DRY] would process {item_id}")
-            else:
-                print(f"processed {item_id}")   # TODO: 幂等真实副作用
-            self.state.resume_point = {"cursor": i + 1}
-            self.state.progress = int((i + 1) / TOTAL_ITEMS * 100)
-            self.state.flush()
-
-        out_dir = Path(self.workspace) / "results"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        target = out_dir / "final.json"
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"processed": TOTAL_ITEMS}, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(target)   # 生成器自然结束 → SDK 自动 success、清 resume_point、exit 0
-
-
-if __name__ == "__main__":
-    sys.exit(run_task(MyTask()))
-'''
-
-
-# ---------------- 工具 ----------------
-
-def _safe_task_path(task_id: str, rel: str) -> Path:
-    task_dir = (config.tasks_dir() / task_id).resolve()
-    if not task_dir.is_dir():
-        raise HTTPException(404, f"任务目录不存在：{task_id}")
-    p = (task_dir / rel).resolve()
-    if p != task_dir and task_dir not in p.parents:
-        raise HTTPException(400, "路径越出任务目录")
-    return p
-
-
-def _editable_path(task_id: str, rel: str) -> Path:
-    rel = (rel or "").lstrip("/")
-    parts = Path(rel).parts
-    if not parts or any(part in _EDIT_DENY_PARTS or part == ".." for part in parts):
-        raise HTTPException(400, "禁止编辑该路径（仅允许任务源码文件，cache/results 为运行时产物）")
-    p = _safe_task_path(task_id, rel)
-    if p.suffix.lower() not in _EDIT_ALLOWED_SUFFIX:
-        raise HTTPException(400, f"不允许编辑该后缀文件：{p.suffix or '(无后缀)'}")
-    return p
+class StopReq(BaseModel):
+    reason: str | None = None
 
 
 def _running_snapshot(svc) -> list[dict]:
@@ -228,6 +79,8 @@ def _running_snapshot(svc) -> list[dict]:
             "trigger": r.get("trigger"), "attempt": r.get("attempt"),
             "started_at": r.get("started_at"), "est_cpu": re.est_cpu, "est_mem_mb": re.est_mem_mb,
             "manual": bool(r.get("manual")),
+            "live_cpu_cores": round(re.live_cpu_cores, 3) if re.live_cpu_cores > 0 else None,
+            "live_mem_mb": re.live_mem_mb or None,
         })
     return out
 
@@ -277,7 +130,6 @@ def create_app(svc) -> FastAPI:
                 "available_memory_mb": cap.available_memory_mb(),
                 "total_cpu": cap.total_cpu,
             },
-            "settings": _public_settings(svc.settings),
             "started_at": svc.started_at,
         }
 
@@ -301,11 +153,10 @@ def create_app(svc) -> FastAPI:
                     "scheduled_at": it.get("scheduled_at"),
                     "resume_point_ref": bool(it.get("resume_point_ref")),
                     "manual": bool(it.get("manual")),
+                    "not_before": it.get("not_before") or "",
                 }
                 for it in svc.state.wq
             ]
-            cooldowns = dict(svc.state.cooldowns)
-            backoffs = dict(svc.state.backoffs)
         # 给每个等待项附上"上次运行结果"：用户在队列页就能看到到底因为什么在等待
         for it in waiting:
             latest = runlog.query_runs(job_id=it["job_id"], limit=1)
@@ -324,8 +175,7 @@ def create_app(svc) -> FastAPI:
                 "message": msg,
                 "finished_at": rec.get("finished_at") or rec.get("started_at") or "",
             }
-        return {"waiting": waiting, "running": _running_snapshot(svc),
-                "cooldowns": cooldowns, "backoffs": backoffs}
+        return {"waiting": waiting, "running": _running_snapshot(svc)}
 
     @app.get("/api/runs")
     def runs(job_id: str | None = None, status: str | None = None, limit: int = Query(100, le=1000)):
@@ -363,8 +213,9 @@ def create_app(svc) -> FastAPI:
             p = svc.profiles.get(jid, decl_cpu, decl_mem)
             out[jid] = {
                 "p95_cpu": p.p95_cpu(), "p95_memory_mb": p.p95_memory_mb(),
+                "p50_duration_sec": p.p50_duration_sec(),
                 "declared_cpu": decl_cpu, "declared_memory_mb": decl_mem,
-                "samples": len(p.samples),
+                "samples": len(p.samples), "duration_samples": len(p.durations),
             }
         return out
 
@@ -391,39 +242,46 @@ def create_app(svc) -> FastAPI:
                                  "job_id": job_id, "enabled": req.enabled})
         return {"ok": True, "job_id": job_id, "enabled": req.enabled}
 
-    # ---------- 运行参数（少数可感知参数，面板改完立即热更新，无需重启） ----------
-
-    @app.post("/api/settings")
-    def update_settings(req: SettingsReq):
-        data = svc.settings.model_dump()
-        patch = {k: v for k, v in req.model_dump().items() if v is not None}
-        runner_keys = ("cooldown_sec", "max_resource_attempts",
-                       "resource_backoff_base_sec", "resource_backoff_cap_sec")
-        runner_patch = {k: patch.pop(k) for k in runner_keys if k in patch}
-        if runner_patch:
-            data["runner"] = {**data.get("runner", {}), **runner_patch}
-        data.update(patch)
+    @app.get("/api/jobs/{job_id}/config")
+    def get_job_config(job_id: str):
         try:
-            new_settings = config.Settings.model_validate(data)
-        except ValidationError as e:
-            msgs = "; ".join(f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}" for err in e.errors())
-            raise HTTPException(400, msgs)
-        r = new_settings.runner
-        if r.cooldown_sec < 0 or r.max_resource_attempts < 0:
-            raise HTTPException(400, "间隔/重试次数不能为负数")
-        if r.resource_backoff_base_sec < 10 or r.resource_backoff_cap_sec < 10:
-            raise HTTPException(400, "退避秒数不能小于 10")
-        if r.resource_backoff_base_sec > r.resource_backoff_cap_sec:
-            raise HTTPException(400, "退避起始秒数不能大于封顶秒数")
-        if new_settings.auto_admit_retry_sec < 10:
-            raise HTTPException(400, "上线检查重试间隔不能小于 10 秒")
-        config.save_settings(new_settings)
-        svc.apply_settings(new_settings)
-        persist.append_decision({"ts": runlog.now_iso(), "act": "web_update_settings",
-                                 "changes": sorted(patch.keys()) + sorted(runner_patch.keys())})
-        return {"ok": True, "settings": _public_settings(new_settings)}
+            return svc._job_config_view(job_id)
+        except taskdoc.TaskDocError as e:
+            raise HTTPException(400, "; ".join(e.errors))
+        except KeyError:
+            raise HTTPException(404, f"任务未注册：{job_id}")
 
-    # ---------- 任务源码文件 ----------
+    @app.post("/api/jobs/{job_id}/config")
+    def update_job_config(job_id: str, patch: dict):
+        if not isinstance(patch, dict) or not patch:
+            raise HTTPException(400, "请求体必须是非空 JSON 对象（要修改的调度参数）")
+        try:
+            return svc.update_job_config(job_id, patch)
+        except taskdoc.TaskDocError as e:
+            raise HTTPException(400, "; ".join(e.errors))
+        except KeyError:
+            raise HTTPException(404, f"任务未注册：{job_id}")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/runs/{job_id}/{run_id}/stop")
+    def stop_run(job_id: str, run_id: str, req: StopReq | None = None):
+        try:
+            reason = (req.reason if req and req.reason else "管理台手动停止")
+            return svc.stop_run(run_id, reason=reason)
+        except KeyError:
+            raise HTTPException(404, "没有正在运行的该 run（可能已结束）")
+
+    @app.delete("/api/runs/{job_id}/{run_id}")
+    def delete_run(job_id: str, run_id: str, delete_files: bool = Query(False)):
+        try:
+            return svc.delete_run(job_id, run_id, delete_files=delete_files)
+        except KeyError:
+            raise HTTPException(404, "历史中不存在该 run")
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+
+    # ---------- 任务目录（只读列出）与导入 ----------
 
     @app.get("/api/tasks")
     def list_tasks():
@@ -447,68 +305,30 @@ def create_app(svc) -> FastAPI:
                         "reason": adm.get("reason", ""),
                         "attempts": int(adm.get("attempts") or 0),
                         "last_check": adm.get("last_check", ""),
-                        "next_check_after": adm.get("next_check_after", ""),
                     }
                 rows.append(row)
         return rows
 
     @app.post("/api/tasks")
-    def create_task(req: CreateReq):
+    def import_task(req: ImportReq):
+        """按子任务目录名导入一个已在本地验证的生产级任务（同步跑五道闸）。"""
+        name = (req.dir_name or "").strip()
         try:
-            taskdoc.validate_task_id(req.id)
+            taskdoc.validate_task_id(name)
         except taskdoc.TaskDocError as e:
             raise HTTPException(400, "; ".join(e.errors))
-        task_dir = config.tasks_dir() / req.id
-        if task_dir.exists():
-            raise HTTPException(409, f"任务目录已存在：{req.id}")
-        (task_dir / "results").mkdir(parents=True)
-        run_user = svc.settings.run_user or ""
-        tj = _SKELETON_TASK_JSON.replace("%RUN_USER%", run_user) % req.id
-        _write_task_file(task_dir / "task.json", tj)
-        _write_task_file(task_dir / "run.py", _SKELETON_RUN_PY)
-        os.chmod(task_dir, 0o755)
-        os.chmod(task_dir / "results", 0o755)
-        chown_error = ""
-        if run_user:
-            try:
-                _chown_tree(task_dir, run_user)
-            except (KeyError, PermissionError, OSError) as e:
-                chown_error = f"（注意：chown {run_user} 失败：{e}；闸2 前需手动处理目录属主）"
-        persist.append_decision({"ts": runlog.now_iso(), "act": "web_create_task", "job_id": req.id})
-        # 新任务目录已就位：立即让调度器开始上线检查（不必等下一轮热加载）
-        svc._kick_auto_admission()
-        return {"ok": True, "id": req.id, "warning": chown_error}
-
-    @app.get("/api/tasks/{job_id}/files")
-    def task_files(job_id: str):
-        task_dir = _safe_task_path(job_id, ".")
-        files = []
-        for p in sorted(task_dir.rglob("*")):
-            if any(part in _EDIT_DENY_PARTS for part in p.relative_to(task_dir).parts):
-                continue
-            if p.is_file():
-                files.append({"path": str(p.relative_to(task_dir)), "size": p.stat().st_size})
-        return files
-
-    @app.get("/api/tasks/{job_id}/file")
-    def read_task_file(job_id: str, path: str):
-        p = _editable_path(job_id, path)
-        if not p.exists():
-            raise HTTPException(404, "文件不存在")
-        if p.stat().st_size > _MAX_FILE_BYTES:
-            raise HTTPException(400, "文件超过 1MB，管理台不打开")
-        return {"path": path, "content": p.read_text("utf-8", errors="replace"), "size": p.stat().st_size}
-
-    @app.put("/api/tasks/{job_id}/file")
-    def write_task_file(job_id: str, path: str, req: FileReq):
-        p = _editable_path(job_id, path)
-        data = req.content.encode("utf-8")
-        if len(data) > _MAX_FILE_BYTES:
-            raise HTTPException(400, "文件超过 1MB")
-        n = _write_task_file(p, req.content)
-        persist.append_decision({"ts": runlog.now_iso(), "act": "web_save_file",
-                                 "job_id": job_id, "path": path, "bytes": n})
-        return {"ok": True, "path": path, "bytes": n}
+        task_dir = config.tasks_dir() / name
+        if not task_dir.is_dir() or not (task_dir / "task.json").is_file():
+            raise HTTPException(404, f"tasks/{name} 目录或 task.json 不存在")
+        if name in registry.load_state():
+            raise HTTPException(409, f"任务已纳入调度：{name}（无需重复导入）")
+        try:
+            svc.register_job(name)
+        except Exception as e:
+            # 五闸任一失败：把闸门原因透传给前端，本地改好文件后会自动重查/可再次导入
+            raise HTTPException(400, str(e))
+        persist.append_decision({"ts": runlog.now_iso(), "act": "web_import_task", "job_id": name})
+        return {"ok": True, "id": name}
 
     return app
 

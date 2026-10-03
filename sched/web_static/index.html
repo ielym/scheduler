@@ -43,8 +43,11 @@
                padding:4px 10px; cursor:pointer; font-size:12px; margin-right:5px; white-space:nowrap; }
   button.act:hover { border-color:var(--accent); color:var(--accent); }
   button.act.primary { background:var(--accent); border-color:var(--accent); color:#06101d; font-weight:600; }
-  button.act.danger:hover { border-color:var(--err); color:var(--err); }
+  button.act.danger { border-color:rgba(239,95,95,.5); color:var(--err); }
+  button.act.danger:hover { background:rgba(239,95,95,.12); }
   button.act[disabled] { opacity:.45; cursor:not-allowed; }
+  .clickable { cursor:pointer; border-bottom:1px dashed var(--dim); }
+  .clickable:hover { color:var(--accent); border-color:var(--accent); }
   .badge { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; font-weight:600; }
   .b-ok { background:rgba(63,191,111,.15); color:var(--ok); }
   .b-err { background:rgba(239,95,95,.15); color:var(--err); }
@@ -64,7 +67,7 @@
   .bar > i.warn { background:var(--warn); } .bar > i.err { background:var(--err); }
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; display:flex;
               align-items:center; justify-content:center; }
-  .modal { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(920px,92vw);
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(720px,92vw);
            max-height:88vh; display:flex; flex-direction:column; }
   .modal.wide { width:min(1200px,95vw); }
   .modal header2, .mhead { padding:13px 18px; border-bottom:1px solid var(--line); font-weight:600;
@@ -84,12 +87,6 @@
   @keyframes blink { 50% { opacity:.25; } }
   .gate .info { flex:1; } .gate .t { font-weight:600; } .gate .r { color:var(--dim); margin-top:2px; word-break:break-all; }
   .gate .el { color:var(--dim); font-size:11px; white-space:nowrap; }
-  .editor-wrap { display:grid; grid-template-columns:190px 1fr; gap:12px; height:62vh; }
-  .filelist { background:var(--bg); border:1px solid var(--line); border-radius:8px; overflow:auto; padding:6px; }
-  .filelist div { padding:5px 8px; border-radius:5px; cursor:pointer; font-size:12px; word-break:break-all; }
-  .filelist div.active { background:var(--panel2); color:var(--accent); }
-  .editor-wrap textarea { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px; resize:none;
-                          height:100%; line-height:1.55; }
   pre.log { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px;
             height:46vh; overflow:auto; font-size:11.5px; margin:0; white-space:pre-wrap; word-break:break-all; }
   .tabs-mini { display:flex; gap:4px; margin-bottom:8px; }
@@ -104,11 +101,13 @@
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .grow { flex:1; }
   .pager { display:flex; gap:10px; align-items:center; padding:9px 15px; border-top:1px solid var(--line); }
-  .setrow { display:grid; grid-template-columns:230px 210px 1fr; gap:12px; align-items:center;
-            padding:9px 0; border-bottom:1px solid var(--line); }
-  .setrow:last-child { border-bottom:0; }
-  .setrow .lab { font-weight:600; }
-  .setrow input { width:130px; }
+  .cfgrow { display:grid; grid-template-columns:150px 200px 1fr; gap:12px; align-items:center;
+            padding:7px 0; border-bottom:1px solid var(--line); }
+  .cfgrow:last-child { border-bottom:0; }
+  .cfgrow .lab { font-weight:600; }
+  .cfgrow input, .cfgrow select { width:190px; }
+  .cfgwarn { background:rgba(230,181,60,.08); border:1px solid rgba(230,181,60,.35); border-radius:8px;
+             padding:9px 12px; color:var(--warn); font-size:12px; margin-bottom:12px; }
   code { background:var(--panel2); padding:1px 5px; border-radius:4px; font-size:11.5px; }
 </style>
 </head>
@@ -134,7 +133,9 @@ const $ = (s, r=document) => r.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const api = async (u, opt) => {
   const r = await fetch(u, opt);
-  if (!r.ok) { let m = `${r.status}`; try { m = (await r.json()).detail || m; } catch {} throw new Error(m); }
+  if (!r.ok) { let m = `${r.status}`; try { m = (await r.json()).detail || m; } catch {}
+    if (Array.isArray(m)) m = m.map(x=>x.msg||JSON.stringify(x)).join("; ");
+    throw new Error(m); }
   return r.json();
 };
 const toast = (msg, kind="") => {
@@ -143,7 +144,7 @@ const toast = (msg, kind="") => {
   setTimeout(() => d.remove(), 4200);
 };
 const post = (u, body) => api(u, {method:"POST", headers:{"Content-Type":"application/json"}, body: body?JSON.stringify(body):"{}"});
-const put = (u, body) => api(u, {method:"PUT", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+const del = (u) => api(u, {method:"DELETE"});
 
 const STATUS_BADGE = {
   success:"b-ok", failed:"b-err", resource:"b-warn", preempted:"b-blue",
@@ -153,6 +154,29 @@ const STATUS_BADGE = {
 const badge = s => `<span class="badge ${STATUS_BADGE[s]||"b-dim"}">${esc(s||"-")}</span>`;
 const GB_MB = m => m >= 1024 ? (m/1024).toFixed(1)+"GB" : m+"MB";
 const hhmmss = iso => (iso||"").replace(/^.*T/,"").replace(/[+-].*$/,"").slice(0,8);
+const humanSec = sec => {
+  sec = Number(sec)||0;
+  if (sec < 60) return `${sec} 秒`;
+  if (sec < 3600) return `${Math.round(sec/60)} 分`;
+  if (sec < 86400) return `${+(sec/3600).toFixed(1)} 小时`;
+  return `${+(sec/86400).toFixed(1)} 天`;
+};
+const humanDur = sec => "每 " + humanSec(sec);
+const WEEK_CN = ["","一","二","三","四","五","六","日"];
+// interval 秒数 → 人话调度描述
+function fmtSchedule(s) {
+  s = s || {};
+  const t = s.type || "manual";
+  if (t === "manual") return "仅手动触发";
+  if (t === "once") return `单次 · ${esc(s.once_at||"-")}`;
+  const wk = Array.isArray(s.weekdays) && s.weekdays.length
+    ? "（周" + s.weekdays.map(d=>WEEK_CN[d]||d).join("/") + "）" : "";
+  if (s.start_time && s.end_time)
+    return `每天 ${esc(s.start_time)}–${esc(s.end_time)} ${wk} · ${humanDur(s.interval)}`
+      + (s.allow_overrun ? " · 允许超时叠加" : "");
+  return `${humanDur(s.interval)}${wk}` + (s.allow_overrun ? " · 允许超时叠加" : "");
+}
+const fmtDuration = sec => sec == null ? '<span class="hint">无样本</span>' : humanSec(Math.round(sec));
 
 // ---------------- 分页（所有展开列表统一兜底，默认每页 50 条） ----------------
 const PAGE_SIZE = 50;
@@ -189,41 +213,6 @@ function modal(title, bodyHtml, footHtml="", wide=false) {
   return bg;
 }
 
-// ---------------- 文件编辑器 ----------------
-let EDIT = {jobId:null, path:null};
-function openEditor(jobId, autoPath) {
-  const m = modal(`任务文件 · <code>${esc(jobId)}</code>`,
-    `<div class="editor-wrap"><div class="filelist" id="fl"></div>
-      <div><div class="row" style="margin-bottom:8px">
-        <span class="hint" id="ed-path"></span><span class="grow"></span>
-        <button class="act primary" id="ed-save">保存（自动重新检查，≤30s 生效）</button>
-      </div><textarea id="ed-area" spellcheck="false"></textarea></div></div>`,
-    `<button class="act" id="ed-close">关闭</button>`, true);
-  const fl = $("#fl",m), area = $("#ed-area",m);
-  const loadList = async () => {
-    const files = await api(`/api/tasks/${encodeURIComponent(jobId)}/files`);
-    fl.innerHTML = files.map(f => `<div data-p="${esc(f.path)}" class="${EDIT.path===f.path?'active':''}">${esc(f.path)}</div>`).join("")
-                   || `<div class="hint" style="padding:8px">无文件</div>`;
-    fl.querySelectorAll("div[data-p]").forEach(d => d.onclick = () => loadFile(d.dataset.p));
-  };
-  const loadFile = async (path) => {
-    EDIT.path = path;
-    const f = await api(`/api/tasks/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(path)}`);
-    area.value = f.content; $("#ed-path",m).textContent = path + `（${f.size}B）`;
-    fl.querySelectorAll("div").forEach(d => d.classList.toggle("active", d.dataset.p === path));
-  };
-  $("#ed-save",m).onclick = async () => {
-    try {
-      await put(`/api/tasks/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(EDIT.path)}`,
-                {content: area.value});
-      toast("已保存 " + EDIT.path + "，调度器将自动重新上线检查", "ok");
-    } catch (e) { toast("保存失败：" + e.message, "err"); }
-  };
-  $("#ed-close",m).onclick = () => m.remove();
-  loadList().then(() => { if (autoPath) loadFile(autoPath).catch(()=>{});
-                          else if (!EDIT.jobId || EDIT.jobId !== jobId) EDIT.path=null; EDIT.jobId=jobId; });
-}
-
 // ---------------- run 详情 ----------------
 function openRun(jobId, runId) {
   const m = modal(`Run <code>${esc(runId)}</code>`,
@@ -257,6 +246,90 @@ function openRun(jobId, runId) {
   loadMeta(); loadLog();
 }
 
+// ---------------- 调度参数行内编辑（优先级等纯调度参数，改完立即生效） ----------------
+async function openJobConfig(jobId) {
+  let cfg;
+  try { cfg = await api(`/api/jobs/${encodeURIComponent(jobId)}/config`); }
+  catch(e){ toast("读取调度参数失败："+e.message,"err"); return; }
+  const s = cfg.schedule || {}, hb = cfg.heartbeat || {}, rt = cfg.retry || {};
+  const wd = new Set(s.weekdays || []);
+  const wdChecks = [1,2,3,4,5,6,7].map(d =>
+    `<label style="margin-right:6px"><input type="checkbox" data-wd="${d}" ${wd.has(d)?"checked":""}>周${WEEK_CN[d]}</label>`).join("");
+  const m = modal(`调度参数 · <code>${esc(jobId)}</code>`,
+    `<div class="cfgwarn">这里只允许修改纯调度参数，保存后立即生效（不用重启、不用重新过闸）。
+      任务代码/入口/资源声明/env 不允许在管理台修改：请在本地改好后重新导入。</div>
+     <div class="cfgrow"><div class="lab">优先级</div>
+       <input type="number" id="c-pri" value="${esc(cfg.priority)}">
+       <div class="hint">整数，越大越先准出（1~100）</div></div>
+     <div class="cfgrow"><div class="lab">调度类型</div>
+       <select id="c-type">
+         <option value="manual" ${s.type==="manual"?"selected":""}>manual（仅手动/CLI 触发）</option>
+         <option value="interval" ${s.type==="interval"?"selected":""}>interval（周期）</option>
+         <option value="once" ${s.type==="once"?"selected":""}>once（一次性）</option>
+       </select><div class="hint">manual 任务只能由「立即运行一次」或 <code>sched run</code> 触发</div></div>
+     <div class="cfgrow"><div class="lab">周期间隔（秒）</div>
+       <input type="number" id="c-interval" value="${esc(s.interval ?? "")}">
+       <div class="hint">interval 用，人话：<span id="c-interval-h"></span></div></div>
+     <div class="cfgrow"><div class="lab">每日时间窗</div>
+       <div class="row"><input type="text" id="c-start" placeholder="HH:MM" value="${esc(s.start_time||"")}" style="width:90px">
+         至 <input type="text" id="c-end" placeholder="HH:MM" value="${esc(s.end_time||"")}" style="width:90px"></div>
+       <div class="hint">留空=全天；仅在窗口内按间隔触发</div></div>
+     <div class="cfgrow"><div class="lab">生效星期</div><div>${wdChecks}</div>
+       <div class="hint">不勾=每天</div></div>
+     <div class="cfgrow"><div class="lab">单次时刻</div>
+       <input type="text" id="c-once" value="${esc(s.once_at||"")}">
+       <div class="hint">once 用，ISO 时间</div></div>
+     <div class="cfgrow"><div class="lab">并发实例 / 超时策略</div>
+       <div class="row"><input type="number" id="c-maxn" value="${esc(s.max_instances ?? 1)}" style="width:80px">
+         <select id="c-overflow" style="width:110px">
+           <option value="queue" ${s.overflow==="queue"?"selected":""}>排队</option>
+           <option value="skip" ${s.overflow==="skip"?"selected":""}>跳过</option>
+         </select>
+         <label><input type="checkbox" id="c-overrun" ${s.allow_overrun?"checked":""}> 允许超时叠加</label>
+       </div><div class="hint">上一轮没跑完又到点时的处理</div></div>
+     <div class="cfgrow"><div class="lab">心跳超时（秒）</div>
+       <input type="number" id="c-hb" value="${esc(hb.timeout_sec ?? 120)}">
+       <div class="hint">超过该秒数无心跳视为卡死（最小 5 秒）</div></div>
+     <div class="cfgrow"><div class="lab">重试间隔（秒）</div>
+       <input type="number" id="c-delay" value="${esc(rt.delay_sec ?? 0)}">
+       <div class="hint">资源错误（100/101）后按此间隔重试；0=资源一空出来就立刻再试</div></div>
+     <div class="cfgrow"><div class="lab">重试上限（次）</div>
+       <input type="number" id="c-maxa" value="${esc(rt.max_attempts ?? 0)}">
+       <div class="hint">0=不放弃，有资源必须跑完；正数=达到后转人工</div></div>
+     <div class="cfgrow"><div class="lab">重试时效截止</div>
+       <input type="text" id="c-after" value="${esc(rt.not_after||"")}">
+       <div class="hint">留空=不失效；ISO 时刻（如 2026-10-04T18:00）或每日时刻（如 18:00），过期转人工</div></div>`,
+    `<button class="act" id="c-cancel">取消</button><button class="act primary" id="c-ok">保存并立即生效</button>`);
+  const updHint = () => { $("#c-interval-h",m).textContent = humanSec(Number($("#c-interval",m).value)||0); };
+  $("#c-interval",m).oninput = updHint; updHint();
+  $("#c-ok",m).onclick = async () => {
+    const weekdays = [...m.querySelectorAll("[data-wd]:checked")].map(x=>Number(x.dataset.wd));
+    const num = id => { const v = $(id,m).value.trim(); return v===""?undefined:Number(v); };
+    const patch = {
+      priority: Number($("#c-pri",m).value),
+      schedule: {
+        type: $("#c-type",m).value,
+        interval: num("#c-interval"),
+        start_time: $("#c-start",m).value.trim(),
+        end_time: $("#c-end",m).value.trim(),
+        weekdays,
+        once_at: $("#c-once",m).value.trim(),
+        max_instances: num("#c-maxn"),
+        overflow: $("#c-overflow",m).value,
+        allow_overrun: $("#c-overrun",m).checked,
+      },
+      heartbeat: { timeout_sec: num("#c-hb") },
+      retry: { delay_sec: num("#c-delay"), max_attempts: num("#c-maxa"),
+               not_after: $("#c-after",m).value.trim() },
+    };
+    try {
+      await post(`/api/jobs/${encodeURIComponent(jobId)}/config`, patch);
+      m.remove(); toast("调度参数已保存并立即生效","ok"); loadTab();
+    } catch(e){ toast("保存失败："+e.message,"err"); }
+  };
+  $("#c-cancel",m).onclick = () => m.remove();
+}
+
 // ---------------- 各 Tab ----------------
 async function tabOverview() {
   const d = await api("/api/overview");
@@ -270,16 +343,15 @@ async function tabOverview() {
     if (!t.has_task_json) { badgeHtml = '<span class="badge b-err">缺少 task.json</span>'; detail = "放入合规的 task.json 后自动开始检查"; }
     else if (!a) { badgeHtml = '<span class="badge b-dim">等待检查</span>'; detail = "下一轮热加载时自动开始（≤30s）"; }
     else if (a.status === "checking") { badgeHtml = '<span class="badge b-blue">检查中</span>'; detail = "正在执行上线检查（静态/契约/冒烟/容量/断点）…"; }
-    else { badgeHtml = `<span class="badge b-err">未通过（已重试 ${a.attempts} 次）</span>`;
-           detail = `${esc(a.reason||"")}；修改文件后立即重试，否则 ${esc((a.next_check_after||"").replace(/^.*T/,"").slice(0,8))} 后自动重试`; }
+    else { badgeHtml = `<span class="badge b-err">未通过（已检查 ${a.attempts} 次）</span>`;
+           detail = `${esc(a.reason||"")}<br><span class="hint">不做定时自动重试：请在本地修改/删除任务文件，文件变化后自动重新检查</span>`; }
     return `<tr><td class="mono">${esc(t.id)}</td><td>${badgeHtml}</td>
-      <td class="hint" style="max-width:560px">${detail}</td>
-      <td><button class="act" data-files="${esc(t.id)}">查看文件</button></td></tr>`;
+      <td class="hint" style="max-width:760px">${detail}</td></tr>`;
   }).join("");
   const admPanel = !pending.length ? "" : `
     <div class="panel"><h2>等待上线检查的任务（${pending.length}）
-      <span class="spacer"></span><span class="hint">任务放进 tasks/ 即自动检查，通过后自动开始调度，无需注册</span></h2>
-      <table><thead><tr><th>任务</th><th>检查状态</th><th>说明 / 未通过原因</th><th></th></tr></thead>
+      <span class="spacer"></span><span class="hint">任务放进 tasks/ 即自动检查，通过后自动开始调度；闸失败不自动重试，改文件后重查</span></h2>
+      <table><thead><tr><th>任务</th><th>检查状态</th><th>说明 / 未通过原因</th></tr></thead>
       <tbody>${admRows}</tbody></table></div>`;
   $("#view").innerHTML = `
     <div class="cards">
@@ -289,54 +361,12 @@ async function tabOverview() {
       <div class="card"><div class="k">整机内存</div><div class="v">${GB_MB(d.machine.available_memory_mb)}</div>
         <div class="sub">可用 / 共 ${GB_MB(d.machine.total_memory_mb)}（${memPct}% 占用）</div>
         <div class="bar"><i class="${memPct>85?'err':memPct>65?'warn':''}" style="width:${memPct}%"></i></div></div>
-      <div class="card"><div class="k">CPU</div><div class="v">${d.machine.total_cpu}</div><div class="sub">核</div></div>
+      <div class="card"><div class="k">CPU</div><div class="v">${d.machine.total_cpu}</div><div class="sub">核（时区固定 Asia/Shanghai）</div></div>
       <div class="card"><div class="k">账本预留</div><div class="v">${d.ledger_reserved_mem_mb}MB</div>
         <div class="sub">实测 ${d.ledger_actual_mem_mb}MB · 占整机 ${ledPct}%</div>
         <div class="bar"><i class="${ledPct>85?'err':ledPct>65?'warn':''}" style="width:${ledPct}%"></i></div></div>
     </div>
-    <div class="panel"><h2>运行参数<span class="spacer"></span>
-      <span class="hint">改完点「保存」立即生效，不用重启 · serve 启动于 ${esc(d.started_at||"-")}</span></h2>
-      <div style="padding:6px 15px 14px">
-        <div class="setrow">
-          <div class="lab">时区</div>
-          <input type="text" data-k="timezone" value="${esc(d.settings.timezone)}">
-          <div class="hint">任务计划时刻按此时区解释，例如 Asia/Shanghai</div></div>
-        <div class="setrow">
-          <div class="lab">成功后冷却（秒）</div>
-          <input type="number" min="0" data-k="cooldown_sec" value="${d.settings.cooldown_sec}">
-          <div class="hint">同一个任务成功跑完后，至少隔这么久才允许再次自动运行</div></div>
-        <div class="setrow">
-          <div class="lab">外部资源出错后的等待（秒）</div>
-          <div class="row">先等 <input type="number" min="10" style="width:90px" data-k="resource_backoff_base_sec" value="${d.settings.resource_backoff_base_sec}">
-            再试，连续失败翻倍，最多等 <input type="number" min="10" style="width:90px" data-k="resource_backoff_cap_sec" value="${d.settings.resource_backoff_cap_sec}"></div>
-          <div class="hint">代理隧道/VPN 被掐断、被限流等（任务退出码 101）时适用。任务自己会先换连接/换出口 IP 就地重试几次，仍失败才按这里等待</div></div>
-        <div class="setrow">
-          <div class="lab">资源错误重试上限（次）</div>
-          <input type="number" min="0" data-k="max_resource_attempts" value="${d.settings.max_resource_attempts}">
-          <div class="hint">0 = 不放弃，按上面的节奏一直自动重试；填正数，达到次数后转人工，不再自动重试</div></div>
-        <div class="setrow">
-          <div class="lab">上线检查失败重试间隔（秒）</div>
-          <input type="number" min="10" data-k="auto_admit_retry_sec" value="${d.settings.auto_admit_retry_sec}">
-          <div class="hint">新任务自动上线检查没通过时，隔这么久自动重查；只要改了任务文件就会立即重查，不用等</div></div>
-        <div style="padding-top:12px" class="row">
-          <button class="act primary" id="set-save">保存并立即生效</button>
-          <span class="hint">抢占宽限、心跳超时、内存水位这些引擎内部参数无需感知，已隐藏</span></div>
-      </div></div>
     ${admPanel}`;
-  document.querySelectorAll("[data-files]").forEach(b => b.onclick = () => openEditor(b.dataset.files, "task.json"));
-  $("#set-save").onclick = async () => {
-    const body = {};
-    document.querySelectorAll("#view [data-k]").forEach(inp => {
-      const v = inp.value.trim();
-      if (v === "") return;
-      body[inp.dataset.k] = inp.type === "number" ? Number(v) : v;
-    });
-    try {
-      await post("/api/settings", body);
-      toast("运行参数已保存并立即生效", "ok");
-      loadTab();
-    } catch (e) { toast("保存失败：" + e.message, "err"); }
-  };
 }
 
 async function tabJobs() {
@@ -351,9 +381,9 @@ async function tabJobs() {
       : `<span class="hint" title="自动调度任务由调度器按计划运行，无需手动触发">按计划自动运行</span>`;
     return `<tr>
       <td class="mono"><b>${esc(j.job_id)}</b><div class="hint">${esc(j.name||"")}</div></td>
-      <td>${j.priority}</td>
+      <td><span class="clickable" data-cfg="${esc(j.job_id)}" title="点击修改优先级等调度参数">${j.priority}</span></td>
       <td><span class="badge b-purple">${esc(sch.type||"manual")}</span>
-          <div class="hint mono">${sch.interval?sch.interval+"s":esc(sch.once_at||"")}</div></td>
+          <div class="hint">${fmtSchedule(sch)}</div></td>
       <td class="mono">${esc(j.next_run_at||"-")}</td>
       <td>${j.ok?'<span class="badge b-ok">ok</span>':
               `<span class="badge b-err" title="${esc(j.error||'')}">异常</span>
@@ -362,7 +392,7 @@ async function tabJobs() {
           <span class="slider"></span></label></td>
       <td>
         ${runBtn}
-        <button class="act" data-files="${esc(j.job_id)}">文件</button>
+        <button class="act" data-cfg="${esc(j.job_id)}">调度参数</button>
       </td></tr>`;
   };
   const unregRow = t => {
@@ -378,47 +408,50 @@ async function tabJobs() {
       statusCell = '<span class="badge b-blue">检查中…</span>';
       hintCell = "正在跑五道闸（静态/契约/冒烟/容量/断点）";
     } else {
-      statusCell = `<span class="badge b-err">未通过 · 已重试 ${a.attempts} 次</span>`;
-      hintCell = `${esc((a.reason||"").slice(0,160))}<br><span class="hint">改好文件后立即重试；否则下次自动重试 ${esc((a.next_check_after||"").replace(/^.*T/,"").slice(0,8))}</span>`;
+      statusCell = `<span class="badge b-err">未通过 · 已检查 ${a.attempts} 次</span>`;
+      hintCell = `${esc((a.reason||"").slice(0,200))}<br><span class="hint">闸失败不自动重试：本地修改任务文件后自动重新检查</span>`;
     }
     return `<tr><td class="mono"><b>${esc(t.id)}</b></td><td>${statusCell}</td>
-      <td class="hint" style="max-width:520px">${hintCell}</td>
-      <td><button class="act" data-files="${esc(t.id)}">查看/修改文件</button></td></tr>`;
+      <td class="hint" style="max-width:720px">${hintCell}</td></tr>`;
   };
   $("#view").innerHTML = `
     <div class="panel"><h2>已纳入调度的任务
       <span class="spacer"></span>
-      <button class="act primary" id="new-task">+ 新建任务</button></h2>
+      <button class="act primary" id="import-task">+ 导入任务</button></h2>
       <table><thead><tr><th>任务</th><th>优先级</th><th>调度</th><th>下次运行</th><th>状态</th><th>启用</th><th>操作</th></tr></thead>
-      <tbody>${jobs.map(row).join("") || `<tr><td colspan="7" class="hint" style="padding:18px">暂无任务（把任务目录放进 tasks/，会自动完成上线检查）</td></tr>`}</tbody></table></div>
+      <tbody>${jobs.map(row).join("") || `<tr><td colspan="7" class="hint" style="padding:18px">暂无任务（点右上角「导入任务」，或把任务目录放进 tasks/ 自动过闸）</td></tr>`}</tbody></table></div>
     ${unreg.length ? `<div class="panel"><h2>等待上线检查（${unreg.length}）
-      <span class="spacer"></span><span class="hint">全自动：检查通过即开始调度，未通过改文件后自动重试</span></h2>
-      <table><thead><tr><th>任务</th><th>检查状态</th><th>说明 / 未通过原因</th><th>操作</th></tr></thead>
+      <span class="spacer"></span><span class="hint">全自动：检查通过即开始调度；未通过请在本地改文件，文件变化后自动重查</span></h2>
+      <table><thead><tr><th>任务</th><th>检查状态</th><th>说明 / 未通过原因</th></tr></thead>
       <tbody>${unreg.map(unregRow).join("")}</tbody></table></div>`:""}`;
   document.querySelectorAll("[data-run]").forEach(b => b.onclick = async () => {
     try { const r = await post(`/api/jobs/${encodeURIComponent(b.dataset.run)}/trigger`);
       toast(`已加入运行队列：${r.run_id}`, "ok"); } catch(e){ toast("运行失败："+e.message,"err"); }
   });
-  document.querySelectorAll("[data-files]").forEach(b => b.onclick = () => openEditor(b.dataset.files, "task.json"));
+  document.querySelectorAll("[data-cfg]").forEach(b => b.onclick = () => openJobConfig(b.dataset.cfg));
   document.querySelectorAll("[data-en]").forEach(c => c.onchange = async () => {
     try { await post(`/api/jobs/${encodeURIComponent(c.dataset.en)}/enabled`, {enabled:c.checked});
       toast(c.checked?"已启用":"已停用（≤30s 生效）","ok"); } catch(e){ toast(e.message,"err"); c.checked=!c.checked; }
   });
-  $("#new-task").onclick = () => {
-    const m = modal("新建任务",
-      `<div class="hint" style="margin-bottom:10px">在 <code>tasks/</code> 下创建最小骨架（手动调度）。
-       创建后调度器会自动进行上线检查（五道闸），通过即开始调度；未通过会在本页显示原因，
-       在文件编辑器里改好保存后自动重试。更丰富的场景模板见 sched 技能 assets/templates。</div>
-       <input type="text" id="nt-id" placeholder="任务 id：字母数字 _ -，1-64 位" style="width:100%">`,
-      `<button class="act" id="nt-cancel">取消</button><button class="act primary" id="nt-ok">创建</button>`);
-    $("#nt-cancel",m).onclick = () => m.remove();
-    $("#nt-ok",m).onclick = async () => {
-      const id = $("#nt-id",m).value.trim();
-      try { const r = await post("/api/tasks", {id}); m.remove();
-            toast("已创建 "+r.id+(r.warning||""), r.warning ? "" : "ok");
-            loadTab(); openEditor(r.id, "task.json"); }
-      catch(e){ toast("创建失败："+e.message,"err"); }
+  $("#import-task").onclick = () => {
+    const m = modal("导入任务",
+      `<div class="cfgwarn">仅限<b>本地已开发验证的生产级任务</b>：按 <code>tasks/</code> 下的子任务目录名导入，
+        导入即同步执行五道上线检查（静态/契约/冒烟/容量/断点），通过后立即纳入调度；
+        未通过会显示闸门原因，本地改好文件后自动重查。管理台不提供文件查看/编辑。</div>
+       <input type="text" id="im-name" placeholder="子任务目录名（字母数字 _ -，1-64 位）" style="width:100%" autofocus>
+       <div class="hint" style="margin-top:8px">目录需已存在于 tasks/ 且包含 task.json，例如：arxiv_agentic_daily</div>`,
+      `<button class="act" id="im-cancel">取消</button><button class="act primary" id="im-ok">导入并过闸</button>`);
+    const submit = async () => {
+      const name = $("#im-name",m).value.trim();
+      if (!name) { toast("请填写目录名","err"); return; }
+      $("#im-ok",m).disabled = true;
+      try { await post("/api/tasks", {dir_name:name}); m.remove();
+            toast("导入成功，已纳入调度：" + name, "ok"); loadTab(); }
+      catch(e){ toast("导入失败："+e.message,"err"); $("#im-ok",m).disabled = false; }
     };
+    $("#im-cancel",m).onclick = () => m.remove();
+    $("#im-ok",m).onclick = submit;
+    $("#im-name",m).onkeydown = e => { if (e.key==="Enter") submit(); };
   };
 }
 
@@ -432,41 +465,77 @@ async function tabQueue() {
       <div class="hint">${esc(hhmmss(l.finished_at))}</div>`;
   };
   const waitCell = it => {
-    const b = q.backoffs[it.job_id];
-    if (b) return `<span class="badge b-warn" title="任务报了外部资源错误（如代理被掐断），按总览页设置的节奏等待后自动重试">
-      外部资源等待 · ${esc(hhmmss(b.not_before))} 自动重试</span>`;
-    const c = q.cooldowns[it.job_id];
-    if (c) return `<span class="badge b-dim">成功冷却中 · ${esc(hhmmss(c))}</span>`;
-    return '<span class="hint">排队等待调度</span>';
+    if (it.not_before) {
+      const t = hhmmss(it.not_before);
+      return `<span class="badge b-warn" title="任务在 task.json retry.delay_sec 中声明的重试节奏">
+        等待任务重试间隔 · ${esc(t)} 后可准出</span>`;
+    }
+    return '<span class="hint">排队等待资源/调度</span>';
   };
+  const trigCell = it => it.trigger==="manual"
+    ? '<span title="由管理台「立即运行一次」或 sched run 手动触发（manual=true）">手动运行</span>'
+    : it.trigger==="interval" ? "按计划" : it.trigger==="once" ? "单次计划" : it.trigger==="second_pass" ? "二刷" : esc(it.trigger);
   const wRow = it => `<tr>
     <td class="mono">${esc(it.job_id)}</td><td>${it.priority}</td>
-    <td><span class="hint">${it.trigger==="manual"?"手动运行":it.trigger==="interval"?"按计划":"自动"}</span></td>
+    <td><span class="hint">${trigCell(it)}</span></td>
     <td>${it.attempt}</td><td>${it.resume_point_ref?'<span class="badge b-blue">断点恢复</span>':""}</td>
     <td class="mono">${esc(hhmmss(it.queued_at))}</td><td>${waitCell(it)}</td><td>${lastCell(it)}</td></tr>`;
   const rRow = it => `<tr>
-    <td class="mono">${esc(it.job_id)}</td><td>${badge("running")} ${it.trigger==="manual"?"手动运行":"按计划"}</td>
-    <td class="mono">${esc(it.run_id)}</td><td>${it.pid}</td><td>${it.est_cpu} 核 / ${it.est_mem_mb}MB</td>
-    <td class="mono">${esc(hhmmss(it.started_at))}</td></tr>`;
+    <td class="mono">${esc(it.job_id)}</td>
+    <td>${badge("running")} <span class="hint">${it.trigger==="manual"?"手动运行":"按计划"}</span></td>
+    <td class="mono">${esc(it.run_id)}</td><td>${it.pid}</td>
+    <td><div>${it.est_cpu} 核 / ${it.est_mem_mb}MB</div>
+        <div class="hint">实测 ${it.live_cpu_cores??"–"} 核 / ${it.live_mem_mb??"–"}MB</div></td>
+    <td class="mono">${esc(hhmmss(it.started_at))}</td>
+    <td><button class="act danger" data-stop="${esc(it.job_id)}|${esc(it.run_id)}">停止</button></td></tr>`;
   const wp = pageSlice(q.waiting, "q-wait");
   const rp = pageSlice(q.running, "q-run");
   $("#view").innerHTML = `
     <div class="panel"><h2>等待运行（${q.waiting.length}）
-      <span class="spacer"></span><span class="hint">尝试次数 = 失败后第几次自动重试；外部资源等待期间不会重复执行</span></h2>
+      <span class="spacer"></span><span class="hint">「手动运行」= 管理台「立即运行一次」或 <code>sched run</code> 触发；尝试次数=本次计划第几次尝试；同优先级按预估时长短作业优先（SJF）</span></h2>
       <table><thead><tr><th>任务</th><th>优先级</th><th>触发方式</th><th>第几次尝试</th><th>恢复</th><th>入队时刻</th><th>等待状态</th><th>上次失败原因</th></tr></thead>
       <tbody>${wp.rows.map(wRow).join("") || '<tr><td colspan="8" class="hint" style="padding:16px">没有等待运行的任务</td></tr>'}</tbody></table>
       ${q.waiting.length > PAGE_SIZE ? pagerHtml(q.waiting.length, wp.p, wp.pages, "q-wait") : ""}</div>
-    <div class="panel"><h2>运行中（${q.running.length}）</h2>
-      <table><thead><tr><th>任务</th><th>状态</th><th>run_id</th><th>pid</th><th>预估资源</th><th>开始</th></tr></thead>
-      <tbody>${rp.rows.map(rRow).join("") || '<tr><td colspan="6" class="hint" style="padding:16px">无运行中任务</td></tr>'}</tbody></table>
+    <div class="panel"><h2>运行中（${q.running.length}）
+      <span class="spacer"></span><span class="hint">「停止」= 请求取消（SIGTERM 整进程组，可断点续跑；本轮不自动重排队）</span></h2>
+      <table><thead><tr><th>任务</th><th>状态</th><th>run_id</th><th>pid</th><th>资源（预估/实测）</th><th>开始</th><th>操作</th></tr></thead>
+      <tbody>${rp.rows.map(rRow).join("") || '<tr><td colspan="7" class="hint" style="padding:16px">无运行中任务</td></tr>'}</tbody></table>
       ${q.running.length > PAGE_SIZE ? pagerHtml(q.running.length, rp.p, rp.pages, "q-run") : ""}</div>`;
   bindPager(loadTab);
+  document.querySelectorAll("[data-stop]").forEach(b => b.onclick = async () => {
+    if (!confirm("确认停止该运行？将发送 SIGTERM（任务可保存断点，本轮结束后不自动重排队）。")) return;
+    const [j, rid] = b.dataset.stop.split("|");
+    b.disabled = true; b.textContent = "停止中…";
+    try { await post(`/api/runs/${encodeURIComponent(j)}/${encodeURIComponent(rid)}/stop`);
+      toast("已发送停止请求","ok"); }
+    catch(e){ toast("停止失败："+e.message,"err"); b.disabled=false; b.textContent="停止"; }
+  });
 }
 
 async function tabRuns() {
   const jobId = $("#rf-job")?.value || ""; const status = $("#rf-status")?.value || "";
   const qs = new URLSearchParams(); if (jobId) qs.set("job_id",jobId); if (status) qs.set("status",status); qs.set("limit","1000");
   const runs = await api("/api/runs?"+qs.toString());
+  const askDelete = (job_id, run_id) => {
+    const m = modal(`删除历史 · <code>${esc(run_id)}</code>`,
+      `<div class="cfgwarn">删除后不可恢复。是否同步删除本地详情与日志？</div>
+       <div class="hint">· 「仅删除历史记录」：从 data/runs/${esc(job_id)}.jsonl 移除该行，日志文件保留在磁盘；<br>
+       · 「同时删除本地详情和日志」：额外删除 data/runs/${esc(job_id)}/ 下该 run 的 stdout/stderr 日志。<br>
+       · state/cache/results 等任务产物不受影响。</div>`,
+      `<button class="act" id="dl-cancel">取消</button>
+       <button class="act" id="dl-row">仅删除历史记录</button>
+       <button class="act danger" id="dl-all">同时删除本地详情和日志</button>`);
+    const doDel = async (withFiles, btn) => {
+      btn.disabled = true;
+      try {
+        await del(`/api/runs/${encodeURIComponent(job_id)}/${encodeURIComponent(run_id)}?delete_files=${withFiles}`);
+        m.remove(); toast(withFiles ? "已删除记录和本地日志" : "已删除历史记录","ok"); loadTab();
+      } catch(e){ toast("删除失败："+e.message,"err"); btn.disabled=false; }
+    };
+    $("#dl-cancel",m).onclick = () => m.remove();
+    $("#dl-row",m).onclick = () => doDel(false, $("#dl-row",m));
+    $("#dl-all",m).onclick = () => doDel(true, $("#dl-all",m));
+  };
   const render = () => {
     const pg = pageSlice(runs, "runs");
     $("#view").innerHTML = `
@@ -479,13 +548,14 @@ async function tabRuns() {
             .map(s=>`<option ${s===status?"selected":""}>${s}</option>`).join("")}
         </select>
         <button class="act" id="rf-go">查询</button></div>
-      <table><thead><tr><th>job</th><th>状态</th><th>exit</th><th>trigger</th><th>attempt</th><th>原因</th><th>时刻</th><th></th></tr></thead>
+      <table><thead><tr><th>job</th><th>状态</th><th>exit</th><th>trigger</th><th>attempt</th><th>原因</th><th>时刻</th><th>操作</th></tr></thead>
       <tbody>${pg.rows.map(r=>`<tr>
         <td class="mono">${esc(r.job_id)}</td><td>${badge(r.status)}</td><td>${esc(r.exit_code)}</td>
         <td>${esc(r.trigger)}</td><td>${esc(r.attempt)}</td>
         <td class="hint" style="max-width:300px">${esc((r.reason||"").slice(0,100))}</td>
         <td class="mono">${esc(r.finished_at||r.started_at||"")}</td>
-        <td><button class="act" data-rd="${esc(r.job_id)}|${esc(r.run_id)}">详情/日志</button></td></tr>`).join("")
+        <td><button class="act" data-rd="${esc(r.job_id)}|${esc(r.run_id)}">详情/日志</button>
+            <button class="act danger" data-del="${esc(r.job_id)}|${esc(r.run_id)}">删除</button></td></tr>`).join("")
         ||'<tr><td colspan="8" class="hint" style="padding:16px">无记录</td></tr>'}</tbody></table>
       ${runs.length > PAGE_SIZE ? pagerHtml(runs.length, pg.p, pg.pages, "runs") : ""}</div>`;
     $("#rf-go").onclick = () => { PG.runs = 1; loadTab(); };
@@ -493,6 +563,9 @@ async function tabRuns() {
     $("#rf-status").onchange = () => { PG.runs = 1; loadTab(); };
     document.querySelectorAll("[data-rd]").forEach(b => b.onclick = () => {
       const [j,rid] = b.dataset.rd.split("|"); openRun(j,rid);
+    });
+    document.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
+      const [j,rid] = b.dataset.del.split("|"); askDelete(j,rid);
     });
     bindPager(render);
   };
@@ -506,7 +579,7 @@ async function tabDecisions() {
     $("#view").innerHTML = `<div class="panel"><h2>调度决策记录（最近 ${items.length} 条）</h2>
     <table><thead><tr><th>时刻</th><th>动作</th><th>job/run</th><th>详情</th></tr></thead><tbody>
     ${pg.rows.map(d=>`<tr><td class="mono">${esc(d.ts||"")}</td>
-      <td><span class="badge ${d.act==="terminal"?"b-err":/enqueue|admit/.test(d.act)?"b-blue":/preempt/.test(d.act)?"b-warn":"b-dim"}">${esc(d.act)}</span></td>
+      <td><span class="badge ${d.act==="terminal"||/giveup/.test(d.act)?"b-err":/enqueue|admit/.test(d.act)?"b-blue":/preempt/.test(d.act)?"b-warn":"b-dim"}">${esc(d.act)}</span></td>
       <td class="mono">${esc(d.job_id||"")} ${d.run_id?`<span class="hint">${esc(d.run_id)}</span>`:""}</td>
       <td class="hint" style="max-width:520px">${esc(JSON.stringify(Object.fromEntries(Object.entries(d).filter(([k])=>!["ts","act","job_id","run_id"].includes(k)))))}</td></tr>`).join("")
       ||'<tr><td colspan="4" class="hint" style="padding:16px">无决策记录</td></tr>'}</tbody></table>
@@ -518,12 +591,15 @@ async function tabDecisions() {
 
 async function tabProfiles() {
   const p = await api("/api/profiles");
-  $("#view").innerHTML = `<div class="panel"><h2>资源画像（冒烟+正式 run 实测，P95 滑窗 8 次 ×1.2 用于准出）</h2>
-    <table><thead><tr><th>job</th><th>声明 CPU/内存</th><th>P95 CPU</th><th>P95 内存</th><th>样本数</th></tr></thead>
+  $("#view").innerHTML = `<div class="panel"><h2>资源画像
+    <span class="spacer"></span><span class="hint">注册冒烟 + 运行中动态采样（约每分钟）+ 终态采样；P95 滑窗 8 次 ×1.2 用于准出；预估时长（成功 run 中位数）用于同优先级 SJF</span></h2>
+    <table><thead><tr><th>job</th><th>声明 CPU/内存</th><th>P95 CPU</th><th>P95 内存</th><th>预估时长</th><th>样本数</th></tr></thead>
     <tbody>${Object.entries(p).map(([k,d])=>`<tr><td class="mono">${esc(k)}</td>
       <td>${d.declared_cpu} 核 / ${d.declared_memory_mb}MB</td>
-      <td>${d.p95_cpu??"-"} 核</td><td>${d.p95_memory_mb??"-"}MB</td><td>${d.samples}</td></tr>`).join("")
-      ||'<tr><td colspan="5" class="hint" style="padding:16px">尚无画像（未注册过任务）</td></tr>'}</tbody></table></div>`;
+      <td>${d.p95_cpu??"-"} 核</td><td>${d.p95_memory_mb??"-"}MB</td>
+      <td>${fmtDuration(d.p50_duration_sec)}</td>
+      <td>${d.samples}（时长 ${d.duration_samples||0}）</td></tr>`).join("")
+      ||'<tr><td colspan="6" class="hint" style="padding:16px">尚无画像（未注册过任务）</td></tr>'}</tbody></table></div>`;
 }
 
 const TABS = {overview:tabOverview, jobs:tabJobs, queue:tabQueue, runs:tabRuns,
@@ -546,7 +622,8 @@ const tick = async () => {
       // 用户正在表单/过滤框里输入时不自动重绘，避免冲掉焦点和未保存内容
       const ae = document.activeElement;
       const editing = ae && ["INPUT","TEXTAREA","SELECT"].includes(ae.tagName) && $("#view").contains(ae);
-      if (!editing) loadTab();
+      const modalOpen = $(".modal-bg");
+      if (!editing && !modalOpen) loadTab();
     }
   } catch { $("#meta").textContent = "管理台未连接（serve 是否带 --web 启动？）"; }
 };
