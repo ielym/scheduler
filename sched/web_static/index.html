@@ -225,30 +225,46 @@ function openRun(jobId, runId) {
     `<div id="rd-meta"></div>
      <div class="tabs-mini" style="margin-top:12px">
        <button data-l="stdout" class="active">stdout</button><button data-l="stderr">stderr</button>
-       <span class="grow"></span><button class="act" id="rd-refresh">刷新尾部</button></div>
-     <pre class="log" id="rd-log">加载中…</pre></div>`,
+       <span class="grow"></span>
+       <label class="hint" style="margin-right:10px"><input type="checkbox" id="rd-auto"> 自动刷新（3s）</label>
+       <button class="act" id="rd-refresh">刷新尾部</button></div>
+     <pre class="log" id="rd-log">加载中…</pre>
+     <div class="hint" style="margin-top:6px">运行中实时读取（自动刷新 3s）；若 stdout/stderr 持续为空，说明任务把详细日志写在了任务目录自身的 <code>cache/logs/</code> 下。</div></div>`,
     `<button class="act" id="rd-close">关闭</button>`, true);
-  let stream = "stdout";
+  let stream = "stdout", timer = null, isRunning = false;
+  const logEl = () => $("#rd-log",m);
   const loadMeta = async () => {
-    const r = await api(`/api/runs/${encodeURIComponent(jobId)}/${encodeURIComponent(runId)}`);
+    let r;
+    try { r = await api(`/api/runs/${encodeURIComponent(jobId)}/${encodeURIComponent(runId)}`); }
+    catch(e){ return; }
+    isRunning = r.status === "running";
     $("#rd-meta",m).innerHTML = `<div class="row">
       <span>${badge(r.status)}</span><b>${esc(r.job_id)}</b>
-      <span class="hint">trigger=${esc(r.trigger)} attempt=${esc(r.attempt)} exit=${esc(r.exit_code)}
+      <span class="hint">trigger=${esc(r.trigger)} attempt=${esc(r.attempt)} exit=${esc(r.exit_code ?? "-")}
       开始=${esc(r.started_at||"-")} 结束=${esc(r.finished_at||"-")} 耗时=${Math.round((r.duration_ms||0)/100)/10}s</span></div>
       ${r.reason?`<div class="hint" style="margin-top:6px">${esc(r.reason)}</div>`:""}
       <details style="margin-top:8px"><summary class="hint">完整记录 JSON</summary>
       <pre class="log" style="height:200px">${esc(JSON.stringify(r,null,2))}</pre></details>`;
+    if (!isRunning && timer) { clearInterval(timer); timer = null; const c=$("#rd-auto",m); if(c) c.checked=false; }
   };
   const loadLog = async () => {
+    const el = logEl(); if (!el) return;
+    // 用户向上翻看历史时，自动刷新不强行拽回底部
+    const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     const l = await api(`/api/logs/${encodeURIComponent(jobId)}/${encodeURIComponent(runId)}/${stream}?tail=2000`);
-    $("#rd-log",m).textContent = l.content || "(空)";
+    el.textContent = l.content || "(空)";
+    if (pinned) el.scrollTop = el.scrollHeight;
   };
   m.querySelectorAll(".tabs-mini button[data-l]").forEach(b => b.onclick = () => {
     stream = b.dataset.l; m.querySelectorAll(".tabs-mini button").forEach(x=>x.classList.remove("active"));
     b.classList.add("active"); loadLog();
   });
   $("#rd-refresh",m).onclick = loadLog;
-  $("#rd-close",m).onclick = () => m.remove();
+  $("#rd-auto",m).onchange = e => {
+    if (e.target.checked) { timer = setInterval(() => { loadMeta(); loadLog(); }, 3000); }
+    else if (timer) { clearInterval(timer); timer = null; }
+  };
+  $("#rd-close",m).onclick = () => { if (timer) clearInterval(timer); m.remove(); };
   loadMeta(); loadLog();
 }
 
@@ -493,7 +509,8 @@ async function tabQueue() {
     <td><div>${it.est_cpu} 核 / ${it.est_mem_mb}MB</div>
         <div class="hint">实测 ${it.live_cpu_cores??"–"} 核 / ${it.live_mem_mb??"–"}MB</div></td>
     <td class="mono">${esc(hhmmss(it.started_at))}</td>
-    <td><button class="act danger" data-stop="${esc(it.job_id)}|${esc(it.run_id)}">停止</button></td></tr>`;
+    <td><button class="act" data-log="${esc(it.job_id)}|${esc(it.run_id)}">日志</button>
+        <button class="act danger" data-stop="${esc(it.job_id)}|${esc(it.run_id)}">停止</button></td></tr>`;
   const wp = pageSlice(q.waiting, "q-wait");
   const rp = pageSlice(q.running, "q-run");
   $("#view").innerHTML = `
@@ -508,6 +525,9 @@ async function tabQueue() {
       <tbody>${rp.rows.map(rRow).join("") || '<tr><td colspan="7" class="hint" style="padding:16px">无运行中任务</td></tr>'}</tbody></table>
       ${q.running.length > PAGE_SIZE ? pagerHtml(q.running.length, rp.p, rp.pages, "q-run") : ""}</div>`;
   bindPager(loadTab);
+  document.querySelectorAll("[data-log]").forEach(b => b.onclick = () => {
+    const [j,rid] = b.dataset.log.split("|"); openRun(j,rid);
+  });
   document.querySelectorAll("[data-stop]").forEach(b => b.onclick = async () => {
     if (!confirm("确认停止该运行？将发送 SIGTERM（任务可保存断点，本轮结束后不自动重排队）。")) return;
     const [j, rid] = b.dataset.stop.split("|");

@@ -174,6 +174,10 @@ def test_p1_e_build_env_injects_error_rules_and_home(home):
     # 未提供 error_rules 时不注入
     env2 = runner.build_env(Path("/tmp/t"), "j", "r", "manual", 1, "2026-01-01", {})
     assert "SCHED_ERROR_RULES" not in env2
+    # stdout/stderr 实时可见：任务子进程强制无缓冲（即使 task.json env 想关也覆盖）
+    env3 = runner.build_env(Path("/tmp/t"), "j", "r", "manual", 1, "2026-01-01",
+                            {"PYTHONUNBUFFERED": "0"})
+    assert env3["PYTHONUNBUFFERED"] == "1"
 
 
 def test_p1_e_sdk_loads_error_rules_from_env(tmp_path, monkeypatch):
@@ -338,6 +342,34 @@ def test_p2_jsonl_rotation_bounded(home):
         assert store_mod.read_jsonl(p2) == [{"n": 2}]
     finally:
         store_mod.ROTATE_MAX_BYTES = 16 * 1024 * 1024
+
+
+def test_p2_stdout_streams_to_disk_while_running(home):
+    """运行中日志实时可见：子进程强制 PYTHONUNBUFFERED + 泵线程逐 chunk flush，
+    不主动 flush 的 print 也必须在进程退出前出现在日志文件里。"""
+    code = (
+        "import time\n"
+        "for i in range(8):\n"
+        "    print('heartbeat', i)\n"   # 故意不 flush：靠调度器强制无缓冲
+        "    time.sleep(0.25)\n"
+    )
+    spec = _make_spec(home, "streamer", code=code)
+    out_box = {}
+    def go():
+        out_box["out"] = runner.execute(spec)
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    p = runlog.stdout_path("streamer", "r1")
+    saw = False
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if p.exists() and "heartbeat" in p.read_text(errors="replace"):
+            saw = True
+            break
+        time.sleep(0.1)
+    t.join(timeout=10)
+    assert saw, "运行中应能在日志文件读到已输出内容"
+    assert out_box["out"].status == runlog.STATUS_SUCCESS
 
 
 def test_p2_instance_lock_mutual_exclusion(home, make_settings):

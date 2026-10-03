@@ -118,6 +118,32 @@ def test_stop_running_run(home, make_settings):
     assert not [it for it in svc.state.wq if it["job_id"] == "long_job"]
 
 
+def test_running_run_detail_and_logs_accessible(home, make_settings):
+    """运行中的 run 尚未落 jsonl：详情接口从内存态合成，日志接口直接读实时文件。"""
+    write_task(home, "live_log_job", real_sleep=1.0, total=30)
+    svc = SchedulerService(make_settings(run_user=""))
+    svc.register_job("live_log_job")
+    c = TestClient(web.create_app(svc))
+    rec = svc.trigger("live_log_job", trigger="manual")
+    svc._tick_admission()
+    assert _wait(lambda: bool(svc.running)), "任务应已起跑"
+    rid = rec["run_id"]
+    d = c.get(f"/api/runs/live_log_job/{rid}")
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["status"] == "running" and body["run_id"] == rid
+    assert body["job_id"] == "live_log_job" and body["started_at"]
+    # 不属于该 job 的 run_id → 404；完全不存在 → 404
+    assert c.get(f"/api/runs/other_job/{rid}").status_code == 404
+    assert c.get("/api/runs/live_log_job/nope").status_code == 404
+    # 日志接口对运行中 run 可读（任务 print 有输出或空内容均合法，不能 404/500）
+    for stream in ("stdout", "stderr"):
+        r = c.get(f"/api/logs/live_log_job/{rid}/{stream}?tail=100")
+        assert r.status_code == 200, r.text
+        assert "content" in r.json() and r.json()["eof"] is True
+    assert c.get(f"/api/logs/live_log_job/{rid}/bogus").status_code == 400
+
+
 def test_delete_run_history_only_and_with_files(home, make_settings):
     write_task(home, "del_job", real_sleep=0.01, total=3)
     svc = SchedulerService(make_settings(run_user=""))

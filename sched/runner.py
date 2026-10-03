@@ -81,6 +81,9 @@ def build_env(
     # 让任务进程可 import sched_task_sdk（与 SCHED_HOME 解耦）
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(_PROJECT_ROOT) + (os.pathsep + existing if existing else "")
+    # stdout/stderr 接管道时 Python 默认块缓冲：运行中看日志会一直是空文件直到
+    # 缓冲区满或进程退出。强制无缓冲，让管理台「日志」对运行中任务真正实时。
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 
@@ -204,6 +207,7 @@ def _pump_stream(src, dst_path: Path, max_bytes: int) -> None:
                 if written < max_bytes:
                     room = max_bytes - written
                     out.write(chunk[:room])
+                    out.flush()  # 每个 chunk 立即落盘：管理台要实时读运行中日志
                     written += min(len(chunk), room)
                     if len(chunk) > room and not marked:
                         out.write(TRUNCATE_HEAD)

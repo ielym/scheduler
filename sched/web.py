@@ -183,10 +183,22 @@ def create_app(svc) -> FastAPI:
 
     @app.get("/api/runs/{job_id}/{run_id}")
     def run_detail(job_id: str, run_id: str):
+        # 同一 run_id 可能断点重入队再次运行（如 recover 去重后沿用旧 id）：
+        # 内存态优先，否则 jsonl 里上一轮的 interrupted 终态行会遮蔽真实状态。
+        with svc._lock:
+            re = svc.running.get(run_id)
+            if re is not None and re.run.get("job_id") == job_id:
+                r = dict(re.run)
+                r.setdefault("status", runlog.STATUS_RUNNING)
+                r.setdefault("exit_code", None)
+                r.setdefault("finished_at", None)
+                r.setdefault("duration_ms", None)
+                r.setdefault("reason", "运行中（记录将在结束时写入历史）")
+                return r
         rec = runlog.find_run(run_id)
-        if not rec or rec.get("job_id") != job_id:
-            raise HTTPException(404, "run 不存在")
-        return rec
+        if rec and rec.get("job_id") == job_id:
+            return rec
+        raise HTTPException(404, "run 不存在")
 
     @app.get("/api/logs/{job_id}/{run_id}/{stream_name}")
     def logs(job_id: str, run_id: str, stream_name: str, tail: int = Query(0, ge=0, le=5000),
