@@ -124,6 +124,10 @@ class Settings(BaseModel):
     preempt_exempt_sec: float = 60.0      # 任务启动后的抢占豁免期
     data_risk_max_reschedules: int = 3    # 110 数据风险二刷轮数上限
     hot_reload_sec: float = 30.0          # serve 主循环周期性热加载 jobs.json/tasks 目录
+    # ---- 资源错误反压（动态提交思想落地）：某子任务窗口内连续多次资源错误退出 → 暂停其新准入 ----
+    res_backoff_window_sec: float = 60.0     # 观测窗口
+    res_backoff_threshold: int = 5           # 窗口内失败次数达此值触发退避
+    res_backoff_duration_sec: float = 180.0  # 退避持续时长
 
     @field_validator("timezone")
     @classmethod

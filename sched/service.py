@@ -73,6 +73,10 @@ class SchedulerService:
         # 抢占后恢复保护期（被抢者重入队后短期内不再被抢）
         self.preempt_exempt_sec = float(self.settings.preempt_exempt_sec)
 
+        # 资源错误反压：subtask -> 最近失败时间戳（monotonic）+ 退避截止时间
+        self._res_failures: dict[str, list[float]] = {}
+        self._backoff_until: dict[str, float] = {}
+
         # 运行中动态画像采样节流间隔
         self.profile_live_interval_sec = max(5.0, float(self.settings.resource.profile_live_interval_sec))
         self._last_profile_save_monotonic = 0.0
@@ -183,6 +187,22 @@ class SchedulerService:
         if recovered:
             _scanner.save_intents_state(state)
             log.info("recovered %d running intents after restart", recovered)
+
+    def _record_res_failure(self, stid: str) -> None:
+        """记录一次资源错误退出，窗口内达阈值则触发该子任务的准入退避（反压）。"""
+        now = time.monotonic()
+        win = float(self.settings.res_backoff_window_sec)
+        ts = self._res_failures.setdefault(stid, [])
+        ts.append(now)
+        ts[:] = [t for t in ts if now - t <= win]
+        if len(ts) >= int(self.settings.res_backoff_threshold):
+            self._backoff_until[stid] = now + float(self.settings.res_backoff_duration_sec)
+            self._res_failures[stid] = []
+            log.warning("子任务 %s 资源错误反压：%.0fs 内 %d 次失败，暂停准入 %.0fs",
+                        stid, win, len(ts), float(self.settings.res_backoff_duration_sec))
+
+    def _is_backoff(self, stid: str) -> bool:
+        return time.monotonic() < self._backoff_until.get(stid or "", 0.0)
 
     def register_subtask(self, name: str) -> dict:
         """导入一个子任务目录（必须含 manifest.json）。"""
@@ -366,7 +386,9 @@ class SchedulerService:
     def _tick_admit(self) -> None:
         """准出：排序 → admission_scan 虚拟账本 → 拉起进程。"""
         with self._lock:
-            items = [it for it in self.state.wq if not self._not_before_pending(it)]
+            items = [it for it in self.state.wq
+                     if not self._not_before_pending(it)
+                     and not self._is_backoff(it.get("subtask_id"))]
         if not items:
             return
 
@@ -786,6 +808,10 @@ class SchedulerService:
         # 非终结 → 续跑/重试
         resume_ref = decision.action == "resume"
         nb = decision.not_before
+
+        # 资源错误回退（retry）→ 计入反压计数（动态提交：出问题就退避，别继续塞）
+        if decision.action == "retry":
+            self._record_res_failure(stid)
 
         # second_pass：特殊处理（可选二刷，这里简化为重入队）
         if decision.action == "second_pass":
