@@ -76,6 +76,8 @@ class SchedulerService:
         # 资源错误反压：subtask -> 最近失败时间戳（monotonic）+ 退避截止时间
         self._res_failures: dict[str, list[float]] = {}
         self._backoff_until: dict[str, float] = {}
+        # 动态并发：subtask -> 当前并发上限（AIMD：成功放量/资源错误缩量）
+        self._cur_limit: dict[str, int] = {}
 
         # 运行中动态画像采样节流间隔
         self.profile_live_interval_sec = max(5.0, float(self.settings.resource.profile_live_interval_sec))
@@ -203,6 +205,12 @@ class SchedulerService:
 
     def _is_backoff(self, stid: str) -> bool:
         return time.monotonic() < self._backoff_until.get(stid or "", 0.0)
+
+    def _cur_concurrency(self, stid: str) -> int:
+        return self._cur_limit.get(stid, int(self.settings.resource.init_concurrency))
+
+    def _running_count(self, stid: str) -> int:
+        return sum(1 for re in self.running.values() if re.run.get("subtask_id") == stid)
 
     def register_subtask(self, name: str) -> dict:
         """导入一个子任务目录（必须含 manifest.json）。"""
@@ -432,6 +440,11 @@ class SchedulerService:
 
         stid = it["subtask_id"]
         rid = it["request_id"]
+        # per-subtask 动态并发上限检查（超出则放回 WQ 等待下一轮）
+        if self._running_count(stid) >= self._cur_concurrency(stid):
+            with self._lock:
+                self.state.enqueue(it)
+            return
         e = self.entries.get(stid)
         if e is None or not e.ok or e.doc is None:
             return
@@ -724,6 +737,14 @@ class SchedulerService:
             self.running.pop(rec["run_id"], None)
         self.ledger.release(rec["run_id"])
         cgroup.Cgroup(re.cgroup_name).remove()
+
+        # AIMD 动态并发调节：成功放量（+1，上限 max_running），资源错误缩量（减半，下限 1）
+        stid = rec.get("subtask_id")
+        cur = self._cur_concurrency(stid)
+        if outcome.status == "success":
+            self._cur_limit[stid] = min(int(self.settings.resource.max_running), cur + 1)
+        elif outcome.status == "resource":
+            self._cur_limit[stid] = max(1, cur // 2)
 
         rec["status"] = outcome.status
         rec["reason"] = outcome.reason

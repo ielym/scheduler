@@ -95,6 +95,8 @@ class ResourceConfig(BaseModel):
     external_safety_margin_mb: int = 512
     # 最大并发运行进程数：CPU/内存再空闲也不超过此上限，防文件描述符/进程数耗尽
     max_running: int = 50
+    # 每个子任务初始并发上限：保守起量，运行健康后逐步放量（成功 +1），资源错误则缩量（减半）
+    init_concurrency: int = 8
 
 
 class WebConfig(BaseModel):
