@@ -49,9 +49,12 @@ class Cgroup:
         从不直接放进程（run 都在叶子），故可以安全委派。失败静默降级。
         """
         parts = [p for p in self.name.split("/") if p and p != "."]
-        ancestor = FALLBACK_ROOT
+        # 需要委派的所有层：sched 根层 + 每个中间层（不含叶子 rid 层）。
+        # 关键：必须先从 sched 根层开始委派，否则下面的 subtask/叶子收不到 memory 控制器。
+        levels = [FALLBACK_ROOT]
         for part in parts[:-1]:
-            ancestor = ancestor / part
+            levels.append(levels[-1] / part)
+        for ancestor in levels:
             sc = ancestor / "cgroup.subtree_control"
             if not sc.exists():
                 continue
