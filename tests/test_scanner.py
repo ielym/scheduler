@@ -45,7 +45,7 @@ class TestScanSubtask:
         tasks = _setup_subtask(env)
         intent = {"schema_version": 1, "request_id": "abc123", "kind": "oneshot",
                   "config": "", "priority": 50, "resources": {"cpu": 0.1, "memory_mb": 16},
-                  "lifetime": {"completion": "terminal", "retry": {"max_attempts": 0}}}
+                  "lifetime": {"completion": "terminal", "retry": {}}}
         (tasks / "requests" / "abc123.json").write_text(json.dumps(intent), encoding="utf-8")
         diff = scan_mod.scan_subtask("hello", tasks)
         assert len(diff.new_requests) == 1

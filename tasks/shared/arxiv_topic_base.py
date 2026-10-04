@@ -149,7 +149,6 @@ class TopicController(OneshotTask):
                 lifetime={
                     "completion": "terminal",
                     "retry": {
-                        "max_attempts": 3,
                         "backoff_base_sec": 10,
                         "backoff_cap_sec": 600,
                         "not_after": "",

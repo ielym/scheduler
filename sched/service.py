@@ -178,7 +178,7 @@ class SchedulerService:
             if os.geteuid() == 0:
                 self._chown_tree(task_dir, pw.pw_uid, pw.pw_gid)
 
-        # 跑三闸：schema + entry 可执行 + 容量预估
+        # 跑双闸：schema + 契约可执行（dry 跑通 exit 0）
         self._check_gates(doc, task_dir)
 
         # 写入基线画像

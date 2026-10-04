@@ -102,13 +102,6 @@ def _cmd_start(args) -> int:
     return 0
 
 
-def _cmd_stop_run(args) -> int:
-    svc = _service().SchedulerService()
-    # 我们不调 start()，仅 stop 某个已经在跑的 run（需要调度器已在运行）
-    print("提示：stop_run 需调度器已启动；仅支持在 serve 进程内调用（或用 process stop）", file=sys.stderr)
-    return 2
-
-
 def _cmd_serve(args) -> int:
     svc = _service().SchedulerService()
     if args.web:

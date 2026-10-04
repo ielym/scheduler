@@ -60,7 +60,6 @@ def bootstrap_one(task_id: str) -> bool:
         lifetime={
             "completion": "terminal",
             "retry": {
-                "max_attempts": 1,
                 "backoff_base_sec": 5,
                 "backoff_cap_sec": 60,
                 "not_after": "",

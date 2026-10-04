@@ -11,14 +11,6 @@
 
 from __future__ import annotations
 
-from enum import Enum
-
-
-class Category(str, Enum):
-    RESOURCE = "resource"
-    LOGIC = "logic"
-    UNCLASSIFIED = "unclassified"
-
 
 # 退出码保留段（协议 A2：与任务 SDK 约定）
 EXIT_OK = 0
@@ -37,31 +29,3 @@ EXIT_SIGKILL = 137          # 128+9 —— 需要归因：cgroup OOM / 调度器
 
 RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE,
                        EXIT_DATA_RISK, EXIT_SKIP_SCHEDULE}
-
-
-def classify_exit_code(code: int | None) -> tuple[str, str]:
-    """按退出码做兜底归类，返回 (category, reason)。
-
-    99=干净抢占、100/101=资源、102=调度跳过（任务自治时机判断）、110=数据风险、137=待归因；
-    其余非 0（含通用 1）一律按 G5 归为 unclassified → 调度器按资源错误重试，
-    倒逼任务通过 last_error.category 显式上报逻辑错误（宁重试不错杀）。
-    """
-    if code == EXIT_OK:
-        return Category.RESOURCE.value, "success"  # 成功不算失败，不该走到这里
-    if code == EXIT_PREEMPTED:
-        return Category.UNCLASSIFIED.value, "preempted"
-    if code == EXIT_SKIP_SCHEDULE:
-        return Category.UNCLASSIFIED.value, "schedule_skip"
-    if code in (EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE):
-        return Category.RESOURCE.value, f"exit_code_{code}"
-    if code == EXIT_DATA_RISK:
-        return Category.LOGIC.value, "data_risk"
-    if code == EXIT_SIGKILL:
-        return Category.UNCLASSIFIED.value, "sigkill_pending_attribution"
-    # 无任务自报分类时，未知非 0 退出码一律按资源错误处理（可重试）
-    return Category.UNCLASSIFIED.value, f"exit_code_{code}_unclassified"
-
-
-def is_retryable_category(category: str) -> bool:
-    """resource 与 unclassified（未分类错误兜底按资源处理）都可重试；logic 不可重试。"""
-    return category in (Category.RESOURCE.value, Category.UNCLASSIFIED.value)

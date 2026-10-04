@@ -132,7 +132,7 @@ def decide_from_exit(exit_code: int | None, directive: ControlDirective,
         return ExitDecision(terminal=True, directive=directive, action="done")
 
     if exit_code == err.EXIT_PREEMPTED:
-        # 抢占/停止：断点已保存 → 续跑同意图，attempt 不递增
+        # 抢占/停止：断点已保存 → 续跑同意图
         return ExitDecision(terminal=False, directive=directive, action="resume")
 
     if exit_code == err.EXIT_DATA_RISK:
@@ -140,14 +140,14 @@ def decide_from_exit(exit_code: int | None, directive: ControlDirective,
         return ExitDecision(terminal=False, directive=directive, action="second_pass")
 
     if exit_code == err.EXIT_SKIP_SCHEDULE:
-        # 任务判定当前不该跑（时间窗/节假日等）：跳过本轮，稍后重排再给机会，不计 attempt。
+        # 任务判定当前不该跑（时间窗/节假日等）：跳过本轮，稍后重排再给机会。
         # 精确的"下次时机"应由任务用 reschedule(delay) 表达；此处给一个保守兜底延迟。
         nb = _not_before(now, base)
         return ExitDecision(terminal=False, directive=directive, action="skip",
                              not_before=nb)
 
     if exit_code in (err.EXIT_RESOURCE, err.EXIT_EXTERNAL_RESOURCE):
-        # 资源不足/冲突：回退 pending 等待合适时机，不计 attempt、不做失败记录。
+        # 资源不足/冲突：回退 pending 等待合适时机，不做失败记录。
         # 资源不足是调度器"等资源"的责任，不是任务失败；退避用固定 base 防热循环。
         nb = _not_before(now, base)
         return ExitDecision(terminal=False, directive=directive, action="retry",
@@ -159,7 +159,7 @@ def decide_from_exit(exit_code: int | None, directive: ControlDirective,
         return ExitDecision(terminal=False, directive=directive, action="retry",
                              not_before=nb)
 
-    # 其他非 0：兜底按资源错误处理（倒逼正确分类），回退 pending 不计 attempt
+    # 其他非 0：兜底按资源错误处理（倒逼正确分类），回退 pending
     nb = _not_before(now, base)
     return ExitDecision(terminal=False, directive=directive, action="retry",
                          not_before=nb)
