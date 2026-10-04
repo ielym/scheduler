@@ -416,9 +416,9 @@ class SchedulerService:
         est_cpu, est_mem = admission.estimate_job(prof, declared_cpu, declared_mem,
                                                    self.settings.resource.overshoot, self.capacity)
         if est_mem <= 0:
-            est_mem = self.capacity.total_memory_mb // 4
+            est_mem = declared_mem
         if est_cpu <= 0:
-            est_cpu = 0.1
+            est_cpu = declared_cpu or 0.1
 
         self.ledger.reserve(run_id, est_cpu, est_mem)
         # cgroup 硬限用声明值做保护下限：画像再低也不把任务限太死（防正常抖动被节流/OOM）
@@ -654,7 +654,9 @@ class SchedulerService:
         e = self.entries.get(stid)
         mcpu = float(e.doc.resources.cpu if e and e.doc else 0)
         mmem = int(e.doc.resources.memory_mb if e and e.doc else 0)
-        self.profiles.record_live(stid, round(re.live_cpu_cores, 3), re.live_mem_mb,
+        # mem 读不到（cgroup memory 降级）时用声明值兜底，避免 0 污染画像
+        mem_sample = re.live_mem_mb if re.live_mem_mb > 0 else mmem
+        self.profiles.record_live(stid, round(re.live_cpu_cores, 3), mem_sample,
                                    mcpu, mmem, window=self.settings.resource.window_samples)
         if now_mono - self._last_profile_save_monotonic >= self.profile_live_interval_sec:
             self._last_profile_save_monotonic = now_mono
