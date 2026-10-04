@@ -38,49 +38,23 @@ def _setup_task(tmp: Path) -> Path:
 
 
 class TestGates:
-    def test_three_gates_pass(self, env):
+    def test_gates_pass(self, env):
         task_dir = _setup_task(env)
         gates = ctr_mod.ContractGates()
-        ok, results, profile = gates.run_all_gates(_min_doc(), task_dir)
+        ok, results = gates.run_all_gates(_min_doc(), task_dir)
         assert ok
-        assert len(results) == 3
+        assert len(results) == 2
         assert all(r.ok for r in results)
-
-    def test_gate1_rejects_missing_entry(self, env):
-        task_dir = _setup_task(env)
-        doc = _min_doc()
-        doc.entry.file = "nonexistent.py"
-        gates = ctr_mod.ContractGates()
-        # 闸1（parse_manifest 内部）会因为 entry.file 不存在 raise
-        # run_all_gates 调 parse_manifest → 捕获 ManifestError 并把 gate1 置 failed
-        try:
-            ok, results, _ = gates.run_all_gates(doc, task_dir)
-        except m.ManifestError as e:
-            # 闸1 捕获路径
-            ok = False
-        assert ok is False
 
     def test_gate2_rejects_bad_exit(self, env):
         task_dir = _setup_task(env)
-        # 把 run.py 改成 exit 1
-        (task_dir / "run.py").write_text("import sys; sys.exit(1)")
+        (task_dir / "run.py").write_text("import sys; sys.exit(1)")  # 改成 exit 1
         gates = ctr_mod.ContractGates()
-        ok, results, _ = gates.run_all_gates(_min_doc(), task_dir)
+        ok, results = gates.run_all_gates(_min_doc(), task_dir)
         assert ok is False
-        # 闸2 失败
         gate2 = next(r for r in results if r.gate == "gate2_contract")
         assert gate2.ok is False
         assert "退出码非 0" in gate2.reason
-
-    def test_gate3_rejects_declared_over_capacity(self, env):
-        task_dir = _setup_task(env)
-        doc = _min_doc()
-        doc.resources.memory_mb = 1024 * 1024  # 夸张声明
-        gates = ctr_mod.ContractGates()
-        ok, results, _ = gates.run_all_gates(doc, task_dir)
-        assert ok is False
-        gate3 = next(r for r in results if r.gate == "gate3_capacity")
-        assert gate3.ok is False
 
 
 class TestParseManifest:

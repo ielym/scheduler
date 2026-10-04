@@ -26,33 +26,75 @@ class AdmissionResult:
 
 def order_waiting(items: list[dict], starvation_sec: float, now_iso: str,
                   get_duration_sec: Callable[[str], float | None] | None = None) -> list[dict]:
-    """排序：饿死提权 > priority 降序 > 同优先级 SJF（预估时长升序）> FIFO。
+    """排序：饿死提权 > priority 降序；同优先级内：
+    - 已有实际运行数据（画像有预估时长）→ SJF（短作业优先）→ FIFO；
+    - 尚无数据（冷启动）→ round-robin（每个 subtask 一人一个轮流）。
 
-    enqueued_at 为带时区 ISO 串（按字典序即时间序）；等待时长用 wall-clock 差值估，
-    跨重启安全（不依赖 monotonic 基准）。无历史时长样本的任务按 +inf 处理
-    （未知=可能很长，排在已知短作业之后），彼此间仍按 FIFO。
+    保证同优先级公平，杜绝"先入队者独占 FIFO"。
     """
+    from collections import defaultdict
+
     from .runlog import _iso_seconds_between  # 延迟导入避免环
 
     def _waited(enqueued: str) -> float:
         return _iso_seconds_between(enqueued, now_iso)
 
-    def _rank(it: dict) -> tuple[int, float, str]:
+    def _dur(it: dict) -> float | None:
+        if get_duration_sec is None:
+            return None
+        try:
+            return get_duration_sec(str(it.get("subtask_id") or ""))
+        except Exception:
+            return None
+
+    # 1) 饿死提权层：等待超阈值者先出列（内部仍按等待时长 FIFO）
+    boosted: list[dict] = []
+    normal: list[dict] = []
+    for it in items:
         pri = int(it.get("priority") or 0)
         enq = it.get("enqueued_at") or ""
-        if _waited(enq) >= starvation_sec:
-            # 饿死看门狗提权钳制在值域 0~100 之上 1 级（=101）：
-            # 保证优先于普通排队，又不越界到天级别
-            pri = 101
-        dur = None
-        if get_duration_sec is not None:
-            try:
-                dur = get_duration_sec(str(it.get("subtask_id") or ""))
-            except Exception:
-                dur = None
-        return (-pri, float(dur) if dur is not None else float("inf"), enq)
+        it = dict(it)
+        it["_pri"] = 101 if _waited(enq) >= starvation_sec else pri
+        (boosted if it["_pri"] == 101 else normal).append(it)
+    boosted.sort(key=lambda it: it.get("enqueued_at") or "")
 
-    return sorted(items, key=_rank)
+    # 2) 正常层按 priority 分组（降序）
+    groups: dict[int, list[dict]] = defaultdict(list)
+    for it in normal:
+        groups[it["_pri"]].append(it)
+
+    ordered: list[dict] = list(boosted)
+    for pri in sorted(groups, key=lambda p: -int(p)):
+        group = groups[pri]
+        if any(_dur(it) is not None for it in group):
+            # 有实际运行数据 → SJF（预估短作业先）→ FIFO
+            def _sjf_key(it: dict) -> tuple[float, str]:
+                d = _dur(it)
+                return (float(d) if d is not None else float("inf"), it.get("enqueued_at") or "")
+
+            group.sort(key=_sjf_key)
+            ordered.extend(group)
+        else:
+            # 无数据（冷启动）→ round-robin：每个 subtask 一人一个轮流
+            ordered.extend(_round_robin(group))
+    return ordered
+
+
+def _round_robin(group: list[dict]) -> list[dict]:
+    """同优先级无画像数据时的公平轮转：按 subtask 分组（组内 FIFO），逐轮各取一个。"""
+    from collections import defaultdict
+
+    by_sid: dict[str, list[dict]] = defaultdict(list)
+    for it in group:
+        by_sid[str(it.get("subtask_id") or "")].append(it)
+    queues = [sorted(by_sid[sid], key=lambda it: it.get("enqueued_at") or "")
+              for sid in sorted(by_sid)]
+    out: list[dict] = []
+    while any(queues):
+        for q in queues:
+            if q:
+                out.append(q.pop(0))
+    return out
 
 
 def estimate_job(profile: resources.Profile, declared_cpu: float, declared_mem_mb: int, overshoot: float,

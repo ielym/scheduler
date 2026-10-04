@@ -118,7 +118,7 @@ class Settings(BaseModel):
     # 非 root 执行用户；为空 = 以调度器当前用户运行；系统无此用户时自动降级为空
     run_user: str = ""
     # ---- 调度行为参数（引擎内部，不进管理台；任务自治参数在意图文件 lifetime.retry 段）----
-    starvation_sec: float = 3600.0        # 饿死看门狗阈值（1h）
+    starvation_sec: float = 60.0          # 饿死看门狗阈值（60s，同优先级冷启动轮转的兜底）
     preempt_exempt_sec: float = 60.0      # 任务启动后的抢占豁免期
     data_risk_max_reschedules: int = 3    # 110 数据风险二刷轮数上限
     hot_reload_sec: float = 30.0          # serve 主循环周期性热加载 jobs.json/tasks 目录

@@ -23,23 +23,25 @@ class TestExitDecision:
         assert d.action == "resume"
         assert d.attempt_increment is False
 
-    def test_resource_error_retries_with_backoff(self):
+    def test_resource_error_retries_without_failure_record(self):
         d = ctrl_mod.decide_from_exit(errors.EXIT_RESOURCE,
                                        ctrl_mod.ControlDirective(action="none"),
                                        lifetime_retry={"max_attempts": 0, "backoff_base_sec": 5, "backoff_cap_sec": 300},
                                        attempt=3)
         assert d.terminal is False
         assert d.action == "retry"
-        assert d.attempt_increment is True
-        assert d.not_before  # 有延迟
+        assert d.attempt_increment is False  # 资源不足不算失败，不计 attempt
+        assert d.not_before  # 有固定退避防热循环
 
-    def test_resource_error_hits_max_attempts_terminal(self):
+    def test_resource_error_never_terminal_by_attempts(self):
+        # 资源不足不是任务失败，即使 attempt 已大也不终结，回退 pending 等待
         d = ctrl_mod.decide_from_exit(errors.EXIT_EXTERNAL_RESOURCE,
                                        ctrl_mod.ControlDirective(action="none"),
                                        lifetime_retry={"max_attempts": 3, "backoff_base_sec": 5, "backoff_cap_sec": 300},
                                        attempt=3)
-        assert d.terminal is True
-        assert d.action == "done"
+        assert d.terminal is False
+        assert d.action == "retry"
+        assert d.attempt_increment is False
 
     def test_stop_directive_overrides_exit_code(self):
         # 即使 exit_code=0，只要 stop directive 就终结
@@ -87,6 +89,16 @@ class TestExitDecision:
                                        attempt=1)
         assert d.terminal is False
         assert d.action == "retry"
+        assert d.attempt_increment is False  # 未分类按资源处理，不计失败
+
+    def test_exit_102_skips_schedule(self):
+        d = ctrl_mod.decide_from_exit(errors.EXIT_SKIP_SCHEDULE,
+                                       ctrl_mod.ControlDirective(action="none"),
+                                       lifetime_retry=None, attempt=1)
+        assert d.terminal is False
+        assert d.action == "skip"
+        assert d.attempt_increment is False
+        assert d.not_before  # 有兜底延迟
 
 
 class TestControlDirective:

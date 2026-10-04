@@ -570,11 +570,12 @@ class SchedulerService:
             st, age = self._read_task_state(Path(re.run["task_dir"]), re.run.get("run_id", ""))
             if age >= 1e8:
                 age = max(0.0, time.monotonic() - re.started_monotonic)
+            self._sample_live_cpu(re)
             actual = self._cgroup_live_mem(re.cgroup_name)
             if actual is not None:
-                self.ledger.set_actual(re.run["run_id"], 0.0, actual)
                 re.live_mem_mb = actual
-            self._sample_live_cpu(re)
+            if actual is not None or re.live_cpu_cores > 0:
+                self.ledger.set_actual(re.run["run_id"], re.live_cpu_cores, actual or 0)
             self._maybe_record_live_profile(re)
             e = self.entries.get(re.run["subtask_id"])
             hb_timeout = None
@@ -678,17 +679,24 @@ class SchedulerService:
             rec["finished_at"] = outcome.finished_at
         rec.setdefault("state_snapshot", {})
 
-        # 画像更新
-        if outcome.memory_peak_mb > 0:
-            duration_sec = max(1, int((rec.get("duration_ms") or 0) / 1000))
-            avg_cpu = round(outcome.cpu_usage_usec / 1_000_000 / duration_sec, 3)
-            e = self.entries.get(rec.get("subtask_id"))
-            mcpu = float(e.doc.resources.cpu if e and e.doc else 0)
-            mmem = int(e.doc.resources.memory_mb if e and e.doc else 0)
-            self.profiles.record(rec["subtask_id"], avg_cpu, outcome.memory_peak_mb,
+        # 画像更新：时长只要有真实运行就记（成功/失败/抢占都算），让 SJF 有数据可用
+        duration_sec = max(1, int((rec.get("duration_ms") or 0) / 1000))
+        e = self.entries.get(rec.get("subtask_id"))
+        mcpu = float(e.doc.resources.cpu if e and e.doc else 0)
+        mmem = int(e.doc.resources.memory_mb if e and e.doc else 0)
+        if outcome.memory_peak_mb > 0 or outcome.cpu_usage_usec > 0:
+            # 有真实资源用量才记资源样本（避免 0 污染画像）
+            avg_cpu = (round(outcome.cpu_usage_usec / 1_000_000 / duration_sec, 3)
+                       if outcome.cpu_usage_usec > 0 else mcpu)
+            self.profiles.record(rec["subtask_id"], avg_cpu,
+                                 outcome.memory_peak_mb if outcome.memory_peak_mb > 0 else mmem,
                                  mcpu, mmem, window=self.settings.resource.window_samples,
-                                 duration_sec=(duration_sec if outcome.status == "success" else None))
-            self.profiles.save()
+                                 duration_sec=duration_sec)
+        else:
+            # 无资源样本（如进程很快失败/被 SIGKILL），仍记时长支撑 SJF
+            self.profiles.record_duration(rec["subtask_id"], duration_sec,
+                                          window=self.settings.resource.window_samples)
+        self.profiles.save()
 
         # run 记录落盘
         runlog.append_run(rec)

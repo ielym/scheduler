@@ -108,8 +108,6 @@ def decide_from_exit(exit_code: int | None, directive: ControlDirective,
     if now is None:
         now = datetime.now().astimezone()
     retry_cfg = lifetime_retry or {}
-    max_attempts = int(retry_cfg.get("max_attempts") or 0)
-    cap = float(retry_cfg.get("backoff_cap_sec") or 300)
     base = float(retry_cfg.get("backoff_base_sec") or 5)
 
     # --- 运行时 control 优先 ---
@@ -143,25 +141,27 @@ def decide_from_exit(exit_code: int | None, directive: ControlDirective,
         return ExitDecision(terminal=False, directive=directive, action="second_pass",
                             attempt_increment=False)
 
+    if exit_code == err.EXIT_SKIP_SCHEDULE:
+        # 任务判定当前不该跑（时间窗/节假日等）：跳过本轮，稍后重排再给机会，不计 attempt。
+        # 精确的"下次时机"应由任务用 reschedule(delay) 表达；此处给一个保守兜底延迟。
+        nb = _not_before(now, base)
+        return ExitDecision(terminal=False, directive=directive, action="skip",
+                            attempt_increment=False, not_before=nb)
+
     if exit_code in (err.EXIT_RESOURCE, err.EXIT_EXTERNAL_RESOURCE):
-        # 资源错误：重试同意图；计 attempt；受 max_attempts 约束
-        if max_attempts > 0 and attempt >= max_attempts:
-            return ExitDecision(terminal=True, directive=directive, action="done", attempt_increment=False)
-        # 指数退避：base * 2^(attempt-1)，封顶 cap
-        delay = min(cap, base * (2 ** max(0, attempt - 1)))
-        nb = _not_before(now, delay)
+        # 资源不足/冲突：回退 pending 等待合适时机，不计 attempt、不做失败记录。
+        # 资源不足是调度器"等资源"的责任，不是任务失败；退避用固定 base 防热循环。
+        nb = _not_before(now, base)
         return ExitDecision(terminal=False, directive=directive, action="retry",
-                            attempt_increment=True, not_before=nb)
+                            attempt_increment=False, not_before=nb)
 
     if exit_code == err.EXIT_SIGKILL:
-        # SIGKILL 归因后处理：当前默认视作资源类
-        delay = min(cap, base * (2 ** max(0, attempt - 1)))
-        nb = _not_before(now, delay)
+        # SIGKILL 归因：默认按资源处理（回退 pending，不计 attempt）
+        nb = _not_before(now, base)
         return ExitDecision(terminal=False, directive=directive, action="retry",
-                            attempt_increment=True, not_before=nb)
+                            attempt_increment=False, not_before=nb)
 
-    # 其他非 0：兜底按资源错误处理（倒逼正确分类）
-    delay = min(cap, base * (2 ** max(0, attempt - 1)))
-    nb = _not_before(now, delay)
+    # 其他非 0：兜底按资源错误处理（倒逼正确分类），回退 pending 不计 attempt
+    nb = _not_before(now, base)
     return ExitDecision(terminal=False, directive=directive, action="retry",
-                        attempt_increment=True, not_before=nb)
+                        attempt_increment=False, not_before=nb)

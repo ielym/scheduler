@@ -22,7 +22,9 @@ EXIT_DATA_RISK = 110
 EXIT_LOGIC = 1
 EXIT_SIGKILL = 137
 EXIT_STOP_REQUESTED = 98  # 进程主动 stop（SDK 的 request_stop 路径）
-EXIT_NO_RETRY = 97       # 进程 no_retry 后正常终结
+EXIT_NO_RETRY = 97        # 进程 no_retry 后正常终结
+EXIT_SKIP_SCHEDULE = 102  # 任务判定当前不该跑（时间窗/节假日等），跳过本轮
 
 RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE,
-                       EXIT_DATA_RISK, EXIT_STOP_REQUESTED, EXIT_NO_RETRY, EXIT_SIGKILL}
+                       EXIT_DATA_RISK, EXIT_STOP_REQUESTED, EXIT_NO_RETRY,
+                       EXIT_SKIP_SCHEDULE, EXIT_SIGKILL}
