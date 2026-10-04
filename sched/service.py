@@ -124,6 +124,7 @@ class SchedulerService:
             persist.append_decision({"ts": runlog.now_iso(), "act": "cgroup_degraded",
                                      "reason": "cgroup 不可用"})
         self.refresh()
+        self._recover_running()
         self.started_at = runlog.now_iso()
         self._loop_thread = threading.Thread(target=self._loop, name="sched-loop", daemon=True)
         self._loop_thread.start()
@@ -159,6 +160,29 @@ class SchedulerService:
         with self._lock:
             self.entries = entries
         return {"subtasks": len(entries), "ok": sum(1 for e in entries.values() if e.ok)}
+
+    def _recover_running(self) -> None:
+        """重启恢复：上次 running 的意图，其进程已随 serve 退出而消失。
+
+        把它们重置回 pending 并重新入队（trigger=resume），配合 SDK 断点续跑不重复工作。
+        重置 pending 让下次 scan 不会被当成新意图，重新入队让它们能继续被准出。
+        """
+        state = _scanner.load_intents_state()
+        recovered = 0
+        for stid, rid_map in state.items():
+            for rid, st in rid_map.items():
+                if st.get("status") != "running":
+                    continue
+                st["status"] = "pending"
+                st["run_id"] = ""
+                recovered += 1
+                try:
+                    self._enqueue_intent(stid, rid, trigger="resume", resume_ref=True)
+                except Exception:
+                    log.warning("recover intent %s/%s failed", stid, rid)
+        if recovered:
+            _scanner.save_intents_state(state)
+            log.info("recovered %d running intents after restart", recovered)
 
     def register_subtask(self, name: str) -> dict:
         """导入一个子任务目录（必须含 manifest.json）。"""
