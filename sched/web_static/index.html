@@ -136,11 +136,17 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
 <!-- ============ Tab 2: 子任务管理 ============ -->
 <div class="tab-pane" id="pane-subtasks">
   <div class="toolbar">
+    <button class="btn ghost" onclick="selectAll('subtasksTable',true)">全选</button>
+    <button class="btn ghost" onclick="selectAll('subtasksTable',false)">全不选</button>
+    <button class="btn ghost" onclick="invertSelect('subtasksTable')">反选</button>
+    <button class="btn danger" onclick="batchDeleteSubtasks()">批量删除</button>
+    <span style="flex:1"></span>
     <span id="subtaskPagedInfo" style="color:#6b7280;font-size:12px"></span>
   </div>
   <div style="overflow:auto;border:1px solid #1f2330;border-radius:8px">
     <table id="subtasksTable">
       <thead><tr>
+        <th style="width:34px"><input type="checkbox" onclick="selectAll('subtasksTable',this.checked)"></th>
         <th>子任务名称</th>
         <th style="width:80px">启用</th>
         <th style="width:120px">优先级 <span style="color:#6b7280;font-weight:normal;font-size:11px">(点击修改)</span></th>
@@ -170,12 +176,18 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
       </div>
     </div>
     <span id="procStatusHint" style="color:#6b7280;font-size:12px"></span>
+    <button class="btn ghost" onclick="selectAll('processesTable',true)">全选</button>
+    <button class="btn ghost" onclick="selectAll('processesTable',false)">全不选</button>
+    <button class="btn ghost" onclick="invertSelect('processesTable')">反选</button>
+    <button class="btn danger" onclick="batchStopProcesses()">批量停止</button>
+    <button class="btn danger" onclick="batchDeleteProcesses()">批量删除</button>
     <span style="flex:1"></span>
     <span id="procPagedInfo" style="color:#6b7280;font-size:12px"></span>
   </div>
   <div style="overflow:auto;border:1px solid #1f2330;border-radius:8px">
     <table>
       <thead><tr>
+        <th style="width:34px"><input type="checkbox" onclick="selectAll('processesTable',this.checked)"></th>
         <th>子任务</th>
         <th>进程</th>
         <th>状态</th>
@@ -344,14 +356,14 @@ async function refreshSubtasks(){
       // 4 个状态计数单元格
       const c = summarizeIntents(intents[s.subtask_id]||{});
       const tds = tr.querySelectorAll('td');
-      tds[3].textContent = c.running || '';
-      tds[3].style.color = c.running ? '#4ade80' : '#94a3b8';
-      tds[4].textContent = c.waiting || '';
-      tds[4].style.color = c.waiting ? '#fbbf24' : '#94a3b8';
-      tds[5].textContent = c.done || '';
-      tds[5].style.color = c.done ? '#8ab4ff' : '#94a3b8';
-      tds[6].textContent = c.failed || '';
-      tds[6].style.color = c.failed ? '#f87171' : '#94a3b8';
+      tds[4].textContent = c.running || '';
+      tds[4].style.color = c.running ? '#4ade80' : '#94a3b8';
+      tds[5].textContent = c.waiting || '';
+      tds[5].style.color = c.waiting ? '#fbbf24' : '#94a3b8';
+      tds[6].textContent = c.done || '';
+      tds[6].style.color = c.done ? '#8ab4ff' : '#94a3b8';
+      tds[7].textContent = c.failed || '';
+      tds[7].style.color = c.failed ? '#f87171' : '#94a3b8';
     }
   }
 
@@ -376,6 +388,7 @@ function subtaskRowHTML(s, intentsMap){
   const c = summarizeIntents(intentsMap);
   const n = v => v || '';
   return `<tr data-sid="${s.subtask_id}">
+    <td><input type="checkbox" data-select value="${s.subtask_id}"></td>
     <td><a href="javascript:void(0)" onclick="openSubtask('${s.subtask_id}')">${s.name||s.subtask_id}</a></td>
     <td><label class="switch"><input type="checkbox" data-toggle data-sid="${s.subtask_id}" ${s.enabled?'checked':''}/><span class="slider"></span></label></td>
     <td><span class="pri-val" data-pri-val data-sid="${s.subtask_id}">${s.priority||0}</span></td>
@@ -482,6 +495,7 @@ async function refreshProcesses(){
     const started = i.started_at || i.enqueued_at || null;
     const {label, cls} = _procStatusLabel(i.status);
     return `<tr>
+      <td><input type="checkbox" data-select value="${i.run_id}"></td>
       <td><a href="javascript:void(0)" onclick="openSubtask('${i.subtask_id}')">${i.subtask_id}</a></td>
       <td>
         <div class="rid-col">${i.run_id}</div>
@@ -495,7 +509,7 @@ async function refreshProcesses(){
         <button class="btn danger" onclick="deleteProcess('${i.run_id}')" style="margin-left:6px">删除</button>
       </td>
     </tr>`;
-  }).join('') || `<tr><td colspan="6" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
+  }).join('') || `<tr><td colspan="7" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
   qs('#processesTable').innerHTML = rows;
   qs('#procPagedInfo').textContent = `共 ${d.total||0} · 第 ${procPage}/${Math.max(1,Math.ceil((d.total||0)/procPSize))} 页`;
   renderPage('#procPagination', d.total||0, procPage, procPSize, np=>{procPage=np;refreshProcesses()});
@@ -607,6 +621,53 @@ _timer = setInterval(()=>{
 
 /* ESC 关日志弹窗 */
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') qs('#logModal')?.remove(); });
+
+/* ========== 批量选择 ========== */
+function selectAll(tableId, checked){
+  document.querySelectorAll('#'+tableId+' input[type=checkbox][data-select]').forEach(cb=>cb.checked=checked);
+}
+function invertSelect(tableId){
+  document.querySelectorAll('#'+tableId+' input[type=checkbox][data-select]').forEach(cb=>cb.checked=!cb.checked);
+}
+function selectedIds(tableId){
+  return [...document.querySelectorAll('#'+tableId+' input[type=checkbox][data-select]:checked')].map(cb=>cb.value);
+}
+async function batchDeleteSubtasks(){
+  const sids = selectedIds('subtasksTable');
+  if(!sids.length) return alert('请先勾选要删除的子任务');
+  if(!confirm(`确认删除 ${sids.length} 个子任务？\n（默认不删除本地目录）`)) return;
+  let ok=0, fail=0;
+  for(const sid of sids){
+    try{ await fetch(API+'/api/subtasks/'+encodeURIComponent(sid)+'?delete_dir=false',{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
+    catch(e){ fail++; }
+  }
+  alert(`批量删除完成：成功 ${ok}，失败 ${fail}`);
+  refreshDashboard(true); refreshSubtasks();
+}
+async function batchStopProcesses(){
+  const rids = selectedIds('processesTable');
+  if(!rids.length) return alert('请先勾选要停止的进程');
+  if(!confirm(`确认停止 ${rids.length} 个进程？`)) return;
+  let ok=0, fail=0;
+  for(const rid of rids){
+    try{ await fetch(API+'/api/process/stop/'+encodeURIComponent(rid),{method:'POST'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
+    catch(e){ fail++; }
+  }
+  alert(`批量停止完成：成功 ${ok}，失败 ${fail}`);
+  refreshProcesses(); refreshDashboard(true);
+}
+async function batchDeleteProcesses(){
+  const rids = selectedIds('processesTable');
+  if(!rids.length) return alert('请先勾选要删除的进程');
+  if(!confirm(`确认删除 ${rids.length} 个进程？`)) return;
+  let ok=0, fail=0;
+  for(const rid of rids){
+    try{ await fetch(API+'/api/process/'+encodeURIComponent(rid),{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
+    catch(e){ fail++; }
+  }
+  alert(`批量删除完成：成功 ${ok}，失败 ${fail}`);
+  refreshProcesses(); refreshDashboard(true);
+}
 </script>
 </body>
 </html>
