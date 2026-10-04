@@ -1,300 +1,164 @@
-"""任务基类：托管断点/心跳/抢占退出(99)/错误分类/跳过项。
+"""SDK 基类：SchedTask（daemon 与 oneshot 统一基类）+ DaemonTask + OneshotTask。
 
-路径 B 的约定：任务收到 SIGTERM 即「托管断点 → 退出 99」，调度器据此判定为干净抢占可恢复。
-SDK 把这一约定封装进 SchedTask.run()，任务作者只需实现 steps() 生成器并维护 resume_point。
+差别仅在 steps() 生成器是否终止：
+  - oneshot: steps() 有限迭代（跑完最后一步自然退出）
+  - daemon: steps() 无限迭代（内层 while True），靠 SIGTERM/request_stop 落断点退出 99
 
-阻止信号：SIGTERM 只置位 _stop_requested，不打断正在执行的步；长步靠后台心跳线程维持存活。
+共用：心跳线程、断点契约、错误分类、控制指令、信号处理。
 """
 
 from __future__ import annotations
 
-import os
-import re
 import signal
 import sys
-import threading
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Generator, Iterator
+import time
+from typing import Any, Iterable, Iterator
 
-from .errors import Category, classify_exception, logic, resource
-from .state import TaskState
-
-PREEMPT_EXIT_CODE = 99
-DRY_RUN_ENV = "SCHED_DRY_RUN"
-
-_pending_skipped_path = "cache/pending_skipped.jsonl"
-_dead_letter_path = "cache/dead_letter.jsonl"
-
-
-@dataclass
-class Step:
-    """yield 出的一个可观测步。name 用于展示，payload 透传到指标。"""
-
-    name: str
-    payload: dict[str, Any] | None = None
+from .errors import (EXIT_DATA_RISK, EXIT_LOGIC, EXIT_NO_RETRY, EXIT_OK,
+                     EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE,
+                     EXIT_STOP_REQUESTED)
+from .state import (DEFAULT_HEARTBEAT_INTERVAL_SEC, DEFAULT_STEP_TIMEOUT_SEC,
+                    TaskState, _global_state)
+from .intent import emit_intent, list_intents
 
 
 class SchedTask:
-    # 心跳线程刷新间隔（秒）；步内无 flush 也保持心跳，避免长步被误判卡死
-    HEARTBEAT_INTERVAL_SEC = 30
+    """统一任务基类（daemon 与 oneshot 共用）。
 
-    def __init__(self, workspace: Path | None = None):
-        self.state = TaskState(workspace)
-        self.workspace = Path(os.environ.get("SCHED_WORKSPACE") or (workspace or os.getcwd()))
-        self.resource_regex: list[str] = []
-        self.logic_regex: list[str] = []
-        # P1-E：task.json 的 error_rules 经调度器注入（SCHED_ERROR_RULES）；
-        # 任务代码在 __init__ 之后自行赋值仍可覆盖
-        self._load_error_rules_from_env()
-        self._stop_requested = False
-        self._heartbeat_thread: threading.Thread | None = None
-        self._exit_code = 0
+    子类实现：
+      - steps() → 迭代器/生成器：每个 yield 返回一个"步骤"（可是 dict/对象/None）
+        每个步骤内自己做业务逻辑、调用 self.state.save_checkpoint(marker) 落断点。
+      - process_step(step) → 实际处理一个步骤（可选，默认 passthrough）
+      - on_error(exc) → 可选：分类错误 category（resource / logic / unclassified）
+    """
 
-    def _load_error_rules_from_env(self) -> None:
-        import json
-        raw = os.environ.get("SCHED_ERROR_RULES", "")
-        if not raw:
-            return
-        try:
-            rules = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return
-        if not isinstance(rules, dict):
-            return
-        res = [str(r) for r in (rules.get("resource_regex") or []) if r]
-        logic_ = [str(r) for r in (rules.get("logic_regex") or []) if r]
-        if res:
-            self.resource_regex = res
-        if logic_:
-            self.logic_regex = logic_
+    kind: str = "oneshot"
+    name: str = "task"
 
-    def contract_probe(self) -> int:
-        """契约自检（闸2）：只写出合法 state.json 即退出 0，不发任何业务副作用。"""
-        self._install_signal_handlers()
-        self.state.status = "running"
-        self.state.current_step = "contract_probe"
-        self.state.resume_point = self.state.resume_point or {}
-        self.state.flush()
-        self.state.mark_success()
-        self.state.flush()
-        return 0
+    def __init__(
+        self,
+        name: str | None = None,
+        state: TaskState | None = None,
+        heartbeat_interval_sec: int = DEFAULT_HEARTBEAT_INTERVAL_SEC,
+        step_timeout_sec: int = DEFAULT_STEP_TIMEOUT_SEC,
+    ):
+        if name is not None:
+            self.name = name
+        self.state = state if state is not None else TaskState()
+        self.state.heartbeat_interval_sec = heartbeat_interval_sec
+        self.state.step_timeout_sec = step_timeout_sec
+        self.state.on_sigterm = self._on_sigterm
+        self._suspended_yield = None  # 被抢占时保存断点标记
 
-    # ---- 用户实现 ----
-    def steps(self, resume: dict[str, Any]) -> Iterator[Step]:
-        """任务主体：生成器。resume 为上次的 resume_point（首次为空 dict）。
+    # ---- 子类 override ----
 
-        典型写法：
-            for date in self.pending_dates(resume):
-                yield Step("fetch", date=date)
-                self.fetch(date)
-                self.state.resume_point = {"date": date}
-                self.state.flush()
-        """
+    def steps(self) -> Iterator[Any]:
+        """迭代器：yield 每个 step（daemon 子类应无限迭代）。"""
         raise NotImplementedError
-        yield Step("noop")  # pragma: no cover
 
-    # ---- 生命周期（run.py 的 main 调用）----
+    def process_step(self, step: Any) -> None:
+        """可选：对 yield 出来的 step 做实际处理。默认无操作。"""
+        pass
+
+    def on_error(self, exc: BaseException) -> str:
+        """可选：返回错误 category（resource / logic / unclassified）。默认 unclassified。"""
+        return "unclassified"
+
+    # ---- 生命周期 ----
+
     def run(self) -> int:
-        self._install_signal_handlers()
-        self._start_heartbeat()
-        self.state.status = "running"
-        self.state.started_at = self.state.started_at or self.state.updated_at
-        self.state.flush()
+        """主循环：初始化 state → 消费 steps() → 返回退出码。"""
+        self.state.start()
+        self.state.enter_step("init")
+
+        resume = self.state.resume_point()
+        marker = None
+        if resume and resume.get("resume_point"):
+            marker = resume["resume_point"]
+            self._log(f"[SDK] resume from checkpoint: {marker}")
+
+        exit_code = EXIT_OK
         try:
-            for step in self.steps(resume=self.state.resume_point):
-                self.state.loop_count += 1
-                if isinstance(step, Step):
-                    self.state.current_step = step.name
-                self.state.flush()
-                if self._stop_requested:
-                    self.state.mark_preempted()
-                    self.state.flush()
-                    return self._exit(PREEMPT_EXIT_CODE)
-        except SystemExit as e:
-            code = e.code if isinstance(e.code, int) else 0
-            if code == PREEMPT_EXIT_CODE:
-                self.state.mark_preempted()
-                self.state.flush()
-                return self._exit(PREEMPT_EXIT_CODE)
-            return self._exit(code)
-        except BaseException as e:  # noqa: BLE001 —— 任务任何异常都要归类落盘
-            classified = classify_exception(e, self.resource_regex, self.logic_regex)
-            self.state.mark_failed(classified["category"], classified["message"])
-            self.state.flush()
-            code = self._code_for_category(classified["category"])
-            return self._exit(code)
+            for step in self.steps():
+                if self.state._preempted or self.state._stop_requested:
+                    break
+                self.state.enter_step(f"step", progress=0.0)
+                try:
+                    self.process_step(step)
+                except Exception as exc:  # noqa: BLE001
+                    cat = self.on_error(exc)
+                    self.state.error(cat, f"{type(exc).__name__}: {exc}")
+                    if cat == "logic":
+                        exit_code = EXIT_LOGIC
+                    else:
+                        exit_code = EXIT_RESOURCE
+                    break
+        finally:
+            # 落断点 → 退出
+            if self.state._preempted:
+                exit_code = EXIT_PREEMPTED
+            elif self.state._stop_requested:
+                exit_code = EXIT_STOP_REQUESTED
+            elif self.state._no_retry and exit_code != EXIT_OK:
+                exit_code = EXIT_NO_RETRY
+            self.state.finalize()
+        return exit_code
 
-        self.state.mark_success()
-        self.state.flush()
-        return self._exit(0)
+    # ---- 信号 ----
 
-    # ---- 意图退出（如日期不命中，正常结束）----
-    def finish(self, code: int = 0) -> int:
-        self.state.mark_success()
-        self.state.flush()
-        return self._exit(code)
+    def _on_sigterm(self) -> None:
+        """SIGTERM 钩子：让 steps() 生成器能在当前 step 落断点后退出。"""
+        self.save_checkpoint(None)
 
-    # ---- 调度跳过（讨论二：任务自己判断"当前不该跑"）----
-    # 典型场景：法定节假日、每月特定日期、收盘后无意义等——调度器只负责"给机会"，
-    # 精确时机判断由任务进程内完成。任务调 reschedule(delay_sec=N) 告诉调度器
-    # "N 秒后再给机会"（写入 state.retry_hint.delay_sec，resolve_retry 与静态声明合并），
-    # 然后 exit_skip() 以 code=102 退出；调度器读 retry_hint.delay_sec 转为 not_before 重排队，
-    # attempt 不递增（这是"跳过本轮"不是"重试失败"）、不受 max_attempts/not_after 限制。
-    SCHEDULE_SKIP_CODE = 102
+    def save_checkpoint(self, marker: Any) -> None:
+        """公开的断点落盘（子任务在业务步骤结束时主动调用）。"""
+        self.state.save_checkpoint(marker)
 
-    def reschedule(self, delay_sec: float | int = 0) -> None:
-        """告诉调度器下次希望什么时候再给机会（默认立刻给）。"""
-        self.set_retry_hint(delay_sec=delay_sec)
+    # ---- 控制 ----
 
-    def exit_skip(self) -> int:
-        """结束本轮：调度器会在 delay_sec 后再给机会。
+    def request_stop(self, reason: str = "") -> None:
+        self.state.request_stop(reason)
 
-        用法示例（任务 steps 开头）：
-            today = self.state.current_date  # 任务可任意判定今天该跑不
-            if today in HOLIDAYS or not self._should_run(today):
-                self.reschedule(3600)   # 1 小时后再给机会（或 0 = 立即给，自己再判）
-                return self.exit_skip()
-        """
-        self.state.mark_success()  # 本次运行无错误，只是时机不对
-        self.state.flush()
-        return self._exit(self.SCHEDULE_SKIP_CODE)
+    def no_retry(self, reason: str = "") -> None:
+        self.state.no_retry(reason)
 
-    # ---- 重试策略运行时声明（失败终态被调度器读取，合并 task.json 的 retry 段）----
-    def set_retry_hint(self, *, delay_sec: float | int | None = None,
-                       max_attempts: int | None = None,
-                       not_after: str | None = None) -> None:
-        """声明本次运行失败后调度器应如何重试（只在以可恢复错误退出时生效）。
+    def reschedule(self, delay_sec: float, reason: str = "") -> None:
+        self.state.reschedule(delay_sec, reason)
 
-        - delay_sec：再次准出前的最小间隔；任务内部已就地重试过、需要节奏时用。
-        - max_attempts：尝试上限（0=不放弃）。
-        - not_after：时效截止（ISO8601 或每日 HH:MM），过期后不再自动重试——
-          典型场景：盘中实时任务到收盘后重跑已无意义。
-        传 None 的字段保持已有声明（task.json 或本 run 早前的设置）不变。
-        """
-        hint = dict(self.state.retry_hint or {})
-        if delay_sec is not None:
-            hint["delay_sec"] = max(0.0, float(delay_sec))
-        if max_attempts is not None:
-            hint["max_attempts"] = max(0, int(max_attempts))
-        if not_after is not None:
-            hint["not_after"] = str(not_after)
-        self.state.retry_hint = hint
-        self.state.flush()
+    # ---- 意图 ----
 
-    # ---- 错误分类辅助 ----
-    def fail(self, message: str, category: str | None = None) -> int:
-        cat = category or logic()
-        self.state.mark_failed(cat, message)
-        self.state.flush()
-        return self._exit(self._code_for_category(cat))
+    def emit_intent(self, **kwargs) -> str:
+        return emit_intent(**kwargs)
 
-    def skip_item(self, item_id: str, reason: str) -> None:
-        """把一条数据处理失败记入 pending_skipped（二刷），不因单条数据卡住整体。
+    def list_intents(self) -> list[dict]:
+        return list_intents()
 
-        P3：同一 item 重复 skip 去重（重试多轮只记一条，避免二刷重复处理）。
-        """
-        if any(r.get("item") == item_id for r in self.read_pending_skipped()):
-            return
-        append_jsonl(self.workspace / _pending_skipped_path, {"item": item_id, "reason": reason})
+    # ---- 工具 ----
 
-    def read_pending_skipped(self) -> list[dict[str, Any]]:
-        """读取待二刷的跳过项（P2⑧）。任务在二刷轮（SCHED_TRIGGER=second_pass）消费：
-            for rec in task.read_pending_skipped():
-                retry(rec["item"])   # 成功后可 dead_letter 清账或自行记录处理结果
-        """
-        return read_jsonl(self.workspace / _pending_skipped_path)
-
-    def dead_letter(self, item_id: str, reason: str) -> None:
-        """明确判死的数据进 dead_letter，避免无限重试。"""
-        append_jsonl(self._dead_letter_path(), {"item": item_id, "reason": reason})
-
-    def _dead_letter_path(self) -> Path:
-        return self.workspace / _dead_letter_path
-
-    @property
-    def dry_run(self) -> bool:
-        return os.environ.get(DRY_RUN_ENV) == "1"
-
-    # ---- 内部 ----
-    def _install_signal_handlers(self) -> None:
-        def _on_term(signum, frame):  # noqa: ARG001
-            self._stop_requested = True
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                signal.signal(sig, _on_term)
-            except ValueError:
-                pass
-
-    def _start_heartbeat(self) -> None:
-        def _beat() -> None:
-            while True:
-                if self._heartbeat_thread is None:
-                    return
-                # 仅当主线程未在 flush 时这里自身 flush 就足够了；周期刷新 updated_at
-                self.state.flush()
-                threading.Event().wait(self.HEARTBEAT_INTERVAL_SEC)
-
-        self._heartbeat_thread = threading.Thread(target=_beat, name="sched-task-heartbeat", daemon=True)
-        self._heartbeat_thread.start()
-
-    @staticmethod
-    def _code_for_category(category: str) -> int:
-        if category == Category.RESOURCE:
-            return 100
-        if category == Category.UNCLASSIFIED:
-            return 1  # 交给调度器 G5 按资源处理
-        return 1
-
-    def _exit(self, code: int) -> int:
-        self._exit_code = int(code)
-        self._stop_heartbeat()
-        return self._exit_code
-
-    def _stop_heartbeat(self) -> None:
-        t, self._heartbeat_thread = self._heartbeat_thread, None
-        # daemon 线程，直接置空标记即可让循环退出；不 join 避免阻塞
+    def _log(self, msg: str) -> None:
+        print(msg, flush=True, file=sys.stderr)
 
 
-def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
-    import json
+class OneshotTask(SchedTask):
+    """有限迭代任务：跑完 steps() 自然 exit 0。"""
+    kind = "oneshot"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    def steps(self) -> Iterator[Any]:  # noqa: D401
+        yield None  # 子类覆写
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    import json
+class DaemonTask(SchedTask):
+    """常驻任务：steps() 无限迭代，靠 SIGTERM/request_stop 落断点 exit 99。"""
+    kind = "daemon"
 
-    if not path.exists():
-        return []
-    out: list[dict[str, Any]] = []
-    try:
-        for line in path.read_text("utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                out.append(obj)
-    except (OSError, UnicodeDecodeError):
-        return out
-    return out
+    def steps(self) -> Iterator[Any]:  # noqa: D401
+        while True:
+            yield None  # 子类覆写
 
+
+# ---- run.py 入口便捷函数 ----
 
 def run_task(task: SchedTask) -> int:
-    """run.py 的 main() 一句话入口。"""
-    if os.environ.get("SCHED_CONTRACT_PROBE") == "1":
-        return task.contract_probe()
-    code = task.run()
-    return code
-
-
-__all__ = ["SchedTask", "Step", "PREEMPT_EXIT_CODE", "run_task", "resource", "logic", "Category"]
+    """最简单的 run.py 入口：构造 task → task.run() → os._exit(rc)。"""
+    rc = task.run()
+    sys.exit(rc)

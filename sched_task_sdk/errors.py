@@ -1,63 +1,28 @@
-"""任务侧错误分类。任务通过 resource()/logic() 显式归类，或用 classify_exception() 兜底。
+"""任务侧退出码协议（复用 sched.errors 的常量，SDK 独立可用）。
 
-默认判定（可按任务 error_rules.resource_regex / logic_regex 微调）：
-命中网络/超时/429/连接/资源不足 → resource；其余 → logic。
+与 sched.errors 完全对齐，避免任务侧额外依赖 sched 包。
 """
 
 from __future__ import annotations
 
-import re
-
-RESOURCE_PATTERNS = [
-    r"timeout",
-    r"timed?\s*out",
-    r"429",
-    r"rate\s*limit",
-    r"too\s*many\s*requests",
-    r"connection",
-    r"connect\s*error",
-    r"proxy",
-    r"socket",
-    r"refused",
-    r"unreachable",
-    r"memory\s*error",
-    r"out\s*of\s*memory",
-    r"oom",
-    r"resource\s*busy",
-    r"quota",
-    r"temporary",
-    r"temporarily",
-]
+from enum import Enum
 
 
-class Category:
+class Category(str, Enum):
     RESOURCE = "resource"
     LOGIC = "logic"
     UNCLASSIFIED = "unclassified"
 
 
-def resource() -> str:
-    return Category.RESOURCE
+EXIT_OK = 0
+EXIT_PREEMPTED = 99
+EXIT_RESOURCE = 100
+EXIT_EXTERNAL_RESOURCE = 101
+EXIT_DATA_RISK = 110
+EXIT_LOGIC = 1
+EXIT_SIGKILL = 137
+EXIT_STOP_REQUESTED = 98  # 进程主动 stop（SDK 的 request_stop 路径）
+EXIT_NO_RETRY = 97       # 进程 no_retry 后正常终结
 
-
-def logic() -> str:
-    return Category.LOGIC
-
-
-def classify_exception(
-    exc: BaseException | None,
-    resource_regex: list[str] | None = None,
-    logic_regex: list[str] | None = None,
-) -> dict:
-    msg = f"{type(exc).__name__}: {exc}" if exc else ""
-    rrules = list(resource_regex or []) + RESOURCE_PATTERNS
-    lrules = list(logic_regex or [])
-    for pat in lrules:
-        if pat and re.search(pat, msg, re.IGNORECASE):
-            return {"category": Category.LOGIC, "message": msg}
-    for pat in rrules:
-        if pat and re.search(pat, msg, re.IGNORECASE):
-            return {"category": Category.RESOURCE, "message": msg}
-    # 未命中任何规则：按调度体系 G5，未分类一律按资源处理（由调度器兜底），
-    # 但 SDK 这里标记 unclassified，让调度器显式走 G5 而非静默。
-    return {"category": Category.UNCLASSIFIED, "message": msg}
+RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE,
+                       EXIT_DATA_RISK, EXIT_STOP_REQUESTED, EXIT_NO_RETRY, EXIT_SIGKILL}

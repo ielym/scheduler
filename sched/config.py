@@ -70,8 +70,8 @@ def sched_user_conf() -> Path:
 
 
 class RunnerConfig(BaseModel):
-    # 这些都是引擎内部参数，不在管理台暴露；重试节奏/放弃策略由任务在 task.json
-    # 的 retry 段自行声明（见 taskdoc.RetrySpec），调度器不设全局冷却/退避/重试上限。
+    # 这些都是引擎内部参数，不在管理台暴露；重试节奏/放弃策略由意图文件 lifetime.retry 段声明
+    # 调度器不设全局冷却/退避/重试上限。
     kill_grace_sec: int = 10
     heartbeat_timeout_sec: int = 120
     grace_sec: int = 40
@@ -98,9 +98,9 @@ class ResourceConfig(BaseModel):
 class WebConfig(BaseModel):
     # 内嵌管理台：serve 进程内起 uvicorn，所有写操作与同一个
     # SchedulerService 实例（另开进程写 scheduler_state.json 会与 serve 内存态互相覆盖，故只允许内嵌）。
-    enabled: bool = False
+    enabled: bool = True
     host: str = "127.0.0.1"   # 默认仅本机；对外暴露必须配 auth_token（或显式风险开关，见下）
-    port: int = 8799
+    port: int = 8765
     # HTTP Basic Auth 密码（用户名任意，只校验密码）。非空即对全部页面/接口启用。
     # 管理台可在线改任务 .py 并注册执行（等同 RCE），绑非回环地址时必须配 token。
     auth_token: str = ""
@@ -115,9 +115,9 @@ class Settings(BaseModel):
     resource: ResourceConfig = Field(default_factory=ResourceConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     max_log_mb: int = 32
-    # 非 root 执行用户（v04 R31）；为空 = 以调度器运行用户直接执行
-    run_user: str = "sched-run"
-    # ---- 调度行为参数（引擎内部，不进管理台；任务自治参数在各任务 task.json 的 retry 段）----
+    # 非 root 执行用户；为空 = 以调度器当前用户运行；系统无此用户时自动降级为空
+    run_user: str = ""
+    # ---- 调度行为参数（引擎内部，不进管理台；任务自治参数在意图文件 lifetime.retry 段）----
     starvation_sec: float = 3600.0        # 饿死看门狗阈值（1h）
     preempt_exempt_sec: float = 60.0      # 任务启动后的抢占豁免期
     data_risk_max_reschedules: int = 3    # 110 数据风险二刷轮数上限
@@ -130,6 +130,21 @@ class Settings(BaseModel):
             ZoneInfo(v)
         except (ZoneInfoNotFoundError, ValueError, KeyError) as e:
             raise ValueError(f"无效时区：{v!r}（例如 Asia/Shanghai）") from e
+        return v
+
+    @field_validator("run_user")
+    @classmethod
+    def _run_user_ok(cls, v: str) -> str:
+        if not v:
+            return v
+        import pwd
+        try:
+            pwd.getpwnam(v)
+        except KeyError:
+            # 用户不存在时降级为空（以调度器当前用户运行），避免 preexec_fn raise 导致进程 exit 2
+            import warnings
+            warnings.warn(f"run_user='{v}' 不存在，降级为空（以当前用户运行）")
+            return ""
         return v
 
 

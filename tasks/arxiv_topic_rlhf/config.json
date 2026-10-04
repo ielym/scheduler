@@ -1,0 +1,6 @@
+{
+  "topic": "RLHF",
+  "query": "(all:RLHF OR all:\"reinforcement learning from human feedback\" OR all:\"direct preference optimization\" OR all:\"preference optimization\" OR all:GRPO OR all:\"group relative policy optimization\" OR abs:PPO OR all:\"reward model\" OR all:\"human feedback\" OR all:\"policy optimization\" OR all:\"constitutional AI\")",
+  "start_date": "2026-01-01",
+  "end_date": "2026-09-30"
+}

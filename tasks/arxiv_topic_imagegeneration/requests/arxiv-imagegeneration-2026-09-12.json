@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "request_id": "arxiv-imagegeneration-2026-09-12",
+  "kind": "oneshot",
+  "config": "config.json",
+  "entry": {
+    "file": "run.py",
+    "interpreter": "python3",
+    "args": [],
+    "cwd": "."
+  },
+  "priority": 30,
+  "resources": {
+    "cpu": 1.0,
+    "memory_mb": 512
+  },
+  "lifetime": {
+    "completion": "terminal",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_base_sec": 10,
+      "backoff_cap_sec": 600,
+      "not_after": ""
+    }
+  }
+}

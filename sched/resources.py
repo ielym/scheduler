@@ -1,14 +1,12 @@
-"""L1 资源层：容量模型 + 画像（三级 + 下行）+ 账本（账本值/实测值双校验）。
+"""资源层：容量模型 + 画像（三级 + 下行）+ 账本。
 
 - 容量：/proc/meminfo + os.cpu_count() 读取整机能力，MemAvailable 用于「非调度器进程占用」感知。
 - 画像：三级估算 —— 个例峰值(cgroup memory.peak) → 滑动窗口 P95 → 保守默认/声明值，
-  统一 × overshoot 上浮；样本窗口自然实现「下行修正」（越用越小则估小）。
+  统一 × overshoot 上浮；样本窗口自然实现「下行修正」。
 - 账本：book 值 = Σ 已准出任务预估；actual 值 = Σ cgroup 实测（由 monitor 刷新）。
 
-注意：代理并发、API 配额等「跨账号/跨机器、调度器无法感知真实容量」的外部资源不做
-令牌池管理——调度器无法获知同一代理是否被别的机器占用，静态容量只可能配错。
-这类资源由任务按退出码 100/101 自分类报错，调度器据错误码指数退避重试 + 渐进式提交
-动态避让（见 errors.py / service._handle_retry）。
+外部资源（代理/VPN/API 配额）不做令牌池管理——调度器无法获知跨机器共享的真实容量。
+这类资源由任务按退出码 100/101 自分类，调度器据错误码指数退避重试。
 """
 
 from __future__ import annotations
@@ -22,7 +20,6 @@ from typing import Any
 from . import config, store
 
 
-# ---------- 整机容量 ----------
 def read_total_memory_mb() -> int:
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemTotal:"):
@@ -47,16 +44,13 @@ class Capacity:
         self.total_cpu = float(read_cpu_count())
 
     def refresh(self) -> None:
-        """定期刷新整机容量（应对热插拔/容器配额变更；由 serve 热加载周期调用）。"""
         self.total_memory_mb = read_total_memory_mb()
         self.total_cpu = float(read_cpu_count())
 
     def available_memory_mb(self) -> int:
-        """整机可用内存（含非调度器进程占用后的余量）。"""
         return read_available_memory_mb()
 
     def book_available_memory_mb(self, ledger_reserved_mb: int) -> int:
-        """账本维度可用内存 = 总量 - 调度器账本已预留（不把其它进程算进硬账本，只作信号）。"""
         return max(0, self.total_memory_mb - ledger_reserved_mb)
 
 
@@ -97,19 +91,16 @@ class Profile:
         return vals[idx]
 
     def p50_duration_sec(self) -> float | None:
-        """典型运行时长（中位数）：同优先级 SJF 排序依据，抗长尾。"""
         if not self.durations:
             return None
         return statistics.median(self.durations)
 
     def estimate(self, overshoot: float) -> tuple[float, int]:
-        """(cpu, memory_mb) 预估。有样本用 P95，否则用声明，再否则 0（=未知，交给容量闸拒绝）。"""
         cpu = self.p95_cpu() if self.samples else (self.declared_cpu or 0.0)
         mem = self.p95_memory_mb() if self.samples else (self.declared_memory_mb or 0)
         return round(cpu * overshoot, 2), int(mem * overshoot)
 
     def estimate_duration_sec(self) -> float | None:
-        """运行时长预估（秒）；无历史样本返回 None（调度排序时按最长处理）。"""
         return self.p50_duration_sec()
 
 
@@ -121,8 +112,8 @@ class ProfileStore:
         raw = store.load_json(config.profiles_file(), default={})
         self._data = raw if isinstance(raw, dict) else {}
 
-    def get(self, job_id: str, declared_cpu: float = 0.0, declared_mem_mb: int = 0) -> Profile:
-        d = self._data.get(job_id) or {}
+    def get(self, subtask_id: str, declared_cpu: float = 0.0, declared_mem_mb: int = 0) -> Profile:
+        d = self._data.get(subtask_id) or {}
         return Profile(
             cpu=float(d.get("cpu") or 0.0),
             memory_mb=int(d.get("memory_mb") or 0),
@@ -132,44 +123,39 @@ class ProfileStore:
             declared_memory_mb=int(declared_mem_mb),
         )
 
-    def _store_profile(self, job_id: str, prof: Profile,
+    def _store_profile(self, subtask_id: str, prof: Profile,
                        declared_cpu: float, declared_mem_mb: int) -> None:
-        self._data[job_id] = {
+        self._data[subtask_id] = {
             "cpu": prof.p95_cpu() if prof.samples else declared_cpu,
             "memory_mb": prof.p95_memory_mb() if prof.samples else declared_mem_mb,
             "samples": [list(s) for s in prof.samples],
             "durations": list(prof.durations),
         }
 
-    def record(self, job_id: str, cpu: float, mem_mb: int, declared_cpu: float, declared_mem_mb: int,
+    def record(self, subtask_id: str, cpu: float, mem_mb: int, declared_cpu: float, declared_mem_mb: int,
                window: int = 8, duration_sec: float | None = None) -> Profile:
-        prof = self.get(job_id, declared_cpu, declared_mem_mb)
+        prof = self.get(subtask_id, declared_cpu, declared_mem_mb)
         prof.record_sample(cpu, mem_mb, window=window)
         if duration_sec is not None:
             prof.record_duration(duration_sec, window=window)
-        self._store_profile(job_id, prof, declared_cpu, declared_mem_mb)
+        self._store_profile(subtask_id, prof, declared_cpu, declared_mem_mb)
         return prof
 
-    def record_live(self, job_id: str, cpu: float, mem_mb: int, declared_cpu: float,
+    def record_live(self, subtask_id: str, cpu: float, mem_mb: int, declared_cpu: float,
                     declared_mem_mb: int, window: int = 8) -> Profile:
-        """运行中动态采样：立即更新内存画像（不落盘，由调用方节流 save）。
-
-        让任务越跑越吃资源时画像随之变化，而不是直到终态才采一次、更不是只用冒烟结果。
-        """
-        prof = self.get(job_id, declared_cpu, declared_mem_mb)
+        prof = self.get(subtask_id, declared_cpu, declared_mem_mb)
         prof.record_sample(cpu, mem_mb, window=window)
-        self._store_profile(job_id, prof, declared_cpu, declared_mem_mb)
+        self._store_profile(subtask_id, prof, declared_cpu, declared_mem_mb)
         return prof
 
-    def record_duration(self, job_id: str, duration_sec: float, window: int = 8) -> None:
-        """只补时长样本（终态收敛用）。"""
-        d = self._data.get(job_id) or {}
-        prof = self.get(job_id, float(d.get("cpu") or 0.0), int(d.get("memory_mb") or 0))
+    def record_duration(self, subtask_id: str, duration_sec: float, window: int = 8) -> None:
+        d = self._data.get(subtask_id) or {}
+        prof = self.get(subtask_id, float(d.get("cpu") or 0.0), int(d.get("memory_mb") or 0))
         prof.record_duration(duration_sec, window=window)
-        self._store_profile(job_id, prof, prof.declared_cpu, prof.declared_memory_mb)
+        self._store_profile(subtask_id, prof, prof.declared_cpu, prof.declared_memory_mb)
 
-    def estimate_duration_sec(self, job_id: str) -> float | None:
-        d = self._data.get(job_id) or {}
+    def estimate_duration_sec(self, subtask_id: str) -> float | None:
+        d = self._data.get(subtask_id) or {}
         vals = [float(x) for x in (d.get("durations") or [])]
         return statistics.median(vals) if vals else None
 

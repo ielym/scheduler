@@ -13,14 +13,13 @@ from typing import Any, Iterator
 
 from . import config, store
 
-# 状态机取值
-STATUS_WAITING = "waiting"          # 已入全局队列 WQ，尚未准出（等待资源/优先级）
-STATUS_RUNNING = "running"          # 已准出 + 进程存活
+STATUS_WAITING = "waiting"
+STATUS_RUNNING = "running"
 STATUS_SUCCESS = "success"
-STATUS_FAILED = "failed"            # 逻辑错误（不可重试）
-STATUS_RESOURCE = "resource"        # 资源错误（可重试，退避 + 画像上调）
-STATUS_PREEMPTED = "preempted"      # 干净抢占：断点已保存（exit 99），可恢复
-STATUS_PREEMPT_FAILED = "preempt_failed"  # 抢占时断点保存失败（数据风险）
+STATUS_FAILED = "failed"
+STATUS_RESOURCE = "resource"
+STATUS_PREEMPTED = "preempted"
+STATUS_PREEMPT_FAILED = "preempt_failed"
 STATUS_TIMEOUT = "timeout"
 STATUS_KILLED = "killed"
 STATUS_INTERRUPTED = "interrupted"
@@ -36,7 +35,6 @@ TERMINAL_STATUSES = (
     STATUS_KILLED,
     STATUS_INTERRUPTED,
 )
-# 这些终态意味着任务尚未真正「成功完成」，可被全局队列重新调度/恢复
 RESUMABLE_STATUSES = (STATUS_PREEMPTED, STATUS_RESOURCE, STATUS_TIMEOUT, STATUS_INTERRUPTED)
 
 
@@ -45,7 +43,6 @@ def now_iso() -> str:
 
 
 def _iso_seconds_between(a: str, b: str) -> float:
-    """两个 ISO 时间戳的秒差；任一端缺失/非法返回 0。"""
     try:
         da = datetime.fromisoformat(str(a))
         db = datetime.fromisoformat(str(b))
@@ -55,24 +52,23 @@ def _iso_seconds_between(a: str, b: str) -> float:
 
 
 def new_run_id() -> str:
-    # 时间戳 + 32bit 随机：同秒多 run 碰撞概率 ~1/4G（原 16bit 同秒碰撞风险过高）
     return f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(4)}"
 
 
-def run_log_path(job_id: str) -> Path:
-    return config.runs_dir() / f"{job_id}.jsonl"
+def run_log_path(subtask_id: str) -> Path:
+    return config.runs_dir() / f"{subtask_id}.jsonl"
 
 
-def job_log_dir(job_id: str) -> Path:
-    return config.runs_dir() / job_id
+def task_log_dir(subtask_id: str) -> Path:
+    return config.runs_dir() / subtask_id
 
 
-def stdout_path(job_id: str, run_id: str) -> Path:
-    return job_log_dir(job_id) / f"{run_id}.stdout.log"
+def stdout_path(subtask_id: str, run_id: str) -> Path:
+    return task_log_dir(subtask_id) / f"{run_id}.stdout.log"
 
 
-def stderr_path(job_id: str, run_id: str) -> Path:
-    return job_log_dir(job_id) / f"{run_id}.stderr.log"
+def stderr_path(subtask_id: str, run_id: str) -> Path:
+    return task_log_dir(subtask_id) / f"{run_id}.stderr.log"
 
 
 def rel_to_runs(path: Path) -> str:
@@ -83,7 +79,8 @@ def rel_to_runs(path: Path) -> str:
 
 
 def append_run(record: dict[str, Any]) -> dict[str, Any]:
-    store.append_jsonl(run_log_path(record["job_id"]), record)
+    subtask_id = str(record.get("subtask_id") or "unknown")
+    store.append_jsonl(run_log_path(subtask_id), record)
     return record
 
 
@@ -102,7 +99,7 @@ def iter_all_runs() -> Iterator[dict]:
 
 
 def query_runs(
-    job_id: str | None = None,
+    subtask_id: str | None = None,
     status: str | None = None,
     statuses: tuple[str, ...] | None = None,
     since: str | None = None,
@@ -110,7 +107,7 @@ def query_runs(
     offset: int = 0,
 ) -> list[dict]:
     records: list[dict] = []
-    source = store.iter_jsonl(run_log_path(job_id)) if job_id else iter_all_runs()
+    source = store.iter_jsonl(run_log_path(subtask_id)) if subtask_id else iter_all_runs()
     for rec in source:
         if status and rec.get("status") != status:
             continue

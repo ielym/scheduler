@@ -1,6 +1,7 @@
-"""注册表：data/jobs.json 是唯一真源（纯手动注册）。
+"""注册表：data/jobs.json 是唯一真源。
 
-任务目录 tasks/<name>/ 由用户自行创建（含 task.json 与入口），调度器绝不自动发现。
+tasks/<subtask_id>/ 下必须有 manifest.json（唯一清单格式）。
+jobs.json 只记录 enabled 状态；其他信息从 manifest.json 解析。
 """
 
 from __future__ import annotations
@@ -9,28 +10,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import config, store, taskdoc
+from . import config, store, manifest
 
 
 @dataclass
 class JobEntry:
-    job_id: str
+    subtask_id: str
     task_dir: Path
-    doc: taskdoc.TaskDoc | None = None
+    doc: manifest.TaskManifest | None = None
     error: str = ""
     enabled: bool = True
 
     @property
     def ok(self) -> bool:
         return self.doc is not None and not self.error
-
-    def effective(self) -> dict[str, Any]:
-        if self.doc is None:
-            return {}
-        return taskdoc.effective(self.task_dir, self.doc)
-
-    def schedule(self) -> dict[str, Any]:
-        return self.effective().get("schedule") or {"type": "manual"}
 
 
 def load_state() -> dict[str, dict]:
@@ -42,36 +35,36 @@ def save_state(state: dict[str, dict]) -> None:
     store.save_json(config.jobs_file(), state)
 
 
-def upsert_state(job_id: str, patch: dict[str, Any]) -> dict:
+def upsert_state(subtask_id: str, patch: dict[str, Any]) -> dict:
     state = load_state()
-    entry = state.get(job_id) or {"enabled": True}
+    entry = state.get(subtask_id) or {"enabled": True}
     for k, v in patch.items():
         entry[k] = v
-    state[job_id] = entry
+    state[subtask_id] = entry
     save_state(state)
     return entry
 
 
-def drop_state(job_id: str) -> None:
+def drop_state(subtask_id: str) -> None:
     state = load_state()
-    if job_id in state:
-        state.pop(job_id)
-        save_state(state)
+    if subtask_id in state:
+        state.pop(subtask_id)
+    save_state(state)
 
 
 def load_registered() -> dict[str, JobEntry]:
     state = load_state()
     root = config.tasks_dir()
     entries: dict[str, JobEntry] = {}
-    for jid, st in sorted(state.items()):
-        task_dir = root / jid
-        e = JobEntry(job_id=jid, task_dir=task_dir, enabled=bool(st.get("enabled", True)))
+    for sid, st in sorted(state.items()):
+        task_dir = root / sid
+        e = JobEntry(subtask_id=sid, task_dir=task_dir, enabled=bool(st.get("enabled", True)))
         if not task_dir.is_dir():
             e.error = f"任务目录不存在：{task_dir}"
         else:
             try:
-                e.doc = taskdoc.load_task_doc(task_dir)
-            except taskdoc.TaskDocError as ex:
+                e.doc = manifest.load_manifest(task_dir)
+            except manifest.ManifestError as ex:
                 e.error = "; ".join(ex.errors)
-        entries[jid] = e
+        entries[sid] = e
     return entries

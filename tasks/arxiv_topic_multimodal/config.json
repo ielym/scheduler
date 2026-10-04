@@ -1,0 +1,6 @@
+{
+  "topic": "Multimodal",
+  "query": "(all:\"multimodal generation\" OR all:\"multimodal understanding\" OR all:\"vision-language\" OR all:\"vision language model\" OR all:VLM OR all:MLLM OR all:\"multimodal large language model\" OR all:\"multimodal learning\" OR all:\"any-to-any\" OR all:\"visual instruction tuning\" OR all:\"multi-modal\")",
+  "start_date": "2026-01-01",
+  "end_date": "2026-09-30"
+}

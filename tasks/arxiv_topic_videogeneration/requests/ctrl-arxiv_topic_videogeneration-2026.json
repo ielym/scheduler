@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "request_id": "ctrl-arxiv_topic_videogeneration-2026",
+  "kind": "oneshot",
+  "config": "",
+  "entry": {
+    "file": "controller.py",
+    "interpreter": "python3",
+    "args": [],
+    "cwd": "."
+  },
+  "priority": 60,
+  "resources": {
+    "cpu": 0.1,
+    "memory_mb": 64
+  },
+  "lifetime": {
+    "completion": "terminal",
+    "retry": {
+      "max_attempts": 1,
+      "backoff_base_sec": 5,
+      "backoff_cap_sec": 60,
+      "not_after": ""
+    }
+  }
+}

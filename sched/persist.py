@@ -1,34 +1,19 @@
-"""L3 持久化：调度态原子快照 + 决策审计日志 + 运行态(active.json) 读写。
+"""持久化：调度态原子快照 + 决策审计。
 
-- scheduler_state.json：全局队列 WQ 的原子快照（先落快照后执行）。
-  重试节奏由任务自治（task.json retry 段），per-item 记 not_before，不再有
-  作业级 cooldown/backoff 字典（旧文件里的遗留键加载时忽略、下次保存自动清除）。
-- decisions.jsonl：每次调度决策的可追溯审计（append-only）。
-- active.json：在途运行（pid/pgid）供崩溃恢复 reconcile 用。
+主循环每 tick 维护：
+- scheduler_state.json：WQ 快照（纯 dict 列表，字段由 service._enqueue_intent 决定）
+- active.json：在途运行快照（崩溃恢复用）
+- decisions.jsonl：每次调度决策的可追溯审计（append-only）
+- intents_state.json：意图消费状态（由 scanner.py 独立维护，本模块不再插手）
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Any
 
-from . import config, store, runlog
-
-
-@dataclass
-class WaitingRun:
-    run_id: str
-    job_id: str
-    priority: int
-    trigger: str
-    attempt: int
-    scheduled_at: str
-    enqueued_at: str
-    resume_point_ref: bool = False   # 是否为恢复运行（来自之前的抢占/中断）
-    not_before: str = ""             # 任务自治重试间隔：此刻前不参与准出（retry.delay_sec）
-    missed_count: int = 0
-    contract_exempt: bool = False
-    manual: bool = False
+from . import config, store
 
 
 @dataclass
@@ -43,7 +28,7 @@ class SchedulerState:
 
     def pop_run(self, run_id: str) -> dict | None:
         for i, it in enumerate(self.wq):
-            if it["run_id"] == run_id:
+            if it.get("run_id") == run_id:
                 return self.wq.pop(i)
         return None
 
@@ -60,7 +45,6 @@ def save_scheduler_state(st: SchedulerState) -> None:
 
 
 def load_admission_state() -> dict[str, dict]:
-    """自动准入状态：{job_id: {status: checking|failed, reason, last_check, fingerprint, ...}}。"""
     raw = store.load_json(config.admission_state_file(), default={})
     return raw if isinstance(raw, dict) else {}
 
@@ -89,20 +73,3 @@ def save_recover_queue(records: list[dict]) -> None:
 
 def append_decision(record: dict) -> None:
     store.append_jsonl(config.decisions_log(), record)
-
-
-def snapshot_running_from(active_records: list[dict]) -> list[dict]:
-    return [
-        {
-            "run_id": r.get("run_id"),
-            "job_id": r.get("job_id"),
-            "pid": r.get("pid"),
-            "pgid": r.get("pgid"),
-            "status": r.get("status"),
-            "task_dir": r.get("task_dir"),
-            "started_at": r.get("started_at"),
-            "scheduled_at": r.get("scheduled_at"),
-            "queued_at": r.get("queued_at"),
-        }
-        for r in active_records
-    ]

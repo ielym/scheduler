@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>子任务详情</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:#0f1115;color:#e6e6e6;min-height:100vh}
+header{padding:14px 24px;border-bottom:1px solid #1f2330;background:#0f1115;position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:14px}
+header h1{margin:0;font-size:16px;font-weight:600}
+header .meta{font-size:12px;color:#6b7280}
+header .back{color:#8ab4ff;font-size:13px;background:none;border:none;cursor:pointer}
+main{padding:18px 24px;max-width:1400px;margin:0 auto}
+.panel{background:#181b22;border-radius:10px;padding:14px;border:1px solid #1f2330;margin-bottom:14px}
+.panel h3{margin:0 0 10px;font-size:12px;color:#94a3b8;font-weight:600;letter-spacing:.5px;text-transform:uppercase}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+thead th{text-align:left;padding:9px 12px;color:#94a3b8;font-weight:600;border-bottom:1px solid #1f2330;background:#151921;position:sticky;top:0;z-index:2}
+tbody td{padding:9px 12px;border-bottom:1px solid #1a1d27;color:#e6e6e6}
+tbody tr:hover td{background:#171a23}
+a{color:#8ab4ff;text-decoration:none}
+a:hover{text-decoration:underline}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:500;line-height:1.5}
+.badge.running{background:rgba(74,222,128,.15);color:#4ade80}
+.badge.waiting{background:rgba(251,191,36,.15);color:#fbbf24}
+.badge.pending{background:rgba(100,116,139,.2);color:#94a3b8}
+.badge.done,.badge.success{background:rgba(138,180,255,.15);color:#8ab4ff}
+.badge.failed{background:rgba(248,113,113,.15);color:#f87171}
+.badge.stopped{background:rgba(100,116,139,.2);color:#94a3b8}
+.badge.disabled{background:rgba(100,116,139,.25);color:#94a3b8}
+.badge.enabled{background:rgba(74,222,128,.12);color:#4ade80}
+.toolbar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.toolbar input[type=text]{background:#0f1115;border:1px solid #2a3040;color:#e6e6e6;padding:5px 9px;border-radius:6px;font-size:13px}
+.toolbar input[type=text]:focus{outline:none;border-color:#8ab4ff}
+.btn{display:inline-block;padding:4px 10px;border:1px solid #2a3040;background:#181b22;color:#cbd5e1;border-radius:6px;font-size:12px;cursor:pointer;transition:all .15s}
+.btn:hover{background:#1f2330;color:#fff}
+.btn.danger{border-color:#7f1d1d;color:#f87171}
+.btn.danger:hover{background:#3f1d1d}
+.btn.ghost{border-color:#2a3040;background:transparent;color:#94a3b8}
+.btn.ghost:hover{color:#e6e6e6}
+.switch{position:relative;width:38px;height:20px;cursor:pointer;user-select:none;display:inline-block;vertical-align:middle}
+.switch input{display:none}
+.switch .slider{position:absolute;inset:0;background:#2a3040;border-radius:10px;transition:background .15s}
+.switch .slider:before{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;background:#e6e6e6;border-radius:50%;transition:transform .15s}
+.switch input:checked + .slider{background:#16a34a}
+.switch input:checked + .slider:before{transform:translateX(18px)}
+.pagination{display:flex;gap:5px;align-items:center;justify-content:center;margin-top:12px;font-size:12px;color:#94a3b8}
+.pagination button{background:#181b22;border:1px solid #2a3040;color:#cbd5e1;padding:3px 8px;border-radius:5px;cursor:pointer;font-size:12px}
+.pagination button:hover:not(:disabled){background:#1f2330;border-color:#3b82f6}
+.pagination button:disabled{opacity:.35;cursor:not-allowed}
+.rid-col{font-family:Menlo,monospace;font-size:11px;color:#94a3b8;white-space:nowrap}
+.time-col{font-size:12px;color:#cbd5e1;white-space:nowrap;font-variant-numeric:tabular-nums}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:flex;align-items:center;justify-content:center}
+.modal{background:#181b22;border:1px solid #2a3040;border-radius:10px;width:min(900px,95vw);height:min(600px,85vh);display:flex;flex-direction:column}
+.modal-head{padding:10px 14px;border-bottom:1px solid #1f2330;display:flex;justify-content:space-between;align-items:center}
+.modal-head h3{margin:0;font-size:13px;color:#e6e6e6;font-weight:600}
+.modal-head .hint{font-size:11px;color:#6b7280;margin-top:2px}
+.modal-body{flex:1;overflow:auto;padding:10px 14px}
+pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;line-height:1.5}
+/* 状态多选下拉 */
+.status-dropdown{position:relative;display:inline-block}
+.status-dropdown-panel{position:absolute;top:calc(100% + 6px);left:0;min-width:160px;background:#181b22;border:1px solid #2a3040;border-radius:8px;padding:6px 0;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.4);display:none}
+.status-dropdown.open .status-dropdown-panel{display:block}
+.status-dropdown-panel label{display:flex;align-items:center;gap:8px;padding:7px 12px;font-size:13px;color:#cbd5e1;cursor:pointer;user-select:none}
+.status-dropdown-panel label:hover{background:#1f2330}
+.status-dropdown-panel input[type=checkbox]{accent-color:#8ab4ff;width:14px;height:14px}
+/* 配置区 */
+.config-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 24px}
+.config-grid .item{display:flex;flex-direction:column;gap:2px}
+.config-grid .k{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px}
+.config-grid .v{font-size:13px;color:#e6e6e6;font-family:Menlo,monospace}
+.intent-chips{display:flex;gap:8px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1 id="sidName">加载中…</h1>
+    <div class="meta" id="sidMeta"></div>
+  </div>
+</header>
+<main>
+  <div class="panel">
+    <h3>配置</h3>
+    <div class="config-grid" id="configGrid"></div>
+  </div>
+  <div class="panel">
+    <h3>意图状态分布</h3>
+    <div class="intent-chips" id="intentChips"></div>
+  </div>
+  <div class="panel">
+    <h3>历史进程</h3>
+    <div class="toolbar">
+      <div class="status-dropdown" id="procStatusDropdown">
+        <button type="button" class="btn ghost" id="procStatusBtn">状态筛选 ▾</button>
+        <div class="status-dropdown-panel" id="procStatusPanel">
+          <label><input type="checkbox" value="running"/> 运行中</label>
+          <label><input type="checkbox" value="waiting"/> 等待中</label>
+          <label><input type="checkbox" value="done"/> 已完成</label>
+          <label><input type="checkbox" value="failed"/> 失败</label>
+          <label><input type="checkbox" value="stopped"/> 已停止</label>
+        </div>
+      </div>
+      <span id="procStatusHint" style="color:#6b7280;font-size:12px"></span>
+      <span style="flex:1"></span>
+      <span id="procPagedInfo" style="color:#6b7280;font-size:12px"></span>
+    </div>
+    <div style="overflow:auto;border:1px solid #1f2330;border-radius:8px">
+      <table>
+        <thead><tr>
+          <th>进程</th>
+          <th>状态</th>
+          <th>开始时间</th>
+          <th>结束时间</th>
+          <th style="width:180px">操作</th>
+        </tr></thead>
+        <tbody id="processesTable"></tbody>
+      </table>
+    </div>
+    <div class="pagination" id="procPagination"></div>
+  </div>
+</main>
+
+<script>
+const PARAMS = new URLSearchParams(location.search);
+const SID = PARAMS.get('sid') || '';
+const API = '';
+const PAGE_SIZE = 20;
+let procPage = 1;
+
+function qs(s){return document.querySelector(s)}
+function fmtAbs(s){
+  if(!s)return '—';
+  try{
+    const d=new Date(s);
+    const pad=n=>String(n).padStart(2,'0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }catch{return String(s).slice(0,19)}
+}
+function _label(s){
+  if(s==='done'||s==='success')return {label:'已完成', cls:'done'};
+  return {label:s, cls:s};
+}
+function debounce(fn,ms=300){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}}
+
+async function loadSubtask(){
+  if(!SID){qs('#sidName').textContent='?sid= 缺失';return}
+  const [sub, intentsRaw] = await Promise.all([
+    fetch(API+'/api/subtasks/'+encodeURIComponent(SID)).then(r=>r.json()),
+    fetch(API+'/api/intents').then(r=>r.json()).catch(()=>({})),
+  ]);
+  qs('#sidName').textContent = sub.name || sub.subtask_id;
+  qs('#sidMeta').textContent = sub.subtask_id + ' · ' + (sub.run_mode||'?') + ' · 优先级 ' + (sub.priority||0) + ' · ' + (sub.enabled?'已启用':'已禁用');
+
+  // 配置（优先级 inline 编辑 + 启用开关）
+  qs('#configGrid').innerHTML = `
+    <div class="item"><span class="k">子任务 ID</span><span class="v">${sub.subtask_id}</span></div>
+    <div class="item"><span class="k">运行模式</span><span class="v">${sub.run_mode||'?'}</span></div>
+    <div class="item"><span class="k">优先级</span><span class="v" id="cfgPri" onclick="editSubtaskPri()">${sub.priority}</span></div>
+    <div class="item"><span class="k">启用状态</span><span class="v"><label class="switch"><input type="checkbox" id="cfgEnabled" ${sub.enabled?'checked':''} onchange="toggleSubtask2(this.checked)"/><span class="slider"></span></label> <span id="cfgEnabledLabel">${sub.enabled?'启用中':'已禁用'}</span></span></div>
+  `;
+  window._curPri = sub.priority;
+
+  // 意图状态分布
+  const imap = intentsRaw[SID] || {};
+  const c = {running:0,waiting:0,done:0,failed:0,stopped:0};
+  for(const info of Object.values(imap)){
+    const st = info.status||'unknown';
+    if(st==='pending') c.waiting++;
+    else if(st==='running') c.running++;
+    else if(st==='done'||st==='success') c.done++;
+    else if(st==='failed') c.failed++;
+    else if(st==='stopped') c.stopped++;
+    else c.waiting++;
+  }
+  const chips = [];
+  if(c.running) chips.push(`<span class="badge running">▶️ 运行 ${c.running}</span>`);
+  if(c.waiting) chips.push(`<span class="badge waiting">⏳ 等待 ${c.waiting}</span>`);
+  if(c.done) chips.push(`<span class="badge done">✅ 完成 ${c.done}</span>`);
+  if(c.failed) chips.push(`<span class="badge failed">❌ 失败 ${c.failed}</span>`);
+  if(c.stopped) chips.push(`<span class="badge stopped">⏹️ 停止 ${c.stopped}</span>`);
+  chips.push(`<span style="color:#6b7280;font-size:12px">共 ${Object.keys(imap).length} 条 intent</span>`);
+  qs('#intentChips').innerHTML = chips.join(' ') || '<span style="color:#6b7280">暂无 intent</span>';
+
+  refreshProcesses();
+}
+
+async function refreshProcesses(){
+  const panel = qs('#procStatusPanel');
+  const chosen = [...panel.querySelectorAll('input:checked')].map(cb=>cb.value);
+  const sp = new URLSearchParams({subtask_id:SID, page:procPage, page_size:PAGE_SIZE});
+  if(chosen.length) sp.set('status', chosen.join(','));
+  const d = await fetch(API+'/api/processes?'+sp).then(r=>r.json()).catch(()=>({items:[],total:0}));
+
+  const items = d.items||[];
+
+  const rows = items.map(i=>{
+    const canLog = ['done','success','failed','stopped','running'].includes(i.status);
+    const started = i.started_at || i.enqueued_at || null;
+    const {label, cls} = _label(i.status);
+    return `<tr>
+      <td><div class="rid-col">${i.run_id}</div></td>
+      <td><span class="badge ${cls}">${label}</span></td>
+      <td class="time-col">${fmtAbs(started)}</td>
+      <td class="time-col">${fmtAbs(i.finished_at)}</td>
+      <td>${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">📜 日志</button>`:'<span style="color:#3b4252">—</span>'}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="5" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
+
+  qs('#processesTable').innerHTML = rows;
+  qs('#procPagedInfo').textContent = `共 ${d.total||0} · 第 ${procPage}/${Math.max(1,Math.ceil((d.total||0)/PAGE_SIZE))} 页`;
+  renderPage('#procPagination', d.total||0, procPage, PAGE_SIZE, np=>{procPage=np;refreshProcesses()});
+
+  // 状态筛选 hint
+  qs('#procStatusHint').textContent = chosen.length? chosen.map(v=>({running:'运行中',waiting:'等待中',done:'已完成',failed:'失败',stopped:'已停止'}[v])||v).join(' / ') : '（不选=全部）';
+}
+
+function renderPage(sel, total, p, ps, onChg){
+  const el=qs(sel); const n=Math.max(1,Math.ceil(total/ps));
+  if(n<=1){el.innerHTML='';return}
+  const items=[];
+  items.push(`<button ${p<=1?'disabled':''} onclick="(${onChg})(${p-1})">‹</button>`);
+  const range=[]; for(let i=Math.max(1,p-2);i<=Math.min(n,p+2);i++) range.push(i);
+  if(range[0]>1){items.push(`<button onclick="(${onChg})(1)">1</button>`); if(range[0]>2)items.push(`<span style="color:#6b7280">…</span>`)}
+  for(const i of range){items.push(`<button onclick="(${onChg})(${i})" style="${i===p?'background:#1e40af;border-color:#3b82f6;color:#dbeafe':''}">${i}</button>`)}
+  if(range[range.length-1]<n){if(range[range.length-1]<n-1)items.push(`<span style="color:#6b7280">…</span>`);items.push(`<button onclick="(${onChg})(${n})">${n}</button>`)}
+  items.push(`<button ${p>=n?'disabled':''} onclick="(${onChg})(${p+1})">›</button>`);
+  el.innerHTML=`<span style="margin-right:6px">共 ${total} · </span>${items.join('')}`;
+}
+
+async function showLog(rid){
+  qs('#logModal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay'; overlay.id='logModal';
+  overlay.innerHTML = `<div class="modal"><div class="modal-head">
+    <div><h3>📜 ${rid}</h3><div class="hint">最近 2MB 尾部</div></div>
+    <button class="btn ghost" onclick="document.getElementById('logModal').remove()">✕</button>
+  </div><div class="modal-body"><span style="color:#6b7280">加载中…</span></div></div>`;
+  document.body.appendChild(overlay);
+  try{
+    const resp = await fetch(API+'/api/runs/'+encodeURIComponent(rid)+'/log');
+    if(!resp.ok){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">HTTP ${resp.status} — 日志不存在</pre>`; return; }
+    const txt = await resp.text();
+    overlay.querySelector('.modal-body').innerHTML = `<pre class="log">${txt||'(日志为空)'}</pre>`;
+  }catch(e){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">加载失败: ${e.message}</pre>`; }
+}
+
+// 状态筛选下拉交互
+qs('#procStatusBtn').onclick = (e)=>{e.stopPropagation();qs('#procStatusDropdown').classList.toggle('open')};
+qs('#procStatusPanel').addEventListener('click', e => e.stopPropagation());
+qs('#procStatusPanel').addEventListener('change', ()=>{procPage=1;refreshProcesses()});
+document.addEventListener('click', ()=>qs('#procStatusDropdown').classList.remove('open'));
+
+// 优先级 inline 编辑
+function editSubtaskPri(){
+  const el = qs('#cfgPri');
+  if(el.querySelector('input')) return;
+  const input = document.createElement('input');
+  input.type='number'; input.min=0; input.max=100;
+  input.value = window._curPri;
+  input.style.cssText='width:60px;background:#0f1115;border:1px solid #2a3040;color:#e6e6e6;padding:2px 6px;border-radius:4px;font-family:Menlo,monospace;font-size:13px';
+  el.textContent=''; el.appendChild(input); input.focus(); input.select();
+  const commit = async ()=>{
+    const v = parseInt(input.value)||0;
+    try{
+      await fetch('/api/subtasks/'+encodeURIComponent(SID)+'/priority',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority:v})});
+      window._curPri = v;
+      el.textContent = v;
+      qs('#sidMeta').textContent = SID + ' · 优先级 ' + v + ' · ' + (qs('#cfgEnabled').checked?'已启用':'已禁用');
+    }catch(e){ el.textContent = window._curPri; alert('修改失败: '+e.message); }
+  };
+  input.onblur = commit;
+  input.onkeydown = (e)=>{ if(e.key==='Enter') input.blur(); if(e.key==='Escape'){ el.textContent = window._curPri; } };
+}
+
+// 启用开关
+async function toggleSubtask2(want){
+  const url = want? '/api/start/'+encodeURIComponent(SID) : '/api/stop/'+encodeURIComponent(SID);
+  try{
+    await fetch(url,{method:'POST'});
+    qs('#cfgEnabledLabel').textContent = want? '启用中' : '已禁用';
+    qs('#sidMeta').textContent = SID + ' · 优先级 ' + window._curPri + ' · ' + (want?'已启用':'已禁用');
+  }catch(e){ alert('操作失败: '+e.message); qs('#cfgEnabled').checked = !want; }
+}
+
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') qs('#logModal')?.remove(); });
+
+loadSubtask();
+</script>
+</body>
+</html>

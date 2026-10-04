@@ -1,0 +1,6 @@
+{
+  "topic": "VideoGeneration",
+  "query": "(all:\"video generation\" OR all:\"text-to-video\" OR all:\"video diffusion\" OR all:\"video synthesis\" OR all:\"video world model\" OR all:\"autoregressive video\" OR all:\"video tokenizer\" OR all:\"long video generation\" OR all:\"text-to-video generation\" OR all:\"visual generation\" OR all:Sora)",
+  "start_date": "2026-01-01",
+  "end_date": "2026-09-30"
+}

@@ -1,4 +1,4 @@
-"""L2 引擎 · 全局队列排序 + 准出（admission）扫描。
+"""全局队列排序 + 准出（admission）扫描。
 
 - 双轨制：base 轨道管严格性（priority 降序，饿死看门狗临时提权）；
   field 轨道管同层次序：先按画像预估运行时长做 SJF（短作业优先，100 个 1s
@@ -6,8 +6,7 @@
 - 见缝插针：准出是全局扫描，高优等固定资源时，能塞进缝隙的低优仍可先跑。
 - 首个任务因固定资源不足：等待并尝试其它任务。
 - 代理/配额等调度器无法感知真实容量的外部资源不参与准出判定：任务以 100/101
-  报错后按任务自治 retry 策略（task.json retry 段）立即或延时重排队，调度器
-  不做全局退避。
+  报错后按意图文件 lifetime.retry 段立即或延时重排队，调度器不做全局退避。
 """
 
 from __future__ import annotations
@@ -48,7 +47,7 @@ def order_waiting(items: list[dict], starvation_sec: float, now_iso: str,
         dur = None
         if get_duration_sec is not None:
             try:
-                dur = get_duration_sec(str(it.get("job_id") or ""))
+                dur = get_duration_sec(str(it.get("subtask_id") or ""))
             except Exception:
                 dur = None
         return (-pri, float(dur) if dur is not None else float("inf"), enq)
@@ -125,8 +124,15 @@ def admission_scan(
     pending_cpu, pending_mem = 0.0, 0
     for it in items:
         rid = it["run_id"]
-        declared_cpu, declared_mem = get_declared(it["job_id"])
-        prof = get_profile(it["job_id"])
+        sid = str(it.get("subtask_id") or "")
+        declared_cpu, declared_mem = get_declared(sid)
+        # intent 自带 resources 覆盖 manifest 声明（每个 intent 可能有不同的资源需求）
+        intent_res = it.get("resources") or {}
+        if intent_res.get("cpu"):
+            declared_cpu = max(declared_cpu, float(intent_res["cpu"]))
+        if intent_res.get("memory_mb"):
+            declared_mem = max(declared_mem, int(intent_res["memory_mb"]))
+        prof = get_profile(sid)
         est_cpu, est_mem = estimate_job(prof, declared_cpu, declared_mem, overshoot, capacity)
         ok, reason = can_admit(est_cpu, est_mem, ledger, capacity,
                                extra_cpu=pending_cpu, extra_mem_mb=pending_mem,

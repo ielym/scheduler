@@ -1,0 +1,6 @@
+{
+  "topic": "Agentic",
+  "query": "(all:agentic OR all:\"language agent\" OR all:\"agent harness\" OR (all:harness AND (all:agent OR all:agentic)) OR all:\"multi-agent\" OR all:\"computer use\" OR all:\"tool use\" OR all:\"autonomous agent\" OR all:\"tool calling\" OR all:\"agentic AI\" OR all:\"function calling\" OR all:\"GUI agent\")",
+  "start_date": "2026-01-01",
+  "end_date": "2026-09-30"
+}

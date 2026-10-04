@@ -1,0 +1,6 @@
+{
+  "topic": "ImageGeneration",
+  "query": "(all:\"image generation\" OR all:\"text-to-image\" OR all:\"image diffusion\" OR all:\"image synthesis\" OR all:\"text-to-image generation\" OR all:\"text-to-image diffusion\" OR all:\"flow matching\" OR all:\"diffusion transformer\" OR all:\"latent diffusion\" OR all:\"rectified flow\" OR all:\"generative adversarial\")",
+  "start_date": "2026-01-01",
+  "end_date": "2026-09-30"
+}
