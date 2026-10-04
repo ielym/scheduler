@@ -81,7 +81,7 @@ def test_p1_c_upsert_preserves_earlier_pending_trigger(home, monkeypatch):
     monkeypatch.setattr(engine_mod, "datetime", _FakeDT)
     base = datetime(2026, 10, 3, 12, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     eng = engine_mod.TriggerEngine("Asia/Shanghai")
-    sched = {"type": "interval", "interval": 3600}
+    sched = {"type": "auto", "interval": 3600}
     _FakeDT.offset = 0
     eng.upsert("j", sched)
     first = eng.next_run_time("j")
@@ -93,12 +93,12 @@ def test_p1_c_upsert_preserves_earlier_pending_trigger(home, monkeypatch):
     assert eng.next_run_time("j") == first
 
     # 新配置的触发更早（interval 缩短）→ 允许重置
-    eng.upsert("j", {"type": "interval", "interval": 10})
+    eng.upsert("j", {"type": "auto", "interval": 10})
     assert eng.next_run_time("j") == (base + timedelta(seconds=110)).isoformat(timespec="seconds")
 
     # 已失效 once 的 None 残留在刷新时清除
     eng._next["gone"] = None
-    eng.upsert("gone", {"type": "once", "once_at": "2000-01-01T00:00:00+08:00"})
+    eng.upsert("gone", {"type": "manual", "interval": 3600})
     assert "gone" not in eng._next
 
 
@@ -107,7 +107,7 @@ def test_p1_c_refresh_hot_loads_new_interval_job(home, make_settings):
     task_dir = write_task(home, "hot", real_sleep=0.01)
     tj = task_dir / "task.json"
     doc = json.loads(tj.read_text("utf-8"))
-    doc["schedule"] = {"type": "interval", "interval": 3600, "max_instances": 1, "overflow": "queue"}
+    doc["schedule"] = {"type": "auto", "interval": 3600, "max_instances": 1, "overflow": "queue"}
     tj.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
     from sched import registry

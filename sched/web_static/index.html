@@ -169,18 +169,17 @@ const humanSec = sec => {
 };
 const humanDur = sec => "每 " + humanSec(sec);
 const WEEK_CN = ["","一","二","三","四","五","六","日"];
-// interval 秒数 → 人话调度描述
+// interval 秒数 → 人话调度描述（讨论二简化：调度器只做"给机会"的 coarse 节流）
 function fmtSchedule(s) {
   s = s || {};
   const t = s.type || "manual";
   if (t === "manual") return "仅手动触发";
-  if (t === "once") return `单次 · ${esc(s.once_at||"-")}`;
-  const wk = Array.isArray(s.weekdays) && s.weekdays.length
-    ? "（周" + s.weekdays.map(d=>WEEK_CN[d]||d).join("/") + "）" : "";
-  if (s.start_time && s.end_time)
-    return `每天 ${esc(s.start_time)}–${esc(s.end_time)} ${wk} · ${humanDur(s.interval)}`
-      + (s.allow_overrun ? " · 允许超时叠加" : "");
-  return `${humanDur(s.interval)}${wk}` + (s.allow_overrun ? " · 允许超时叠加" : "");
+  if (t === "auto") {
+    const iv = s.interval;
+    if (!iv) return "自动触发（需手动先给机会，interval 未设）";
+    return `自动触发 · 给机会间隔 ${humanDur(iv)}（精确时机由任务内部判断）`;
+  }
+  return "未设置";
 }
 const fmtDuration = sec => sec == null ? '<span class="hint">无样本</span>' : humanSec(Math.round(sec));
 
@@ -274,9 +273,7 @@ async function openJobConfig(jobId) {
   try { cfg = await api(`/api/jobs/${encodeURIComponent(jobId)}/config`); }
   catch(e){ toast("读取调度参数失败："+e.message,"err"); return; }
   const s = cfg.schedule || {}, hb = cfg.heartbeat || {}, rt = cfg.retry || {};
-  const wd = new Set(s.weekdays || []);
-  const wdChecks = [1,2,3,4,5,6,7].map(d =>
-    `<label style="margin-right:6px"><input type="checkbox" data-wd="${d}" ${wd.has(d)?"checked":""}>周${WEEK_CN[d]}</label>`).join("");
+  const curType = s.type === "auto" ? "auto" : "manual";
   const m = modal(`调度参数 · <code>${esc(jobId)}</code>`,
     `<div class="cfgwarn">这里只允许修改纯调度参数，保存后立即生效（不用重启、不用重新过闸）。
       任务代码/入口/资源声明/env 不允许在管理台修改：请在本地改好后重新导入。</div>
@@ -285,61 +282,55 @@ async function openJobConfig(jobId) {
        <div class="hint">整数，越大越先准出（1~100）</div></div>
      <div class="cfgrow"><div class="lab">调度类型</div>
        <select id="c-type">
-         <option value="manual" ${s.type==="manual"?"selected":""}>manual（仅手动/CLI 触发）</option>
-         <option value="interval" ${s.type==="interval"?"selected":""}>interval（周期）</option>
-         <option value="once" ${s.type==="once"?"selected":""}>once（一次性）</option>
-       </select><div class="hint">manual 任务只能由「立即运行一次」或 <code>sched run</code> 触发</div></div>
-     <div class="cfgrow"><div class="lab">周期间隔（秒）</div>
-       <input type="number" id="c-interval" value="${esc(s.interval ?? "")}">
-       <div class="hint">interval 用，人话：<span id="c-interval-h"></span></div></div>
-     <div class="cfgrow"><div class="lab">每日时间窗</div>
-       <div class="row"><input type="text" id="c-start" placeholder="HH:MM" value="${esc(s.start_time||"")}" style="width:90px">
-         至 <input type="text" id="c-end" placeholder="HH:MM" value="${esc(s.end_time||"")}" style="width:90px"></div>
-       <div class="hint">留空=全天；仅在窗口内按间隔触发</div></div>
-     <div class="cfgrow"><div class="lab">生效星期</div><div>${wdChecks}</div>
-       <div class="hint">不勾=每天</div></div>
-     <div class="cfgrow"><div class="lab">单次时刻</div>
-       <input type="text" id="c-once" value="${esc(s.once_at||"")}">
-       <div class="hint">once 用，ISO 时间</div></div>
+         <option value="manual" ${curType==="manual"?"selected":""}>manual（仅手动/CLI 触发）</option>
+         <option value="auto" ${curType==="auto"?"selected":""}>auto（自动给机会，interval 控节奏）</option>
+       </select><div class="hint">调度器只做"盲给机会"的 coarse 节流；精确时机（法定节假日、每月特定日期、收盘后等）由任务进程内 SDK reschedule()+exit_skip() 自行判断</div></div>
+     <div class="cfgrow" id="c-interval-row"><div class="lab">给机会的最小间隔（秒）</div>
+       <input type="number" id="c-interval" value="${esc(s.interval ?? 3600)}">
+       <div class="hint">auto 类型时必填；人话：<span id="c-interval-h"></span></div></div>
      <div class="cfgrow"><div class="lab">并发实例 / 超时策略</div>
        <div class="row"><input type="number" id="c-maxn" value="${esc(s.max_instances ?? 1)}" style="width:80px">
          <select id="c-overflow" style="width:110px">
            <option value="queue" ${s.overflow==="queue"?"selected":""}>排队</option>
            <option value="skip" ${s.overflow==="skip"?"selected":""}>跳过</option>
-         </select>
-         <label><input type="checkbox" id="c-overrun" ${s.allow_overrun?"checked":""}> 允许超时叠加</label>
-       </div><div class="hint">上一轮没跑完又到点时的处理</div></div>
+         </select></div>
+       <div class="hint">上一轮没跑完又到点时的处理</div></div>
      <div class="cfgrow"><div class="lab">心跳超时（秒）</div>
        <input type="number" id="c-hb" value="${esc(hb.timeout_sec ?? 120)}">
        <div class="hint">超过该秒数无心跳视为卡死（最小 5 秒）</div></div>
      <div class="cfgrow"><div class="lab">重试间隔（秒）</div>
        <input type="number" id="c-delay" value="${esc(rt.delay_sec ?? 0)}">
-       <div class="hint">资源错误（100/101）后按此间隔重试；0=资源一空出来就立刻再试</div></div>
+       <div class="hint">资源错误（100/101）后按此间隔重试；0=资源一空出来就立刻再试；任务可在进程内 reschedule(delay_sec=N) 覆盖</div></div>
      <div class="cfgrow"><div class="lab">重试上限（次）</div>
        <input type="number" id="c-maxa" value="${esc(rt.max_attempts ?? 0)}">
-       <div class="hint">0=不放弃，有资源必须跑完；正数=达到后转人工</div></div>
+       <div class="hint">0=不放弃，有资源必须跑完；正数=达到后转人工；exit_skip(102) 不走这条</div></div>
      <div class="cfgrow"><div class="lab">重试时效截止</div>
        <input type="text" id="c-after" value="${esc(rt.not_after||"")}">
        <div class="hint">留空=不失效；ISO 时刻（如 2026-10-04T18:00）或每日时刻（如 18:00），过期转人工</div></div>`,
     `<button class="act" id="c-cancel">取消</button><button class="act primary" id="c-ok">保存并立即生效</button>`);
   const updHint = () => { $("#c-interval-h",m).textContent = humanSec(Number($("#c-interval",m).value)||0); };
   $("#c-interval",m).oninput = updHint; updHint();
+  // manual 时 interval 输入框隐藏（调度器从不自动给机会）
+  const syncIntervalRow = () => {
+    $("#c-interval-row",m).style.display = $("#c-type",m).value === "auto" ? "" : "none";
+  };
+  $("#c-type",m).onchange = syncIntervalRow; syncIntervalRow();
   $("#c-ok",m).onclick = async () => {
-    const weekdays = [...m.querySelectorAll("[data-wd]:checked")].map(x=>Number(x.dataset.wd));
     const num = id => { const v = $(id,m).value.trim(); return v===""?undefined:Number(v); };
+    const stype = $("#c-type",m).value;
+    const schedule = {
+      type: stype,
+      max_instances: num("#c-maxn") ?? 1,
+      overflow: $("#c-overflow",m).value,
+    };
+    if (stype === "auto") {
+      const iv = Number($("#c-interval",m).value);
+      if (!iv || iv <= 0) { toast("auto 类型必须填给机会间隔","err"); return; }
+      schedule.interval = iv;
+    }
     const patch = {
       priority: Number($("#c-pri",m).value),
-      schedule: {
-        type: $("#c-type",m).value,
-        interval: num("#c-interval"),
-        start_time: $("#c-start",m).value.trim(),
-        end_time: $("#c-end",m).value.trim(),
-        weekdays,
-        once_at: $("#c-once",m).value.trim(),
-        max_instances: num("#c-maxn"),
-        overflow: $("#c-overflow",m).value,
-        allow_overrun: $("#c-overrun",m).checked,
-      },
+      schedule,
       heartbeat: { timeout_sec: num("#c-hb") },
       retry: { delay_sec: num("#c-delay"), max_attempts: num("#c-maxa"),
                not_after: $("#c-after",m).value.trim() },

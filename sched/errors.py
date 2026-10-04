@@ -26,16 +26,23 @@ EXIT_PREEMPTED = 99         # 收到 SIGTERM，完成断点保存后主动退出
 EXIT_RESOURCE = 100         # 本机资源错误（内存/CPU 不足等，可重试，触发画像上调）
 EXIT_EXTERNAL_RESOURCE = 101  # 外部资源错误（代理/隧道、限流 429、配额、连接超时等）：指数退避重试
 EXIT_DATA_RISK = 110        # 数据风险：跳过项已写入 pending_skipped，可继续二刷
+EXIT_SKIP_SCHEDULE = 102    # 【讨论二 新增】调度器给机会但任务判断"当前不该跑"：
+                            # 比如法定节假日、每月特定日期、收盘后无意义等。
+                            # 任务通常会先调 SDK state.reschedule(delay_sec=N) 指定下次机会，
+                            # 调度器读取 retry_hint.delay_sec 转为 not_before 重排队。
+                            # 与 110 data_risk 的区别：没有二刷闭环，只是"跳过本轮 N 秒后再给机会"，
+                            # 不受 data_risk_max_reschedules=3 限制。
 EXIT_LOGIC = 1              # 逻辑错误的代表码（任务自报 logic 时使用；无自报时按 G5 兜底）
 EXIT_SIGKILL = 137          # 128+9 —— 需要归因：cgroup OOM / 调度器 SIGKILL / 外部 kill
 
-RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE, EXIT_DATA_RISK}
+RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE,
+                       EXIT_DATA_RISK, EXIT_SKIP_SCHEDULE}
 
 
 def classify_exit_code(code: int | None) -> tuple[str, str]:
     """按退出码做兜底归类，返回 (category, reason)。
 
-    99=干净抢占、100/101=资源、110=数据风险、137=待归因；
+    99=干净抢占、100/101=资源、102=调度跳过（任务自治时机判断）、110=数据风险、137=待归因；
     其余非 0（含通用 1）一律按 G5 归为 unclassified → 调度器按资源错误重试，
     倒逼任务通过 last_error.category 显式上报逻辑错误（宁重试不错杀）。
     """
@@ -43,6 +50,8 @@ def classify_exit_code(code: int | None) -> tuple[str, str]:
         return Category.RESOURCE.value, "success"  # 成功不算失败，不该走到这里
     if code == EXIT_PREEMPTED:
         return Category.UNCLASSIFIED.value, "preempted"
+    if code == EXIT_SKIP_SCHEDULE:
+        return Category.UNCLASSIFIED.value, "schedule_skip"
     if code in (EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE):
         return Category.RESOURCE.value, f"exit_code_{code}"
     if code == EXIT_DATA_RISK:

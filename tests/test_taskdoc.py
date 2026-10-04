@@ -50,14 +50,14 @@ def test_path_traversal_rejected(tmp_path):
 
 
 def test_interval_requires_positive(tmp_path):
-    payload = dict(MINIMAL, schedule={"type": "interval", "interval": 0})
+    payload = dict(MINIMAL, schedule={"type": "auto", "interval": 0})
     d = _write(tmp_path, "iv", payload)
     with pytest.raises(taskdoc.TaskDocError):
         taskdoc.load_task_doc(d)
 
 
 def test_contract_exempt_manual_only(tmp_path):
-    payload = dict(MINIMAL, contract_exempt=True, schedule={"type": "interval", "interval": 60})
+    payload = dict(MINIMAL, contract_exempt=True, schedule={"type": "auto", "interval": 60})
     d = _write(tmp_path, "ex", payload)
     with pytest.raises(taskdoc.TaskDocError) as e:
         taskdoc.load_task_doc(d)

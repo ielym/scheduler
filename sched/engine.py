@@ -1,12 +1,18 @@
-"""触发引擎（自实现，不依赖 APScheduler）：interval/once/manual 与时间窗/星期的下次触发计算。
+"""触发引擎（讨论二简化版）：只做 coarse 节流，精确时机判断交给任务 SDK。
 
-纯函数计算下次触发时刻；带时间窗的 interval 用「窗口起点对齐的 N 秒网格」，支持跨天窗口。
+- type=manual：从不自动给机会（调度器只做"盲给机会"的节流器）
+- type=auto  + interval=N：每 N 秒给一次机会（now + interval）
+
+不再做时间窗/星期/单次时刻的精确判定——任务进程内用任意规则（法定节假日、
+每月特定日期、自定义日历）调 SDK reschedule(delay_sec) + exit_skip() 自行判断。
+
+保留：TriggerEngine 容器、upsert 保序、advance、due、next_run_time。
+删除：next_interval_window_fire、window_interval_containing、once_at 分支。
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -14,101 +20,21 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("sched.engine")
 
 
-def _parse_hms(value: Any) -> int:
-    parts = [int(x) for x in str(value).split(":")]
-    while len(parts) < 3:
-        parts.append(0)
-    return parts[0] * 3600 + parts[1] * 60 + parts[2]
-
-
-def next_interval_window_fire(schedule: dict[str, Any], now: datetime) -> datetime | None:
-    """从 now 向后（最多 8 天）找下一个「星期命中 + 窗口内 + 起点对齐」的时刻。"""
-    try:
-        start_sec = _parse_hms(schedule.get("start_time"))
-        end_sec = _parse_hms(schedule.get("end_time"))
-    except (TypeError, ValueError):
-        return None
-    cross_day = end_sec < start_sec
-    raw_interval = schedule.get("interval")
-    interval = int(raw_interval) if raw_interval else None
-    if interval is not None and interval <= 0:
-        return None
-    raw_days = schedule.get("weekdays") or []
-    try:
-        days = {int(x) for x in raw_days} or None
-    except (TypeError, ValueError):
-        return None
-
-    tz = now.tzinfo
-    for delta in range(-1, 9):
-        day = (now + timedelta(days=delta)).date()
-        if days is not None and day.isoweekday() not in days:
-            continue
-        day_start = datetime(day.year, day.month, day.day, tzinfo=tz) + timedelta(seconds=start_sec)
-        day_end = datetime(day.year, day.month, day.day, tzinfo=tz) + timedelta(seconds=end_sec)
-        if cross_day:
-            day_end += timedelta(days=1)
-        if day_end < now:
-            continue
-        if interval is None:
-            if day_start >= now:
-                return day_start
-            continue
-        if now <= day_start:
-            cand = day_start
-        else:
-            steps = math.ceil((now - day_start).total_seconds() / interval)
-            cand = day_start + timedelta(seconds=steps * interval)
-        if cand <= day_end:
-            return cand
-    return None
-
-
-def window_interval_containing(schedule: dict[str, Any], ts: datetime) -> tuple[datetime, datetime] | None:
-    try:
-        start_sec = _parse_hms(schedule.get("start_time"))
-        end_sec = _parse_hms(schedule.get("end_time"))
-    except (TypeError, ValueError):
-        return None
-    cross_day = end_sec < start_sec
-    raw_days = schedule.get("weekdays") or []
-    try:
-        days = {int(x) for x in raw_days} or None
-    except (TypeError, ValueError):
-        return None
-    tz = ts.tzinfo
-    for delta in (0, -1):
-        day = (ts + timedelta(days=delta)).date()
-        if days is not None and day.isoweekday() not in days:
-            continue
-        day_start = datetime(day.year, day.month, day.day, tzinfo=tz) + timedelta(seconds=start_sec)
-        day_end = datetime(day.year, day.month, day.day, tzinfo=tz) + timedelta(seconds=end_sec)
-        if cross_day:
-            day_end += timedelta(days=1)
-        if day_start <= ts <= day_end:
-            return day_start, day_end
-    return None
-
-
 def next_fire(schedule: dict[str, Any], now: datetime) -> datetime | None:
+    """按简化后的 schedule 算下一次"给机会"时刻。
+
+    auto 且 interval>0 → now + interval；manual → None（永不自动给）；
+    其他非法组合也返回 None。不做任何精确窗口/星期/单次时刻判定。
+    """
     stype = (schedule or {}).get("type") or "manual"
-    if stype == "interval":
-        if schedule.get("start_time") and schedule.get("end_time"):
-            return next_interval_window_fire(schedule, now)
-        interval = schedule.get("interval")
-        if not interval:
-            return None
-        # 纯固定间隔：从 now 起一个 interval 后
-        return now + timedelta(seconds=int(interval))
-    if stype == "once" and schedule.get("once_at"):
+    interval = schedule.get("interval")
+    if stype == "auto" and interval:
         try:
-            fire_at = datetime.fromisoformat(str(schedule["once_at"]))
-        except ValueError:
+            iv = int(interval)
+        except (TypeError, ValueError):
             return None
-        if fire_at.tzinfo is None and now.tzinfo is not None:
-            fire_at = fire_at.replace(tzinfo=now.tzinfo)
-        # 过期返回 None：once 只触发一次，到期后即失效（防无限重复入队）
-        return fire_at if fire_at > now else None
+        if iv > 0:
+            return now + timedelta(seconds=iv)
     return None
 
 
@@ -123,7 +49,7 @@ class TriggerEngine:
         """注册/刷新触发配置。
 
         保序规则：若该任务已有"未到期"的下次触发，且不晚于按新配置算出的
-        下次触发，则保留原时刻——避免热加载（refresh）把 interval 任务的
+        下次触发，则保留原时刻——避免热加载（refresh）把 auto 任务的
         触发时间整体重置为 now+interval，导致注册频繁时任务永不触发。
         """
         now = datetime.now(self._tz)
@@ -132,7 +58,6 @@ class TriggerEngine:
         if cur is not None and nxt is not None and cur > now and cur <= nxt:
             return
         if cur is None and nxt is None:
-            # 已失效的 once 任务重复刷新时不再留下 None 残留
             self._next.pop(job_id, None)
             return
         self._next[job_id] = nxt

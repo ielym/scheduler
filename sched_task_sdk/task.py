@@ -135,6 +135,31 @@ class SchedTask:
         self.state.flush()
         return self._exit(code)
 
+    # ---- 调度跳过（讨论二：任务自己判断"当前不该跑"）----
+    # 典型场景：法定节假日、每月特定日期、收盘后无意义等——调度器只负责"给机会"，
+    # 精确时机判断由任务进程内完成。任务调 reschedule(delay_sec=N) 告诉调度器
+    # "N 秒后再给机会"（写入 state.retry_hint.delay_sec，resolve_retry 与静态声明合并），
+    # 然后 exit_skip() 以 code=102 退出；调度器读 retry_hint.delay_sec 转为 not_before 重排队，
+    # attempt 不递增（这是"跳过本轮"不是"重试失败"）、不受 max_attempts/not_after 限制。
+    SCHEDULE_SKIP_CODE = 102
+
+    def reschedule(self, delay_sec: float | int = 0) -> None:
+        """告诉调度器下次希望什么时候再给机会（默认立刻给）。"""
+        self.set_retry_hint(delay_sec=delay_sec)
+
+    def exit_skip(self) -> int:
+        """结束本轮：调度器会在 delay_sec 后再给机会。
+
+        用法示例（任务 steps 开头）：
+            today = self.state.current_date  # 任务可任意判定今天该跑不
+            if today in HOLIDAYS or not self._should_run(today):
+                self.reschedule(3600)   # 1 小时后再给机会（或 0 = 立即给，自己再判）
+                return self.exit_skip()
+        """
+        self.state.mark_success()  # 本次运行无错误，只是时机不对
+        self.state.flush()
+        return self._exit(self.SCHEDULE_SKIP_CODE)
+
     # ---- 重试策略运行时声明（失败终态被调度器读取，合并 task.json 的 retry 段）----
     def set_retry_hint(self, *, delay_sec: float | int | None = None,
                        max_attempts: int | None = None,

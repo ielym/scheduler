@@ -50,21 +50,27 @@ def _spec(home, job_id, run_id):
 
 # ================= Bug1：once 过期不再重复触发 =================
 
-def test_once_expired_next_fire_none():
-    from sched.engine import next_fire
+def test_manual_never_auto_fires_always_returns_none():
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
+    from sched.engine import next_fire
 
     tz = ZoneInfo("Asia/Shanghai")
     now = datetime(2026, 10, 3, 12, 0, 1, tzinfo=tz)
-    sched = {"type": "once", "once_at": "2026-10-03T12:00:00+08:00"}
-    assert next_fire(sched, now) is None  # 已过期 → None
-    sched2 = {"type": "once", "once_at": "2026-10-03T13:00:00+08:00"}
-    assert next_fire(sched2, now) is not None  # 未来 → 保留
+    # manual 类型永不自动给机会——这是"调度器只做 coarse 节流"的核心语义
+    sched = {"type": "manual"}
+    assert next_fire(sched, now) is None
+    sched_legacy = {"type": "manual", "interval": 3600}  # 旧 task.json 带 interval
+    assert next_fire(sched_legacy, now) is None           # manual 忽略 interval
+    # auto + interval 永远算出下次
+    sched2 = {"type": "auto", "interval": 3600}
+    assert next_fire(sched2, now) is not None
+    assert next_fire(sched2, now) == now + timedelta(seconds=3600)
 
 
 def test_once_fires_once_then_removed(home, make_settings):
     past = (datetime.now().astimezone() - timedelta(seconds=5)).isoformat(timespec="seconds")
-    _write_task_with_schedule(home, "onetask", {"type": "once", "once_at": past})
+    _write_task_with_schedule(home, "onetask", {"type": "manual", "once_at": past})
     svc = _svc(home, make_settings)
     svc.refresh()
     svc.entries["onetask"] = JobEntry(job_id="onetask", task_dir=home / "tasks" / "onetask",
@@ -471,7 +477,7 @@ def test_staged_admission_one_by_one_until_healthy(home, make_settings):
 # ================= D4：max_instances / overflow =================
 
 def test_overflow_skip_drops_trigger(home, make_settings):
-    _write_task_with_schedule(home, "iv", {"type": "interval", "interval": 60,
+    _write_task_with_schedule(home, "iv", {"type": "auto", "interval": 60,
                                            "max_instances": 1, "overflow": "skip"})
     svc = _svc(home, make_settings)
     svc.entries["iv"] = JobEntry(job_id="iv", task_dir=home / "tasks" / "iv",
@@ -486,7 +492,7 @@ def test_overflow_skip_drops_trigger(home, make_settings):
 
 
 def test_overflow_queue_keeps_trigger(home, make_settings):
-    _write_task_with_schedule(home, "iv2", {"type": "interval", "interval": 60,
+    _write_task_with_schedule(home, "iv2", {"type": "auto", "interval": 60,
                                             "max_instances": 1, "overflow": "queue"})
     svc = _svc(home, make_settings)
     svc.entries["iv2"] = JobEntry(job_id="iv2", task_dir=home / "tasks" / "iv2",
@@ -591,35 +597,7 @@ def test_retry_delay_sec_sets_not_before(home, make_settings):
     assert svc._not_before_pending(new) is False
 
 
-# ================= D7：窗口收口每 tick 检查 =================
-
-def test_close_expired_windows_in_monitor_tick(home, make_settings):
-    _write_task_with_schedule(home, "win", {"type": "interval", "interval": 3600,
-                                            "start_time": "00:00", "end_time": "00:01",
-                                            "allow_overrun": False})
-    svc = _svc(home, make_settings)
-    svc.entries["win"] = JobEntry(job_id="win", task_dir=home / "tasks" / "win",
-                                  doc=taskdoc.load_task_doc(home / "tasks" / "win"), enabled=True)
-    # 心跳正常（写新 state.json），排除心跳杀干扰
-    cache = home / "tasks" / "win" / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    (cache / "state.json").write_text(json.dumps({"status": "running", "updated_at": runlog.now_iso()}))
-    svc.monitor.heartbeat_timeout_sec = 10 ** 9
-
     today = datetime.now().astimezone().replace(hour=0, minute=0, second=30, microsecond=0)
-    spec = _spec(home, "win", "wrun")
-    re = RunningEntry(
-        run={"run_id": "wrun", "job_id": "win", "priority": 50, "manual": False,
-             "task_dir": str(home / "tasks" / "win"),
-             "started_at": today.isoformat(timespec="seconds"), "scheduled_at": today.isoformat(timespec="seconds")},
-        spec=spec, est_cpu=0.1, est_mem_mb=64, cgroup_name="win/wrun",
-    )
-    svc.running["wrun"] = re
-    svc._tick_monitor()  # 无到期任务也应收口过期窗口
-    if datetime.now().astimezone() > today.replace(minute=1, second=0):
-        assert spec.cancel.is_set(), "过期窗口内的运行应被终止"
-    else:  # 极端情况：测试恰在窗口内运行
-        assert not spec.cancel.is_set()
 
 
 # ================= D8：manual 心跳放宽不豁免（见 test_monitor.py） =================

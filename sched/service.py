@@ -466,6 +466,12 @@ class SchedulerService:
 
     # 允许在管理台编辑的"纯调度参数"白名单（与业务代码无关，改完立即生效）
     _JOB_CONFIG_KEYS = {"priority", "schedule", "heartbeat", "retry"}
+    # schedule 下允许通过管理台修改的字段（讨论二简化后仅 4 个：
+    # type=manual|auto + interval=给机会的最小间隔秒数 + 并发控制 max_instances/overflow）
+    # start_time/end_time/weekdays/once_at/allow_overrun 已废弃，不在此白名单，
+    # 但 ScheduleSpec 仍保留定义 + model_config extra="ignore"，所以旧 task.json
+    # 含这些字段时热加载也不报错（只是不生效）。
+    _SCHEDULE_EDITABLE_KEYS = {"type", "interval", "max_instances", "overflow"}
     _JOB_CONFIG_SUBKEYS = {
         "heartbeat": {"timeout_sec"},
         "retry": {"delay_sec", "max_attempts", "not_after"},
@@ -494,7 +500,7 @@ class SchedulerService:
         if "schedule" in patch:
             if not isinstance(patch["schedule"], dict):
                 raise taskdoc.TaskDocError("schedule 必须是对象")
-            extra = set(patch["schedule"]) - set(taskdoc.ScheduleSpec.model_fields)
+            extra = set(patch["schedule"]) - self._SCHEDULE_EDITABLE_KEYS
             if extra:
                 raise taskdoc.TaskDocError(f"schedule 中不允许修改的字段：{sorted(extra)}")
 
@@ -550,10 +556,14 @@ class SchedulerService:
         if e is None or not e.ok or e.doc is None:
             raise taskdoc.TaskDocError(f"任务不可用：{job_id}")
         d = e.doc
+        # 对外只暴露生效字段（废弃的 start_time/end_time/weekdays/once_at/allow_overrun 不吐）
+        raw = d.schedule.model_dump()
+        _SCHEDULE_FIELDS = {"type", "interval", "max_instances", "overflow"}
+        sched = {k: raw[k] for k in _SCHEDULE_FIELDS if k in raw}
         return {
             "job_id": job_id,
             "priority": d.priority,
-            "schedule": d.schedule.model_dump(),
+            "schedule": sched,
             "heartbeat": {"timeout_sec": d.heartbeat.timeout_sec},
             "retry": d.retry.model_dump(),
         }
@@ -633,10 +643,13 @@ class SchedulerService:
                     self.engine.advance(jid, e.schedule(), now)
                     continue
                 # overflow=queue：照常入队，由准出侧的并发上限把关
-            self._enqueue(e, trigger=("once" if doc.schedule.type == "once" else "interval"))
+            # 讨论二：调度器只做"给机会"的 coarse 节流，统一 trigger="auto"
+            # 任务进程内自行判断时机（法定节假日、每月特定日期等）
+            self._enqueue(e, trigger="auto")
             self.engine.advance(jid, e.schedule(), now)
             if self.engine.next_run_time(jid) is None:
-                # once 到期后 next_fire 为 None：从触发引擎摘除，防止重复到期
+                # 理论上 auto + interval 永远算得出下次（advance 会用 new schedule 重算）；
+                # 但为防万一（interval 被改没了），next_fire 返回 None 时也摘除避免空耗
                 self.engine.remove(jid)
 
     def _instances_in_flight(self, job_id: str) -> int:
@@ -851,12 +864,9 @@ class SchedulerService:
 
     # ================= 监测 =================
     def _tick_monitor(self) -> None:
+        # 讨论二：窗口收口已移除——调度器不再决定"时机对不对"，
+        # 精确时机判断交给任务进程内 SDK reschedule()/exit_skip() 自治。
         now = datetime.now(ZoneInfo(self.settings.timezone))
-        # 窗口到点收口（每 tick 检查，不依赖是否有到期任务）：
-        # allow_overrun=false 时终止过期窗口内的在途运行
-        for e in self.entries.values():
-            if e.ok and e.doc is not None:
-                self._close_expired_windows(e.doc, now)
         obs = []
         with self._lock:
             running = list(self.running.values())
@@ -970,8 +980,16 @@ class SchedulerService:
     def _after_finalize(self, rec: dict, status: str) -> None:
         jid = rec["job_id"]
         if status == runlog.STATUS_SUCCESS:
-            # 不再有"成功冷却"：何时再跑由任务 schedule（interval/时间窗）决定；
-            # 需要纠错/回扫节奏的任务自行配置 schedule 或 retry 策略
+            # 调度器不再决定"该不该再跑"——auto 类任务由 engine 继续给机会，
+            # 任务自己在 SDK 内判断时机；任务进程内纠错/回扫节奏自己定（state.reschedule 等）。
+            return
+        if rec.get("exit_code") == errors.EXIT_SKIP_SCHEDULE:
+            # 【讨论二】任务判断"当前不该跑"（法定节假日、每月特定日期、收盘后无意义等）：
+            # 不是错误——任务已在进程内完成语义判断，只是调度器盲给的机会时机不对。
+            # 任务通常会先调 SDK state.reschedule(delay_sec=N) 指定下次希望被给机会的间隔，
+            # 通过 state.retry_hint.delay_sec 传入；若未指定，fallback 用 retry.delay_sec（默认 0）。
+            # attempt 不递增（这是"跳过本轮"不是"重试失败"）、不受 max_attempts/not_after 限制。
+            self._handle_schedule_skip(rec)
             return
         if status == runlog.STATUS_PREEMPTED:
             self._requeue_resume(rec, exempt_sec=self.preempt_exempt_sec)
@@ -1102,6 +1120,24 @@ class SchedulerService:
         persist.append_decision({"ts": runlog.now_iso(), "act": "retry_enqueue", "run_id": new_rec["run_id"],
                                  "job_id": jid, "attempt": attempts + 1,
                                  "delay_sec": round(delay, 3), "category": category})
+
+    def _handle_schedule_skip(self, rec: dict) -> None:
+        """任务自治跳过本轮（exit 102）：时机不对不是错误，不递增 attempt、不受 max_attempts/not_after 限制。"""
+        jid = rec["job_id"]
+        e = self.entries.get(jid)
+        doc = e.doc if e is not None and e.ok else None
+        now = datetime.now().astimezone()
+        # 仅拿 delay_sec：SDK state.reschedule(delay_sec=N) 写到 retry_hint.delay_sec，
+        # resolve_retry 会把它与 task.json retry.delay_sec 合并；max_attempts/not_after 忽略。
+        pol = taskdoc.resolve_retry(doc, rec.get("state_snapshot"), now)
+        delay = max(0.0, float(pol["delay_sec"]))
+        not_before = (now + timedelta(seconds=delay)).isoformat(timespec="seconds") if delay > 0 else ""
+        new_rec = self._new_run_record(rec, attempt=int(rec.get("attempt") or 1), not_before=not_before)
+        with self._lock:
+            self.state.enqueue(new_rec)
+        persist.save_scheduler_state(self.state)
+        persist.append_decision({"ts": runlog.now_iso(), "act": "schedule_skip", "run_id": new_rec["run_id"],
+                                 "job_id": jid, "delay_sec": round(delay, 3)})
 
     def _requeue_resume(self, rec: dict, exempt_sec: float = 0.0) -> None:
         jid = rec["job_id"]
@@ -1287,31 +1323,19 @@ class SchedulerService:
         except ValueError:
             return False
 
-    def _close_expired_windows(self, doc: taskdoc.TaskDoc, now: datetime) -> None:
-        sched = doc.schedule
-        if sched.type != "interval" or not (sched.start_time and sched.end_time) or sched.allow_overrun:
-            return
-        with self._lock:
-            running = list(self.running.values())
-        for re in running:
-            rec = re.run
-            started = rec.get("started_at") or rec.get("scheduled_at")
-            try:
-                st = datetime.fromisoformat(started)
-            except (ValueError, TypeError):
-                continue
-            win = _engine_mod.window_interval_containing(sched.model_dump(), st.astimezone(now.tzinfo))
-            if win and now > win[1]:
-                re.spec.cancel.set()
-
     # ================= 查询 =================
     def list_jobs(self) -> list[dict]:
         out = []
+        # 讨论二：ScheduleSpec 仍保留废弃字段（start_time/end_time/weekdays/once_at/allow_overrun）
+        # 以兼容旧 task.json 加载不报错，但对外返回的 schedule 应只暴露生效字段
+        _SCHEDULE_FIELDS = {"type", "interval", "max_instances", "overflow"}
         for e in sorted(self.entries.values(), key=lambda x: x.job_id):
+            raw = e.schedule() if e.doc else {}
+            sched_out = {k: raw[k] for k in _SCHEDULE_FIELDS if k in raw}
             out.append({
                 "job_id": e.job_id, "name": e.doc.display_name() if e.doc else e.job_id,
                 "ok": e.ok, "error": e.error, "enabled": e.enabled,
-                "schedule": e.schedule(), "priority": e.doc.priority if e.doc else 0,
+                "schedule": sched_out, "priority": e.doc.priority if e.doc else 0,
                 "next_run_at": self.engine.next_run_time(e.job_id),
                 "heartbeat_timeout_sec": e.doc.heartbeat.timeout_sec if e.doc else None,
                 "retry": e.doc.retry.model_dump() if e.doc else None,

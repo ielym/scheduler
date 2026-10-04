@@ -9,11 +9,8 @@
     "cwd": "."
   },
   "schedule": {
-    "type": "interval",
+    "type": "auto",
     "interval": 86400,
-    "start_time": "18:40",
-    "end_time": "23:00",
-    "allow_overrun": true,
     "max_instances": 1,
     "overflow": "skip"
   },

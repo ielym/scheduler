@@ -73,8 +73,8 @@ def test_job_config_update_takes_effect_immediately(home, make_settings):
     c = TestClient(web.create_app(svc))
     r = c.post("/api/jobs/cfg_job/config", json={
         "priority": 77,
-        "schedule": {"type": "interval", "interval": 900,
-                     "start_time": "18:40", "end_time": "22:00", "weekdays": [1, 3, 5]},
+        "schedule": {"type": "auto", "interval": 900,
+                     "max_instances": 1, "overflow": "skip"},
         "retry": {"delay_sec": 15, "max_attempts": 3, "not_after": "23:00"},
     })
     assert r.status_code == 200, r.text

@@ -31,6 +31,20 @@ class TaskDocError(Exception):
         super().__init__("; ".join(self.errors))
 
 
+def _ignore_extra(**kwargs):
+    """让 Pydantic v2 额外字段被静默忽略（旧 task.json 含 start_time/end_time 等
+    已废弃字段时，热加载不会报错）。"""
+    return {**kwargs}
+
+
+class _CompatExtra:
+    """旧 task.json 可能含已移除的窗口/once 字段；加载时忽略、写回时不回填。"""
+    @classmethod
+    def model_config(cls):
+        from pydantic import ConfigDict
+        return ConfigDict(extra="ignore")
+
+
 class EntrySpec(BaseModel):
     file: str
     interpreter: str | None = "python3"
@@ -63,33 +77,42 @@ class EntrySpec(BaseModel):
 
 
 class ScheduleSpec(BaseModel):
-    type: Literal["interval", "once", "manual"] = "manual"
+    """【讨论二 简化】调度器只做 coarse 节流，精确时机判断交给任务 SDK。
+
+    两值模型：
+    - manual：从不自动给机会，仅在 CLI 或管理台「立即运行一次」时 enqueue
+    - auto：自动给机会；interval（秒）= 给机会的最小间隔；interval 为 None 时
+      engine 不自动触发（需要外部手动触发，但 overflow/max_instances 等并发控制仍生效）
+
+    已废弃：start_time/end_time/weekdays（时间窗/星期）、once_at（单次时刻）、
+    allow_overrun。调度器不再做精确窗口判定，任务进程内用任意规则（法定节假日、
+    每月特定日期、自定义日历）调 SDK reschedule(delay_sec) + exit_skip() 自行判断。
+    """
+    type: Literal["manual", "auto"] = "manual"
+    # 给机会的最小间隔（秒）。auto 类型时必填且 >0；manual 时忽略。
+    # 任务可以通过 SDK reschedule()/exit_skip() 把实际触发节奏放得更紧/更松。
     interval: int | None = None
-    once_at: str | None = None
+    # 下面四个字段已废弃（讨论二移到任务 SDK 自行判断），保留定义只用于兼容旧 task.json
+    # 加载时不报错；新文档不应再出现；写回（update_job_config）也不会回填。
     start_time: str | None = None
     end_time: str | None = None
     weekdays: list[int] = Field(default_factory=list)
+    once_at: str | None = None
     allow_overrun: bool = False
+    # 并发控制不属于"时机判断"，保留：
     max_instances: int = 1
     overflow: Literal["skip", "queue"] = "skip"
 
+    model_config = {"extra": "ignore"}
+
     @model_validator(mode="after")
     def _check(self) -> "ScheduleSpec":
-        if self.type == "interval":
+        if self.type == "auto":
             if not self.interval or self.interval <= 0:
-                raise ValueError("schedule.type=interval 时 schedule.interval 必须为正整数秒")
-            if (self.start_time is None) != (self.end_time is None):
-                raise ValueError("schedule.start_time 与 schedule.end_time 必须同时提供；都不填 = 全天")
-            if self.start_time is not None:
-                if not TIME_OF_DAY_RE.match(str(self.start_time)) or not TIME_OF_DAY_RE.match(str(self.end_time)):
-                    raise ValueError("schedule.start_time/end_time 必须是 HH:MM 或 HH:MM:SS")
-            for d in self.weekdays:
-                if not isinstance(d, int) or isinstance(d, bool) or d < 1 or d > 7:
-                    raise ValueError("schedule.weekdays 只能是 1..7 的整数（1=周一，7=周日）")
-            if self.weekdays:
-                self.weekdays = sorted(set(self.weekdays))
-        elif self.type == "once" and not self.once_at:
-            raise ValueError("schedule.type=once 时必须提供 schedule.once_at（ISO8601）")
+                raise ValueError("schedule.type=auto 时 schedule.interval 必须为正整数秒（给机会的最小间隔）")
+        elif self.type == "manual":
+            # manual 类型 interval 忽略：调度器从不自动给机会
+            self.interval = None
         if not isinstance(self.max_instances, int) or isinstance(self.max_instances, bool):
             raise ValueError("schedule.max_instances 必须是整数（1~20）")
         if not 1 <= self.max_instances <= 20:
