@@ -322,6 +322,13 @@ def execute(spec: RunSpec, on_started: Callable[[int, int], None] | None = None)
         elif exit_code == errors.EXIT_DATA_RISK:
             status = runlog.STATUS_FAILED
             reason = "data_risk"
+        elif exit_code == errors.EXIT_SKIP_SCHEDULE:
+            # 讨论二：任务自治时机判断"当前不该跑"——不是错误，只是调度器盲给的机会时机不对。
+            # SDK exit_skip() 会先 mark_success 再 exit(102)，所以 run 语义上是"成功完结、时机不对"；
+            # 终态 status 记 SUCCESS（和普通成功一样），reason 标注 schedule_skip 便于排障。
+            # service._after_finalize 会用 exit_code==102 拦截走 _handle_schedule_skip 重排队。
+            status = runlog.STATUS_SUCCESS
+            reason = "schedule_skip（时机不对，SDK reschedule 已指定下次机会）"
         elif exit_code == errors.EXIT_SIGKILL or exit_code == -signal.SIGKILL:
             # SIGKILL：Popen 直接 exec 时返回 -9，经 shell 包装才是 137；
             # 两种形态都要识别，否则 OOM/外部 SIGKILL 归因会失效

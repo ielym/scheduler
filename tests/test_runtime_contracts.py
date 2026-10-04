@@ -476,6 +476,62 @@ def test_data_risk_110_second_pass_end_to_end(home, make_settings):
     assert [r.get("item") for r in skipped] == ["item-1"]
 
 
+# ================= D9：exit 102 调度跳过端到端 =================
+
+SKIP_RUN_PY = '''import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from sched_task_sdk import SchedTask, Step, run_task
+
+class T(SchedTask):
+    def steps(self, resume):
+        yield Step("check")
+        if not self.dry_run:
+            self.reschedule(delay_sec=2)
+            self.state.flush()
+            sys.exit(self.exit_skip())
+        yield Step("done")
+
+if __name__ == "__main__":
+    sys.exit(run_task(T()))
+'''
+
+
+def test_exit_102_schedule_skip_reschedules_end_to_end(home, make_settings):
+    """讨论二：任务 SDK reschedule(2)+exit_skip(102) → 调度器重排队带 not_before、
+    attempt 不递增、终态 status=success、decisions 记 schedule_skip。"""
+    task_dir = write_task(home, "skipping", real_sleep=0.01)
+    # 覆盖 run.py + 清 outputs.expect（skip 不需要 final.json）
+    (task_dir / "run.py").write_text(SKIP_RUN_PY, encoding="utf-8")
+    tj = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+    tj["outputs"]["expect"] = []
+    (task_dir / "task.json").write_text(json.dumps(tj, ensure_ascii=False, indent=2), encoding="utf-8")
+    doc = taskdoc.load_task_doc(task_dir)
+    svc = SchedulerService(make_settings(run_user=""))
+    svc.entries["skipping"] = JobEntry(job_id="skipping", task_dir=task_dir,
+                                       doc=doc, enabled=True)
+
+    svc.trigger("skipping", trigger="manual")
+    svc._tick_admission()
+    assert _wait(lambda: runlog.query_runs(job_id="skipping"))
+    first = runlog.query_runs(job_id="skipping")[0]
+    assert first["exit_code"] == errors.EXIT_SKIP_SCHEDULE
+    assert first["status"] == runlog.STATUS_SUCCESS, (
+        "exit 102 终态应是 success（任务没失败，只是时机不对）"
+    )
+    assert "schedule_skip" in (first.get("reason") or "")
+
+    # 调度器重排队（_handle_schedule_skip → WQ 有 1 个，attempt 不递增）
+    assert len(svc.state.wq) == 1
+    new_rec = svc.state.wq[0]
+    assert new_rec.get("not_before"), "skip 重排队应带 not_before"
+    nb = datetime.fromisoformat(new_rec["not_before"]).astimezone()
+    assert 0 < (nb - datetime.now().astimezone()).total_seconds() < 6
+    assert int(new_rec.get("attempt") or 1) == int(first.get("attempt") or 1)
+
+    decisions = store.read_jsonl(config.decisions_log())
+    assert any(d.get("act") == "schedule_skip" for d in decisions)
+
+
 # ================= SDK：skip_item 去重 + read_pending_skipped =================
 
 def test_sdk_skip_item_dedup_and_read(tmp_path):

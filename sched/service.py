@@ -979,17 +979,15 @@ class SchedulerService:
 
     def _after_finalize(self, rec: dict, status: str) -> None:
         jid = rec["job_id"]
-        if status == runlog.STATUS_SUCCESS:
-            # 调度器不再决定"该不该再跑"——auto 类任务由 engine 继续给机会，
-            # 任务自己在 SDK 内判断时机；任务进程内纠错/回扫节奏自己定（state.reschedule 等）。
-            return
+        # exit 102 = 调度跳过（任务自治时机判断）——虽然 runner 把终态 status 记 SUCCESS，
+        # 但后续调度不能按普通成功处理（engine 继续给机会而是立即重排队），
+        # 所以这里必须**前置** exit_code 分支、先于 STATUS_SUCCESS 的空 return。
         if rec.get("exit_code") == errors.EXIT_SKIP_SCHEDULE:
-            # 【讨论二】任务判断"当前不该跑"（法定节假日、每月特定日期、收盘后无意义等）：
-            # 不是错误——任务已在进程内完成语义判断，只是调度器盲给的机会时机不对。
-            # 任务通常会先调 SDK state.reschedule(delay_sec=N) 指定下次希望被给机会的间隔，
-            # 通过 state.retry_hint.delay_sec 传入；若未指定，fallback 用 retry.delay_sec（默认 0）。
-            # attempt 不递增（这是"跳过本轮"不是"重试失败"）、不受 max_attempts/not_after 限制。
             self._handle_schedule_skip(rec)
+            return
+        if status == runlog.STATUS_SUCCESS:
+            # 普通成功：auto 类 engine 继续按 interval 给机会；
+            # 任务进程内纠错/回扫节奏自己定（state.reschedule 等）。
             return
         if status == runlog.STATUS_PREEMPTED:
             self._requeue_resume(rec, exempt_sec=self.preempt_exempt_sec)
