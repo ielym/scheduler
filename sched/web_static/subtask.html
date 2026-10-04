@@ -366,17 +366,37 @@ async function batchStopProcesses(){
   alert(`批量停止完成：成功 ${ok}，失败 ${fail}`);
   refreshProcesses();
 }
-async function batchDeleteProcesses(){
+function batchDeleteProcesses(){
   const rids = selectedIds('processesTable');
   if(!rids.length) return alert('请先勾选要删除的进程');
-  if(!confirm(`确认删除 ${rids.length} 个进程？`)) return;
-  let ok=0, fail=0;
-  for(const rid of rids){
-    try{ await fetch(API+'/api/process/'+encodeURIComponent(rid),{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
-    catch(e){ fail++; }
-  }
-  alert(`批量删除完成：成功 ${ok}，失败 ${fail}`);
-  refreshProcesses();
+  qs('#batchModal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay'; overlay.id='batchModal';
+  overlay.innerHTML = `<div class="modal" style="max-width:460px"><div class="modal-head">
+    <div><h3>批量删除 ${rids.length} 个进程</h3></div>
+    <button class="btn ghost" onclick="document.getElementById('batchModal').remove()">✕</button>
+  </div><div class="modal-body">
+    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止这些进程（若运行中）并从界面移除，不影响任务与其他进程。</div>
+    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+      <input type="checkbox" id="batchDelFiles"> 同时删除这些进程的日志与缓存文件
+    </label>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn ghost" onclick="document.getElementById('batchModal').remove()">取消</button>
+      <button class="btn danger" id="batchConfirm">确认删除</button>
+    </div>
+  </div></div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#batchConfirm').onclick = async ()=>{
+    const delFiles = overlay.querySelector('#batchDelFiles').checked;
+    overlay.remove();
+    let ok=0, fail=0;
+    for(const rid of rids){
+      try{ await fetch(API+'/api/process/'+encodeURIComponent(rid)+'?delete_files='+delFiles,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
+      catch(e){ fail++; }
+    }
+    alert(`批量删除完成：成功 ${ok}，失败 ${fail}`);
+    refreshProcesses();
+  };
 }
 
 loadSubtask();

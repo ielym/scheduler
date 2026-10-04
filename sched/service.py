@@ -942,9 +942,9 @@ class SchedulerService:
         persist.save_scheduler_state(st)
 
         # 4) 清意图消费状态
-        intents = scanner.load_intents_state()
+        intents = _scanner.load_intents_state()
         intents.pop(name, None)
-        scanner.save_intents_state(intents)
+        __scanner.save_intents_state(intents)
 
         # 5) 清运行历史 jsonl + 日志目录
         import shutil
@@ -1005,14 +1005,14 @@ class SchedulerService:
 
         # 该 run 对应的 intent 标 done（若仍指向该 run），不影响其他进程
         if subtask_id and request_id:
-            intents = scanner.load_intents_state()
+            intents = _scanner.load_intents_state()
             st = intents.get(subtask_id, {}).get(request_id)
             if st and st.get("run_id") == run_id:
                 st["status"] = "done"
                 st["run_id"] = ""
                 st["finished_at"] = runlog.now_iso()
                 st["rejected_reason"] = f"进程 {run_id} 被删除"
-                scanner.save_intents_state(intents)
+                _scanner.save_intents_state(intents)
 
         return {"ok": True, "run_id": run_id, "subtask_id": subtask_id,
                 "request_id": request_id, "deleted_files": delete_files}
