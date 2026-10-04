@@ -731,9 +731,8 @@ class SchedulerService:
         except Exception:
             pass
 
-        attempt = int(rec.get("attempt") or 1)
         decision = control.decide_from_exit(
-            outcome.exit_code, directive, lifetime_retry, attempt,
+            outcome.exit_code, directive, lifetime_retry,
             now=datetime.now().astimezone(),
         )
 
@@ -755,7 +754,6 @@ class SchedulerService:
             return
 
         # 非终结 → 续跑/重试
-        new_attempt = attempt + (1 if decision.attempt_increment else 0)
         resume_ref = decision.action == "resume"
         nb = decision.not_before
 
@@ -767,7 +765,7 @@ class SchedulerService:
             if not intent_path.exists():
                 _scanner.mark_terminal(stid, rid, "done", reason="意图文件消失（second_pass 跳过）")
                 return
-            self._enqueue_intent(stid, rid, trigger="second_pass", attempt=new_attempt,
+            self._enqueue_intent(stid, rid, trigger="second_pass",
                                  resume_ref=resume_ref, not_before=nb)
             _scanner.mark_retry_same(stid, rid)
             return
@@ -780,7 +778,7 @@ class SchedulerService:
                 _scanner.mark_terminal(stid, rid, "done", reason="意图文件消失")
                 return
             self._enqueue_intent(stid, rid, trigger=("resume" if resume_ref else "retry"),
-                                 attempt=new_attempt, resume_ref=resume_ref, not_before=nb)
+                                 resume_ref=resume_ref, not_before=nb)
             _scanner.mark_retry_same(stid, rid)
             return
 

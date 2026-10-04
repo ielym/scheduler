@@ -372,7 +372,7 @@ def execute(spec: RunSpec, on_started=None) -> RunOutcome:
             if oom:
                 status, reason = "resource", "cgroup OOM（超限被内核杀）"
             elif scheduler_signaled:
-                status, reason = "preempt_failed", "终结超时被 SIGKILL"
+                status, reason = "preempted", "抢占超时未落断点被 SIGKILL（回退重跑）"
             else:
                 status, reason = "failed", f"被 SIGKILL（rc={exit_code}）"
         else:

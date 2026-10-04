@@ -45,8 +45,7 @@ class LifetimeSpec(BaseModel):
     completion: Literal["terminal", "indefinite"] = "terminal"
     # 意图完成后的自动重试策略（资源错误/抢占导致的退出）
     retry: dict[str, Any] = Field(default_factory=lambda: {
-        "max_attempts": 0,        # 0=持续重试；正整数 N=到第 N 次仍失败则终结
-        "backoff_base_sec": 5,    # 退避初始秒数（指数到 300s 封顶）
+        "backoff_base_sec": 5,    # 资源不足回退 pending 的固定退避（防热循环）
         "backoff_cap_sec": 300,
         "not_after": "",          # ISO8601 绝对时间或每日 HH:MM；空=无截止
     })

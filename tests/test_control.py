@@ -11,62 +11,54 @@ from sched import errors
 class TestExitDecision:
     def test_exit_0_is_terminal_done(self):
         d = ctrl_mod.decide_from_exit(0, ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry=None, attempt=1)
+                                       lifetime_retry=None)
         assert d.terminal is True
         assert d.action == "done"
 
     def test_exit_99_is_resume_same_intent(self):
         d = ctrl_mod.decide_from_exit(errors.EXIT_PREEMPTED,
                                        ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry=None, attempt=1)
+                                       lifetime_retry=None)
         assert d.terminal is False
         assert d.action == "resume"
-        assert d.attempt_increment is False
 
-    def test_resource_error_retries_without_failure_record(self):
+    def test_resource_error_back_to_pending(self):
         d = ctrl_mod.decide_from_exit(errors.EXIT_RESOURCE,
                                        ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry={"max_attempts": 0, "backoff_base_sec": 5, "backoff_cap_sec": 300},
-                                       attempt=3)
+                                       lifetime_retry={"backoff_base_sec": 5})
         assert d.terminal is False
         assert d.action == "retry"
-        assert d.attempt_increment is False  # 资源不足不算失败，不计 attempt
         assert d.not_before  # 有固定退避防热循环
 
-    def test_resource_error_never_terminal_by_attempts(self):
-        # 资源不足不是任务失败，即使 attempt 已大也不终结，回退 pending 等待
+    def test_resource_error_never_terminal(self):
+        # 资源不足不是任务失败，永远回退 pending 等待，不终结
         d = ctrl_mod.decide_from_exit(errors.EXIT_EXTERNAL_RESOURCE,
                                        ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry={"max_attempts": 3, "backoff_base_sec": 5, "backoff_cap_sec": 300},
-                                       attempt=3)
+                                       lifetime_retry={"backoff_base_sec": 5})
         assert d.terminal is False
         assert d.action == "retry"
-        assert d.attempt_increment is False
 
     def test_stop_directive_overrides_exit_code(self):
         # 即使 exit_code=0，只要 stop directive 就终结
         d = ctrl_mod.decide_from_exit(0, ctrl_mod.ControlDirective(action="stop"),
-                                       lifetime_retry=None, attempt=1)
+                                       lifetime_retry=None)
         assert d.terminal is True
         assert d.action == "done"
 
     def test_no_retry_on_nonzero_exit_is_terminal(self):
         d = ctrl_mod.decide_from_exit(errors.EXIT_RESOURCE,
                                        ctrl_mod.ControlDirective(action="no_retry"),
-                                       lifetime_retry=None, attempt=2)
+                                       lifetime_retry=None)
         assert d.terminal is True
         assert d.action == "done"
 
     def test_reschedule_directive_sets_not_before(self):
         d = ctrl_mod.decide_from_exit(errors.EXIT_OK,
                                        ctrl_mod.ControlDirective(action="reschedule", delay_sec=120),
-                                       lifetime_retry=None, attempt=1)
+                                       lifetime_retry=None)
         assert d.terminal is False
         assert d.action == "skip"
-        assert d.not_before  # ISO 时间
-        # 延迟应为 120s
-        from datetime import datetime
-        import os
+        assert d.not_before
         now = datetime.now().astimezone()
         target = datetime.fromisoformat(d.not_before)
         assert abs((target - now - timedelta(seconds=120)).total_seconds()) < 5
@@ -74,30 +66,27 @@ class TestExitDecision:
     def test_data_risk_110_is_non_terminal(self):
         d = ctrl_mod.decide_from_exit(errors.EXIT_DATA_RISK,
                                        ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry=None, attempt=1)
+                                       lifetime_retry=None)
         assert d.terminal is False
         assert d.action == "second_pass"
 
     def test_none_exit_code_default_terminal(self):
         d = ctrl_mod.decide_from_exit(None, ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry=None, attempt=1)
+                                       lifetime_retry=None)
         assert d.terminal is True
 
     def test_unknown_nonzero_falls_back_to_resource_retry(self):
         d = ctrl_mod.decide_from_exit(42, ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry={"max_attempts": 2, "backoff_base_sec": 5, "backoff_cap_sec": 300},
-                                       attempt=1)
+                                       lifetime_retry={"backoff_base_sec": 5})
         assert d.terminal is False
-        assert d.action == "retry"
-        assert d.attempt_increment is False  # 未分类按资源处理，不计失败
+        assert d.action == "retry"  # 未分类按资源处理，回退 pending
 
     def test_exit_102_skips_schedule(self):
         d = ctrl_mod.decide_from_exit(errors.EXIT_SKIP_SCHEDULE,
                                        ctrl_mod.ControlDirective(action="none"),
-                                       lifetime_retry=None, attempt=1)
+                                       lifetime_retry=None)
         assert d.terminal is False
         assert d.action == "skip"
-        assert d.attempt_increment is False
         assert d.not_before  # 有兜底延迟
 
 

@@ -69,7 +69,7 @@ def emit_intent(
     if lifetime is None:
         lifetime = {
             "completion": "indefinite" if kind == "daemon" else "terminal",
-            "retry": {"max_attempts": 0, "backoff_base_sec": 5, "backoff_cap_sec": 300, "not_after": ""},
+            "retry": {"backoff_base_sec": 5, "backoff_cap_sec": 300, "not_after": ""},
         }
     rid = request_id or _make_request_id()
     if not rid:

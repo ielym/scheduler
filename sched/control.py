@@ -46,7 +46,6 @@ class ExitDecision:
     terminal: bool              # True=意图 done/archived；False=继续续跑/重试同意图
     directive: ControlDirective  # 合并运行时 control 段
     action: str                 # done | resume | retry | skip | second_pass | kill_attribution
-    attempt_increment: bool     # 本次是否计入 attempt
     not_before: str = ""        # ISO8601，到点前不参与准出
 
 
@@ -98,7 +97,7 @@ def _not_before(now: datetime, delay_sec: float) -> str:
 
 def decide_from_exit(exit_code: int | None, directive: ControlDirective,
                      lifetime_retry: dict[str, Any] | None,
-                     attempt: int, now: datetime | None = None) -> ExitDecision:
+                     now: datetime | None = None) -> ExitDecision:
     """进程退出后，合并「退出码 + 运行时 control + 意图生命周期」给出终结决策。
 
     优先级：运行时 control（stop/no_retry）> 退出码。
@@ -113,55 +112,54 @@ def decide_from_exit(exit_code: int | None, directive: ControlDirective,
     # --- 运行时 control 优先 ---
     if directive.action == "stop":
         # 进程请求结束：终结意图，不再续跑
-        return ExitDecision(terminal=True, directive=directive, action="done", attempt_increment=False)
+        return ExitDecision(terminal=True, directive=directive, action="done")
 
     if directive.action == "no_retry":
         # 进程声明不再重试：非 0 退出时终结；0 退出本身也终结
-        return ExitDecision(terminal=True, directive=directive, action="done", attempt_increment=False)
+        return ExitDecision(terminal=True, directive=directive, action="done")
 
     if directive.action == "reschedule":
         # 进程声明稍后再跑：回 pending + not_before，不算 attempt
         nb = _not_before(now, directive.delay_sec)
         return ExitDecision(terminal=False, directive=directive, action="skip",
-                            attempt_increment=False, not_before=nb)
+                             not_before=nb)
 
     # --- 纯退出码判定 ---
     if exit_code is None:
-        return ExitDecision(terminal=True, directive=directive, action="done", attempt_increment=False)
+        return ExitDecision(terminal=True, directive=directive, action="done")
 
     if exit_code == err.EXIT_OK:
-        return ExitDecision(terminal=True, directive=directive, action="done", attempt_increment=False)
+        return ExitDecision(terminal=True, directive=directive, action="done")
 
     if exit_code == err.EXIT_PREEMPTED:
         # 抢占/停止：断点已保存 → 续跑同意图，attempt 不递增
-        return ExitDecision(terminal=False, directive=directive, action="resume", attempt_increment=False)
+        return ExitDecision(terminal=False, directive=directive, action="resume")
 
     if exit_code == err.EXIT_DATA_RISK:
         # 数据风险：调度器可选二刷（由意图 lifetime 或后续策略决定）
-        return ExitDecision(terminal=False, directive=directive, action="second_pass",
-                            attempt_increment=False)
+        return ExitDecision(terminal=False, directive=directive, action="second_pass")
 
     if exit_code == err.EXIT_SKIP_SCHEDULE:
         # 任务判定当前不该跑（时间窗/节假日等）：跳过本轮，稍后重排再给机会，不计 attempt。
         # 精确的"下次时机"应由任务用 reschedule(delay) 表达；此处给一个保守兜底延迟。
         nb = _not_before(now, base)
         return ExitDecision(terminal=False, directive=directive, action="skip",
-                            attempt_increment=False, not_before=nb)
+                             not_before=nb)
 
     if exit_code in (err.EXIT_RESOURCE, err.EXIT_EXTERNAL_RESOURCE):
         # 资源不足/冲突：回退 pending 等待合适时机，不计 attempt、不做失败记录。
         # 资源不足是调度器"等资源"的责任，不是任务失败；退避用固定 base 防热循环。
         nb = _not_before(now, base)
         return ExitDecision(terminal=False, directive=directive, action="retry",
-                            attempt_increment=False, not_before=nb)
+                             not_before=nb)
 
     if exit_code == err.EXIT_SIGKILL:
         # SIGKILL 归因：默认按资源处理（回退 pending，不计 attempt）
         nb = _not_before(now, base)
         return ExitDecision(terminal=False, directive=directive, action="retry",
-                            attempt_increment=False, not_before=nb)
+                             not_before=nb)
 
     # 其他非 0：兜底按资源错误处理（倒逼正确分类），回退 pending 不计 attempt
     nb = _not_before(now, base)
     return ExitDecision(terminal=False, directive=directive, action="retry",
-                        attempt_increment=False, not_before=nb)
+                         not_before=nb)
