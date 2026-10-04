@@ -93,6 +93,13 @@ class SchedTask:
                     else:
                         exit_code = EXIT_RESOURCE
                     break
+        except Exception as exc:  # noqa: BLE001  捕获 steps() 迭代器在 yield 前抛的异常（如初始化失败）
+            cat = self.on_error(exc)
+            self.state.error(cat, f"{type(exc).__name__}: {exc}")
+            if cat == "logic":
+                exit_code = EXIT_LOGIC
+            else:
+                exit_code = EXIT_RESOURCE
         finally:
             # 落断点 → 退出
             if self.state._preempted:
