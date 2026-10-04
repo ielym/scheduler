@@ -148,6 +148,7 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
         <th style="width:60px">等待</th>
         <th style="width:60px">已完成</th>
         <th style="width:60px">失败</th>
+        <th style="width:120px">操作</th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -383,6 +384,7 @@ function subtaskRowHTML(s, intentsMap){
     <td style="color:${c.waiting?'#fbbf24':'#94a3b8'}">${n(c.waiting)}</td>
     <td style="color:${c.done?'#8ab4ff':'#94a3b8'}">${n(c.done)}</td>
     <td style="color:${c.failed?'#f87171':'#94a3b8'}">${n(c.failed)}</td>
+    <td><button class="btn danger" onclick="deleteSubtask('${s.subtask_id}')">删除</button></td>
   </tr>`;
 }
 
@@ -395,6 +397,33 @@ async function toggleSubtask(sid, wantEnable){
     }
     refreshDashboard(true); refreshSubtasks();
   }catch(e){ alert('操作失败: '+e.message); refreshSubtasks(); }
+}
+
+function deleteSubtask(sid){
+  qs('#delSubtaskModal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay'; overlay.id='delSubtaskModal';
+  overlay.innerHTML = `<div class="modal" style="max-width:440px"><div class="modal-head">
+    <div><h3>删除子任务 ${sid}</h3></div>
+    <button class="btn ghost" onclick="document.getElementById('delSubtaskModal').remove()">✕</button>
+  </div><div class="modal-body">
+    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止该任务所有进程，并移除调度器内记录（注册 / 队列 / 意图状态 / 历史 / 日志）。</div>
+    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+      <input type="checkbox" id="delSubtaskDir"> 同时删除本地目录 tasks/${sid}/
+    </label>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn ghost" onclick="document.getElementById('delSubtaskModal').remove()">取消</button>
+      <button class="btn danger" id="delSubtaskConfirm">确认删除</button>
+    </div>
+  </div></div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#delSubtaskConfirm').onclick = async ()=>{
+    const delDir = overlay.querySelector('#delSubtaskDir').checked;
+    try{
+      await fetch(API+'/api/subtasks/'+encodeURIComponent(sid)+'?delete_dir='+delDir,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
+      overlay.remove(); refreshDashboard(true); refreshSubtasks();
+    }catch(e){ alert('删除失败: '+e.message); }
+  };
 }
 
 function enterPriEdit(el){
@@ -464,6 +493,7 @@ async function refreshProcesses(){
       <td>
         ${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">📜 日志</button>`:'<span style="color:#3b4252">—</span>'}
         ${canStop?`<button class="btn danger" onclick="stopProcess('${i.run_id}')" style="margin-left:6px">停止</button>`:''}
+        <button class="btn danger" onclick="deleteProcess('${i.run_id}')" style="margin-left:6px">删除</button>
       </td>
     </tr>`;
   }).join('') || `<tr><td colspan="6" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
@@ -489,28 +519,46 @@ async function stopProcess(rid){
   catch(e){ alert('停止失败: '+e.message); }
 }
 
+async function deleteProcess(rid){
+  if(!confirm('确认删除进程 '+rid+' ?\n将删除该进程的日志与缓存，不影响任务与其他进程。')) return;
+  try{ await fetch(API+'/api/process/'+encodeURIComponent(rid),{method:'DELETE'}); refreshProcesses(); refreshDashboard(true); }
+  catch(e){ alert('删除失败: '+e.message); }
+}
+
 async function showLog(rid){
   qs('#logModal')?.remove();
   const overlay = document.createElement('div');
   overlay.className='modal-overlay'; overlay.id='logModal';
   overlay.innerHTML = `<div class="modal"><div class="modal-head">
-    <div><h3>📜 ${rid}</h3><div class="hint">最近 2MB 尾部</div></div>
+    <div><h3>📜 ${rid}</h3><div class="hint">最近 2MB 尾部 · stdout / stderr 分开</div></div>
     <button class="btn ghost" onclick="document.getElementById('logModal').remove()">✕</button>
-  </div><div class="modal-body"><span class="loading"></span> 加载中…</div></div>`;
+  </div>
+  <div style="display:flex;gap:2px;padding:6px 16px 0;border-bottom:1px solid #1f2330">
+    <button class="tab active" data-stream="stdout" id="logTabStdout">stdout</button>
+    <button class="tab" data-stream="stderr" id="logTabStderr">stderr</button>
+  </div>
+  <div class="modal-body"><span class="loading"></span> 加载中…</div></div>`;
   document.body.appendChild(overlay);
-  try{
-    const resp = await fetch(API+'/api/runs/'+encodeURIComponent(rid)+'/log');
-    if(!resp.ok){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">HTTP ${resp.status} — 日志文件不存在（该进程可能没产生 stdout 或 scheduler 已清理）</pre>`; return; }
-    const txt = await resp.text();
-    const total = resp.headers.get('X-Run-Log-Total-Bytes');
-    const tail = resp.headers.get('X-Run-Log-Range');
-    overlay.querySelector('.modal-body').innerHTML =
-      `<div style="margin-bottom:6px;font-size:11px;color:#6b7280">共 ${total} 字节 · 尾部 ${tail||'—'}</div>` +
-      `<pre class="log"></pre>`;
-    overlay.querySelector('.log').textContent = txt || '(日志为空)';
-  }catch(e){
-    overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">加载失败: ${e.message}</pre>`;
+
+  async function loadStream(stream){
+    overlay.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active', b.dataset.stream===stream));
+    overlay.querySelector('.modal-body').innerHTML = `<span class="loading"></span> 加载中…`;
+    try{
+      const resp = await fetch(API+'/api/runs/'+encodeURIComponent(rid)+'/log?stream='+stream);
+      if(!resp.ok){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">HTTP ${resp.status} — ${stream} 日志文件不存在或为空</pre>`; return; }
+      const txt = await resp.text();
+      const total = resp.headers.get('X-Run-Log-Total-Bytes');
+      overlay.querySelector('.modal-body').innerHTML =
+        `<div style="margin-bottom:6px;font-size:11px;color:#6b7280">[${stream}] 共 ${total} 字节</div>` +
+        `<pre class="log"></pre>`;
+      overlay.querySelector('.log').textContent = txt || '（日志为空）';
+    }catch(e){
+      overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">加载失败: ${e.message}</pre>`;
+    }
   }
+  overlay.querySelector('#logTabStdout').onclick=()=>loadStream('stdout');
+  overlay.querySelector('#logTabStderr').onclick=()=>loadStream('stderr');
+  await loadStream('stdout');
 }
 
 /* ========== 公共 ========== */

@@ -184,6 +184,14 @@ def start_in_thread(svc) -> None:
         svc.refresh()
         return {"ok": True, "subtask_id": name, "priority": new_pri}
 
+    @app.delete("/api/subtasks/{name}")
+    def delete_subtask(name: str, _req: Request, delete_dir: bool = Query(False)):
+        """删除子任务：默认只从调度器移除记录；delete_dir=true 连本地任务目录一起删。"""
+        svc.refresh()
+        if name not in svc.entries:
+            raise HTTPException(404, f"not registered: {name}")
+        return svc.delete_subtask(name, delete_dir=delete_dir)
+
     # ---------- 进程控制 ----------
     @app.post("/api/process/stop/{run_id}")
     def stop_run(run_id: str, _req: Request):
@@ -191,6 +199,11 @@ def start_in_thread(svc) -> None:
             return svc.stop_run(run_id, reason="web 手动停止")
         except KeyError:
             raise HTTPException(404, f"run not running: {run_id}")
+
+    @app.delete("/api/process/{run_id}")
+    def delete_run(run_id: str, _req: Request):
+        """删除单个进程：停（若运行中）+ 删日志/缓存，不影响任务与其他进程。"""
+        return svc.delete_run(run_id)
 
     # ---------- 进程管理（全部状态 + 历史） ----------
     @app.get("/api/processes")
@@ -307,11 +320,17 @@ def start_in_thread(svc) -> None:
 
     # ---------- 进程日志 ----------
     @app.get("/api/runs/{run_id}/log")
-    def run_log(run_id: str, _req: Request, max_bytes: int = Query(2_000_000, ge=1024, le=20_000_000)):
-        """返回 run 的 stdout.log 最后 max_bytes 字节（tail 语义）。
+    def run_log(run_id: str, _req: Request,
+                stream: str = Query("stdout"),
+                max_bytes: int = Query(2_000_000, ge=1024, le=20_000_000)):
+        """返回 run 的 stdout 或 stderr 日志最后 max_bytes 字节（tail 语义）。
 
-        遍历所有 subtask 目录找 {run_id}.stdout.log。找不到时返回 404。
+        stream=stdout|stderr 分开返回。遍历所有 subtask 目录找
+        {run_id}.stdout.log / {run_id}.stderr.log。找不到时返回 404。
         """
+        if stream not in ("stdout", "stderr"):
+            raise HTTPException(400, "stream 需为 stdout 或 stderr")
+        ext = ".stdout.log" if stream == "stdout" else ".stderr.log"
         run_root = config.runs_dir()
         if not run_root.is_dir():
             raise HTTPException(404, "no runs directory yet")
@@ -320,7 +339,7 @@ def start_in_thread(svc) -> None:
         for sub in run_root.iterdir():
             if not sub.is_dir():
                 continue
-            cand = sub / f"{run_id}.stdout.log"
+            cand = sub / f"{run_id}{ext}"
             if cand.is_file():
                 found = cand
                 break

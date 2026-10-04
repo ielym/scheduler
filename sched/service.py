@@ -859,3 +859,104 @@ class SchedulerService:
         re.spec.cancel.set()
         return {"run_id": run_id, "subtask_id": re.run.get("subtask_id"),
                 "request_id": re.run.get("request_id")}
+
+    def delete_subtask(self, name: str, delete_dir: bool = False) -> dict:
+        """删除子任务：停所有运行中进程 + 清调度状态 + 可选删除本地任务目录。
+
+        delete_dir=False（默认）只移除调度器内的记录（注册表/队列/意图状态/运行历史/日志），
+        保留 tasks/<name>/ 本地目录与意图文件；delete_dir=True 连本地目录一起删。
+        """
+        # 1) 停该任务所有 running 进程
+        with self._lock:
+            run_ids = [rid for rid, re in self.running.items()
+                       if re.run.get("subtask_id") == name]
+        killed = []
+        for rid in run_ids:
+            try:
+                self.stop_run(rid, reason=f"子任务 {name} 被删除")
+                killed.append(rid)
+            except KeyError:
+                pass
+
+        # 2) 删注册表条目
+        registry.drop_state(name)
+
+        # 3) 清 WQ 中该任务项
+        st = persist.load_scheduler_state()
+        before = len(st.wq)
+        st.wq = [r for r in st.wq if r.get("subtask_id") != name]
+        removed_wq = before - len(st.wq)
+        persist.save_scheduler_state(st)
+
+        # 4) 清意图消费状态
+        intents = scanner.load_intents_state()
+        intents.pop(name, None)
+        scanner.save_intents_state(intents)
+
+        # 5) 清运行历史 jsonl + 日志目录
+        import shutil
+        runs_dir = config.runs_dir()
+        hist = runs_dir / f"{name}.jsonl"
+        logs_dir = runs_dir / name
+        removed_files = 0
+        if hist.exists():
+            hist.unlink()
+            removed_files += 1
+        if logs_dir.is_dir():
+            removed_files += sum(1 for f in logs_dir.rglob("*") if f.is_file())
+            shutil.rmtree(logs_dir, ignore_errors=True)
+
+        # 6) 可选删除本地任务目录
+        deleted_dir = False
+        if delete_dir:
+            task_dir = config.tasks_dir() / name
+            if task_dir.is_dir():
+                shutil.rmtree(task_dir, ignore_errors=True)
+                deleted_dir = True
+
+        self.refresh()
+        return {"ok": True, "subtask_id": name, "killed_running": killed,
+                "removed_wq": removed_wq, "removed_files": removed_files,
+                "deleted_dir": deleted_dir}
+
+    def delete_run(self, run_id: str, reason: str = "进程删除") -> dict:
+        """删除单个进程：停（若运行中）+ 删日志/缓存；不影响任务与其他进程。"""
+        with self._lock:
+            re = self.running.get(run_id)
+        subtask_id = request_id = None
+        if re is not None:
+            subtask_id = re.run.get("subtask_id")
+            request_id = re.run.get("request_id")
+            re.spec.cancel_reason = reason
+            re.spec.cancel.set()
+        else:
+            rec = runlog.find_run(run_id)
+            if rec:
+                subtask_id = rec.get("subtask_id")
+                request_id = rec.get("request_id")
+
+        # 删日志文件 + 缓存目录（只按 run_id 定位，不动意图文件和任务目录）
+        if subtask_id:
+            import shutil
+            log_dir = config.runs_dir() / subtask_id
+            for suffix in (".stdout.log", ".stderr.log"):
+                f = log_dir / f"{run_id}{suffix}"
+                if f.exists():
+                    f.unlink()
+            cache_run = config.tasks_dir() / subtask_id / "cache" / "runs" / run_id
+            if cache_run.is_dir():
+                shutil.rmtree(cache_run, ignore_errors=True)
+
+        # 该 run 对应的 intent 标 done（若仍指向该 run），不影响其他进程
+        if subtask_id and request_id:
+            intents = scanner.load_intents_state()
+            st = intents.get(subtask_id, {}).get(request_id)
+            if st and st.get("run_id") == run_id:
+                st["status"] = "done"
+                st["run_id"] = ""
+                st["finished_at"] = runlog.now_iso()
+                st["rejected_reason"] = f"进程 {run_id} 被删除"
+                scanner.save_intents_state(intents)
+
+        return {"ok": True, "run_id": run_id, "subtask_id": subtask_id,
+                "request_id": request_id}

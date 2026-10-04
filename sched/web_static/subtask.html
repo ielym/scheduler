@@ -56,6 +56,8 @@ a:hover{text-decoration:underline}
 .modal-head h3{margin:0;font-size:13px;color:#e6e6e6;font-weight:600}
 .modal-head .hint{font-size:11px;color:#6b7280;margin-top:2px}
 .modal-body{flex:1;overflow:auto;padding:10px 14px}
+.tab{padding:5px 12px;border-radius:6px 6px 0 0;cursor:pointer;font-size:13px;color:#8892a8;background:transparent;border:1px solid transparent}
+.tab.active{color:#8ab4ff;background:#181b22;border-color:#2a3547;font-weight:600}
 pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;line-height:1.5}
 /* 状态多选下拉 */
 .status-dropdown{position:relative;display:inline-block}
@@ -233,16 +235,30 @@ async function showLog(rid){
   const overlay = document.createElement('div');
   overlay.className='modal-overlay'; overlay.id='logModal';
   overlay.innerHTML = `<div class="modal"><div class="modal-head">
-    <div><h3>📜 ${rid}</h3><div class="hint">最近 2MB 尾部</div></div>
+    <div><h3>📜 ${rid}</h3><div class="hint">stdout / stderr 分开</div></div>
     <button class="btn ghost" onclick="document.getElementById('logModal').remove()">✕</button>
-  </div><div class="modal-body"><span style="color:#6b7280">加载中…</span></div></div>`;
+  </div>
+  <div style="display:flex;gap:2px;padding:6px 16px 0;border-bottom:1px solid #1f2330">
+    <button class="tab active" data-stream="stdout" id="logTabStdout">stdout</button>
+    <button class="tab" data-stream="stderr" id="logTabStderr">stderr</button>
+  </div>
+  <div class="modal-body"><span style="color:#6b7280">加载中…</span></div></div>`;
   document.body.appendChild(overlay);
-  try{
-    const resp = await fetch(API+'/api/runs/'+encodeURIComponent(rid)+'/log');
-    if(!resp.ok){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">HTTP ${resp.status} — 日志不存在</pre>`; return; }
-    const txt = await resp.text();
-    overlay.querySelector('.modal-body').innerHTML = `<pre class="log">${txt||'(日志为空)'}</pre>`;
-  }catch(e){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">加载失败: ${e.message}</pre>`; }
+
+  async function loadStream(stream){
+    overlay.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active', b.dataset.stream===stream));
+    overlay.querySelector('.modal-body').innerHTML = `<span style="color:#6b7280">加载中…</span>`;
+    try{
+      const resp = await fetch(API+'/api/runs/'+encodeURIComponent(rid)+'/log?stream='+stream);
+      if(!resp.ok){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">HTTP ${resp.status} — ${stream} 日志不存在</pre>`; return; }
+      const txt = await resp.text();
+      overlay.querySelector('.modal-body').innerHTML = `<div style="font-size:11px;color:#6b7280;margin-bottom:6px">[${stream}]</div><pre class="log"></pre>`;
+      overlay.querySelector('.log').textContent = txt || '(日志为空)';
+    }catch(e){ overlay.querySelector('.modal-body').innerHTML=`<pre class="log" style="color:#f87171">加载失败: ${e.message}</pre>`; }
+  }
+  overlay.querySelector('#logTabStdout').onclick=()=>loadStream('stdout');
+  overlay.querySelector('#logTabStderr').onclick=()=>loadStream('stderr');
+  await loadStream('stdout');
 }
 
 // 状态筛选下拉交互
