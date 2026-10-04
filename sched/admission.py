@@ -104,11 +104,10 @@ def estimate_job(profile: resources.Profile, declared_cpu: float, declared_mem_m
         declared_cpu=declared_cpu, declared_memory_mb=declared_mem_mb,
     )
     est_cpu, est_mem = prof.estimate(overshoot)
-    # 画像可能因历史样本偏低，至少不低于声明（声明是任务自报的最低下限）
-    est_cpu = max(est_cpu, declared_cpu)
-    est_mem = max(est_mem, declared_mem_mb)
+    # 方案 C：有画像样本用画像（真实消耗）；无样本时 Profile.estimate 内部已兜底用声明值。
+    # 声明值只做冷启动兜底，不再作为硬下界钳制（否则画像校准到极低也永远被钉在声明值）。
+    # 单个任务的失控由 cgroup 硬限（声明值下限）+ monitor 超限退让兜底，不会打爆机器。
     # 钳制在机器上限内：画像上浮（×overshoot）可能越过上限导致任务永久无法准出。
-    # 真正超限的运行由 cgroup memory.max 硬兜底 + monitor 超限退让兜住，不会打爆机器。
     if capacity is not None:
         est_cpu = min(est_cpu, capacity.total_cpu)
         est_mem = min(est_mem, capacity.total_memory_mb)

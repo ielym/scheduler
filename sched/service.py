@@ -409,19 +409,21 @@ class SchedulerService:
         if e is None or not e.ok or e.doc is None:
             return
 
-        cpu = float((it.get("resources") or {}).get("cpu") or e.doc.resources.cpu)
-        mem = int((it.get("resources") or {}).get("memory_mb") or e.doc.resources.memory_mb)
+        declared_cpu = float((it.get("resources") or {}).get("cpu") or e.doc.resources.cpu)
+        declared_mem = int((it.get("resources") or {}).get("memory_mb") or e.doc.resources.memory_mb)
         prof = self.profiles.get(stid, float(e.doc.resources.cpu), int(e.doc.resources.memory_mb))
-        est_cpu, est_mem = admission.estimate_job(prof, float(e.doc.resources.cpu), int(e.doc.resources.memory_mb),
+        # 准入预估：有画像用画像（真实消耗），无画像才用声明兜底；声明不再作硬下界
+        est_cpu, est_mem = admission.estimate_job(prof, declared_cpu, declared_mem,
                                                    self.settings.resource.overshoot, self.capacity)
-        est_cpu = max(est_cpu, cpu)
-        est_mem = max(est_mem, mem)
         if est_mem <= 0:
-            est_mem = max(mem, self.capacity.total_memory_mb // 4)
+            est_mem = self.capacity.total_memory_mb // 4
         if est_cpu <= 0:
-            est_cpu = cpu or 0.5
+            est_cpu = 0.1
 
         self.ledger.reserve(run_id, est_cpu, est_mem)
+        # cgroup 硬限用声明值做保护下限：画像再低也不把任务限太死（防正常抖动被节流/OOM）
+        limit_cpu = max(est_cpu, declared_cpu)
+        limit_mem = max(est_mem, declared_mem)
 
         # 意图文件覆盖 manifest 里的 entry
         entry_file = e.doc.entry.file
@@ -457,8 +459,8 @@ class SchedulerService:
         run_user = run_user or (self.settings.run_user or "")
 
         cg_name = f"{stid}/{rid}"
-        mem_high = int(est_mem * 1024 * 1024 * self.settings.resource.memory_high_ratio)
-        mem_max = int(est_mem * 1024 * 1024 * self.settings.resource.memory_max_ratio)
+        mem_high = int(limit_mem * 1024 * 1024 * self.settings.resource.memory_high_ratio)
+        mem_max = int(limit_mem * 1024 * 1024 * self.settings.resource.memory_max_ratio)
 
         spec = runner.RunSpec(
             subtask_id=stid, request_id=rid, run_id=run_id,
@@ -470,7 +472,7 @@ class SchedulerService:
             config=config_rel or None,
             run_user=run_user,
             cgroup_name=cg_name,
-            memory_high=mem_high, memory_max=mem_max, cpu_quota=est_cpu,
+            memory_high=mem_high, memory_max=mem_max, cpu_quota=limit_cpu,
             cancel_grace_sec=self.settings.runner.kill_grace_sec,
             preempt_grace_sec=self.settings.runner.grace_sec,
             error_rules={"resource_regex": e.doc.error_rules.resource_regex,
@@ -523,10 +525,8 @@ class SchedulerService:
             e = self.entries.get(it["subtask_id"])
             mcpu = float(e.doc.resources.cpu if e and e.doc else 0)
             mmem = int(e.doc.resources.memory_mb if e and e.doc else 0)
-            ecpu, emem = admission.estimate_job(prof, mcpu, mmem,
+            ecpu, emem = admission.estimate_job(prof, cpu or mcpu, mem or mmem,
                                                   self.settings.resource.overshoot, self.capacity)
-            ecpu = max(ecpu, cpu)
-            emem = max(emem, mem)
             ok, _ = admission.can_admit(ecpu, emem, self.ledger, self.capacity,
                                          external_mem_margin_mb=self.settings.resource.external_safety_margin_mb)
             return not ok
@@ -552,9 +552,8 @@ class SchedulerService:
             mcpu = float(e.doc.resources.cpu if e and e.doc else 0)
             mmem = int(e.doc.resources.memory_mb if e and e.doc else 0)
             prof = self.profiles.get(top["subtask_id"], mcpu, mmem)
-            ecpu, emem = admission.estimate_job(prof, mcpu, mmem, self.settings.resource.overshoot, self.capacity)
-            ecpu = max(ecpu, cpu)
-            emem = max(emem, mem)
+            ecpu, emem = admission.estimate_job(prof, cpu or mcpu, mem or mmem,
+                                                self.settings.resource.overshoot, self.capacity)
             free_cpu = self.capacity.total_cpu - self.ledger.reserved_cpu() + freed_cpu
             free_mem = self.capacity.total_memory_mb - self.ledger.reserved_mem_mb() + freed_mem
             gap_cpu = max(0.0, ecpu - free_cpu)
