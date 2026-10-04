@@ -198,6 +198,7 @@ async function refreshProcesses(){
 
   const rows = items.map(i=>{
     const canLog = ['done','success','failed','stopped','running'].includes(i.status);
+    const canStop = i.status==='running';
     const started = i.started_at || i.enqueued_at || null;
     const {label, cls} = _label(i.status);
     return `<tr>
@@ -205,7 +206,9 @@ async function refreshProcesses(){
       <td><span class="badge ${cls}">${label}</span></td>
       <td class="time-col">${fmtAbs(started)}</td>
       <td class="time-col">${fmtAbs(i.finished_at)}</td>
-      <td>${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">📜 日志</button>`:'<span style="color:#3b4252">—</span>'}</td>
+      <td>${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">📜 日志</button>`:'<span style="color:#3b4252">—</span>'}
+        ${canStop?`<button class="btn danger" onclick="stopProcess('${i.run_id}')" style="margin-left:6px">停止</button>`:''}
+        <button class="btn danger" onclick="deleteProcess('${i.run_id}')" style="margin-left:6px">删除</button></td>
     </tr>`;
   }).join('') || `<tr><td colspan="5" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
 
@@ -259,6 +262,39 @@ async function showLog(rid){
   overlay.querySelector('#logTabStdout').onclick=()=>loadStream('stdout');
   overlay.querySelector('#logTabStderr').onclick=()=>loadStream('stderr');
   await loadStream('stdout');
+}
+
+async function stopProcess(rid){
+  if(!confirm('确认停止进程 '+rid+' ?')) return;
+  try{ await fetch(API+'/api/process/stop/'+encodeURIComponent(rid),{method:'POST'}); refreshProcesses(); }
+  catch(e){ alert('停止失败: '+e.message); }
+}
+
+function deleteProcess(rid){
+  qs('#delProcModal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay'; overlay.id='delProcModal';
+  overlay.innerHTML = `<div class="modal" style="max-width:440px"><div class="modal-head">
+    <div><h3>删除进程 ${rid}</h3></div>
+    <button class="btn ghost" onclick="document.getElementById('delProcModal').remove()">✕</button>
+  </div><div class="modal-body">
+    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止该进程（若运行中）并从界面移除，不影响任务与其他进程。</div>
+    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+      <input type="checkbox" id="delProcFiles"> 同时删除该进程的日志与缓存文件
+    </label>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn ghost" onclick="document.getElementById('delProcModal').remove()">取消</button>
+      <button class="btn danger" id="delProcConfirm">确认删除</button>
+    </div>
+  </div></div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#delProcConfirm').onclick = async ()=>{
+    const delFiles = overlay.querySelector('#delProcFiles').checked;
+    try{
+      await fetch(API+'/api/process/'+encodeURIComponent(rid)+'?delete_files='+delFiles,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
+      overlay.remove(); refreshProcesses();
+    }catch(e){ alert('删除失败: '+e.message); }
+  };
 }
 
 // 状态筛选下拉交互

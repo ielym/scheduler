@@ -919,8 +919,11 @@ class SchedulerService:
                 "removed_wq": removed_wq, "removed_files": removed_files,
                 "deleted_dir": deleted_dir}
 
-    def delete_run(self, run_id: str, reason: str = "进程删除") -> dict:
-        """删除单个进程：停（若运行中）+ 删日志/缓存；不影响任务与其他进程。"""
+    def delete_run(self, run_id: str, reason: str = "进程删除", delete_files: bool = False) -> dict:
+        """删除单个进程：停（若运行中）+ 标 done；delete_files=true 才删日志/缓存。
+
+        无论 delete_files 与否，都从界面移除（intent 标 done），不影响任务与其他进程。
+        """
         with self._lock:
             re = self.running.get(run_id)
         subtask_id = request_id = None
@@ -935,8 +938,8 @@ class SchedulerService:
                 subtask_id = rec.get("subtask_id")
                 request_id = rec.get("request_id")
 
-        # 删日志文件 + 缓存目录（只按 run_id 定位，不动意图文件和任务目录）
-        if subtask_id:
+        # 可选删除日志文件 + 缓存目录（只按 run_id 定位，不动意图文件和任务目录）
+        if delete_files and subtask_id:
             import shutil
             log_dir = config.runs_dir() / subtask_id
             for suffix in (".stdout.log", ".stderr.log"):
@@ -959,4 +962,4 @@ class SchedulerService:
                 scanner.save_intents_state(intents)
 
         return {"ok": True, "run_id": run_id, "subtask_id": subtask_id,
-                "request_id": request_id}
+                "request_id": request_id, "deleted_files": delete_files}

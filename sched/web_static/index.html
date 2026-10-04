@@ -262,7 +262,6 @@ async function refreshDashboard(silent=false){
     {icon:'▶️', cls:'green', label:'运行中', value:running},
     {icon:'✅', cls:'cyan', label:'已完成', value:done},
     {icon:'❌', cls:'red', label:'失败', value:failed},
-    {icon:'📊', cls:'purple', label:'运行/等待比', value:pending? (running/pending).toFixed(1)+'x':'—'},
   ];
   qs('#statsGrid').innerHTML = cards.map(c=>
     `<div class="stat-card"><div class="stat-icon ${c.cls}">${c.icon}</div><div><div class="stat-value">${c.value}</div><div class="stat-label">${c.label}</div></div></div>`
@@ -277,18 +276,18 @@ async function refreshDashboard(silent=false){
   const reservedMem = +(status.ledger_reserved_mem_mb||0);
   const cpuUsed = actualCpu > 0 ? actualCpu : reservedCpu;
   const memUsed = actualMem > 0 ? actualMem : reservedMem;
-  const cpuPct = cpuTotal? Math.min(100, Math.round(100*cpuUsed/cpuTotal)) : 0;
-  const memPct = memTotal? Math.min(100, Math.round(100*memUsed/memTotal)) : 0;
+  const cpuPct = cpuTotal? Math.min(100, 100*cpuUsed/cpuTotal) : 0;
+  const memPct = memTotal? Math.min(100, 100*memUsed/memTotal) : 0;
   const setBar=(id,pct)=>{
     const el=qs('#bar'+id);
     el.style.width=pct+'%';
     el.classList.toggle('warn',pct>=70&&pct<90);
     el.classList.toggle('crit',pct>=90);
   };
-  setBar('Cpu',cpuPct);
-  setBar('Mem',memPct);
-  qs('#valCpu').textContent = cpuPct + '%';
-  qs('#valMem').textContent = memPct + '%';
+  setBar('Cpu',Math.round(cpuPct));
+  setBar('Mem',Math.round(memPct));
+  qs('#valCpu').textContent = cpuPct.toFixed(1) + '%';
+  qs('#valMem').textContent = memPct.toFixed(1) + '%';
 
   qs('#meta').textContent = '就绪 · ' + new Date().toLocaleTimeString('zh-CN',{hour12:false});
 }
@@ -519,10 +518,31 @@ async function stopProcess(rid){
   catch(e){ alert('停止失败: '+e.message); }
 }
 
-async function deleteProcess(rid){
-  if(!confirm('确认删除进程 '+rid+' ?\n将删除该进程的日志与缓存，不影响任务与其他进程。')) return;
-  try{ await fetch(API+'/api/process/'+encodeURIComponent(rid),{method:'DELETE'}); refreshProcesses(); refreshDashboard(true); }
-  catch(e){ alert('删除失败: '+e.message); }
+function deleteProcess(rid){
+  qs('#delProcModal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay'; overlay.id='delProcModal';
+  overlay.innerHTML = `<div class="modal" style="max-width:440px"><div class="modal-head">
+    <div><h3>删除进程 ${rid}</h3></div>
+    <button class="btn ghost" onclick="document.getElementById('delProcModal').remove()">✕</button>
+  </div><div class="modal-body">
+    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止该进程（若运行中）并从界面移除，不影响任务与其他进程。</div>
+    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+      <input type="checkbox" id="delProcFiles"> 同时删除该进程的日志与缓存文件
+    </label>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn ghost" onclick="document.getElementById('delProcModal').remove()">取消</button>
+      <button class="btn danger" id="delProcConfirm">确认删除</button>
+    </div>
+  </div></div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#delProcConfirm').onclick = async ()=>{
+    const delFiles = overlay.querySelector('#delProcFiles').checked;
+    try{
+      await fetch(API+'/api/process/'+encodeURIComponent(rid)+'?delete_files='+delFiles,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
+      overlay.remove(); refreshProcesses(); refreshDashboard(true);
+    }catch(e){ alert('删除失败: '+e.message); }
+  };
 }
 
 async function showLog(rid){

@@ -201,9 +201,9 @@ def start_in_thread(svc) -> None:
             raise HTTPException(404, f"run not running: {run_id}")
 
     @app.delete("/api/process/{run_id}")
-    def delete_run(run_id: str, _req: Request):
-        """删除单个进程：停（若运行中）+ 删日志/缓存，不影响任务与其他进程。"""
-        return svc.delete_run(run_id)
+    def delete_run(run_id: str, _req: Request, delete_files: bool = Query(False)):
+        """删除单个进程：勾选 delete_files 才删日志/缓存；否则只停止并从界面移除，不影响任务/其他进程。"""
+        return svc.delete_run(run_id, delete_files=delete_files)
 
     # ---------- 进程管理（全部状态 + 历史） ----------
     @app.get("/api/processes")
