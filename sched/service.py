@@ -390,7 +390,9 @@ class SchedulerService:
             overshoot=self.settings.resource.overshoot,
             external_mem_margin_mb=self.settings.resource.external_safety_margin_mb,
         )
-        for rid in scanned.admitted:
+        # 并发上限：CPU/内存再空闲，也限制最大 running 进程数，防文件描述符/进程耗尽
+        budget = max(0, int(self.settings.resource.max_running) - len(self.running))
+        for rid in scanned.admitted[:budget]:
             self._admit(rid)
 
     def _admit(self, run_id: str) -> None:

@@ -93,6 +93,8 @@ class ResourceConfig(BaseModel):
     profile_live_interval_sec: int = 60
     # 准出时对非调度进程占用的感知（R14）：est_mem > MemAvailable - margin → 退让等待
     external_safety_margin_mb: int = 512
+    # 最大并发运行进程数：CPU/内存再空闲也不超过此上限，防文件描述符/进程数耗尽
+    max_running: int = 50
 
 
 class WebConfig(BaseModel):
