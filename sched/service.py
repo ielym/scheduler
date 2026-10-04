@@ -270,7 +270,7 @@ class SchedulerService:
                 continue
             # 新意图入 WQ
             for r in diff.new_requests:
-                self._enqueue_intent(stid, r["request_id"], trigger="auto")
+                self._enqueue_intent(stid, r["request_id"], trigger="auto", save=False)
             # 改写违规 → reject（仅审计，不入队）
             for r in diff.modified_requests:
                 persist.append_decision({"ts": now_iso, "act": "intent_modified_rejected",
@@ -280,6 +280,7 @@ class SchedulerService:
             for r in diff.disappeared_requests:
                 self._drain_gone_request(stid, r["request_id"], r["reason"])
         _scanner.save_intents_state(all_states)
+        persist.save_scheduler_state(self.state)
 
     def _drain_gone_request(self, subtask_id: str, request_id: str, reason: str) -> None:
         # WQ 里还有这条 → 踢掉
@@ -302,7 +303,8 @@ class SchedulerService:
 
     def _enqueue_intent(self, subtask_id: str, request_id: str, trigger: str = "auto",
                         priority_override: int | None = None, attempt: int = 1,
-                        resume_ref: bool = False, not_before: str = "") -> dict:
+                        resume_ref: bool = False, not_before: str = "",
+                        save: bool = True) -> dict:
         e = self.entries.get(subtask_id)
         if e is None or not e.ok or e.doc is None:
             raise KeyError(subtask_id)
@@ -351,7 +353,8 @@ class SchedulerService:
         }
         with self._lock:
             self.state.enqueue(rec)
-            persist.save_scheduler_state(self.state)
+            if save:
+                persist.save_scheduler_state(self.state)
             persist.append_decision({"ts": runlog.now_iso(), "act": "enqueue_intent",
                                      "run_id": run_id, "subtask_id": subtask_id,
                                      "request_id": request_id, "trigger": trigger,
