@@ -185,6 +185,19 @@ def _cmd_process(args) -> int:
     return 2
 
 
+def _cmd_requeue(args) -> int:
+    """把 pending 但不在 WQ 的意图重新入队（对账/卡死恢复）。
+
+    说明：调度器主循环每 tick 已自动对账，本命令主要供服务停止状态下手动重入队
+    （服务运行中执行也无害，会被下一次自动对账覆盖）。
+    """
+    svc = _service().SchedulerService()
+    svc.refresh()
+    result = svc.requeue_pending(args.subtask)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def _cmd_clear(args) -> int:
     """清空全部调度状态（建议先停服务再执行，避免与运行实例写盘竞争）。"""
     svc = _service().SchedulerService()
@@ -221,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_clear.add_argument("--delete-requests", action="store_true",
                         help="同时清空所有子任务 requests/ 意图文件（保留任务代码）")
     p_clear.set_defaults(func=_cmd_clear)
+
+    p_requeue = sub.add_parser("requeue", help="重入队 pending 但不在 WQ 的意图（对账/卡死恢复）")
+    p_requeue.add_argument("subtask", nargs="?", default=None,
+                           help="仅对账指定子任务；省略则对账全部")
+    p_requeue.set_defaults(func=_cmd_requeue)
 
     p_proc = sub.add_parser("process", help="子进程管理（依赖调度器已跑）")
     proc_sub = p_proc.add_subparsers(dest="action", required=True)

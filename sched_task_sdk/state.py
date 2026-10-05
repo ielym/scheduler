@@ -105,6 +105,10 @@ class TaskState:
     def resume_point(self) -> dict | None:
         return self._resume_from
 
+    def heartbeat(self) -> None:
+        """显式写一次心跳（正常由后台心跳线程自动写，供需要立即刷新的调用方）。"""
+        self._tick_heartbeat()
+
     # -------- 心跳线程 --------
     def _write_initial(self) -> None:
         st = {
@@ -275,6 +279,10 @@ def no_retry(reason: str = "") -> None:
 
 def reschedule(delay_sec: float, reason: str = "") -> None:
     _global().reschedule(delay_sec, reason)
+
+
+def heartbeat() -> None:
+    _global().heartbeat()
 
 
 def _now_iso() -> str:

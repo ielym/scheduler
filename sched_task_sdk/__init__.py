@@ -7,13 +7,13 @@
 """
 
 from .task import SchedTask, DaemonTask, OneshotTask
-from .state import TaskState, SDKError, request_stop, no_retry, reschedule
+from .state import TaskState, SDKError, request_stop, no_retry, reschedule, heartbeat
 from .intent import emit_intent, list_intents
 from .errors import *  # noqa: F401,F403
 
 __all__ = [
     "SchedTask", "DaemonTask", "OneshotTask",
     "TaskState", "SDKError",
-    "request_stop", "no_retry", "reschedule",
+    "request_stop", "no_retry", "reschedule", "heartbeat",
     "emit_intent", "list_intents",
 ]

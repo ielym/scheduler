@@ -112,22 +112,55 @@ def read_jsonl(path: Path) -> list[dict]:
     return list(iter_jsonl(path))
 
 
-def write_text_atomic(path: Path, text: str) -> None:
+def _atomic_write_unlocked(path: Path, text: str) -> None:
+    """临时文件 + fsync + os.replace（假定调用方已持有 file_lock）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(path):
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    with file_lock(path):
+        _atomic_write_unlocked(path, text)
+
+
+def remove_jsonl(path: Path, should_remove) -> int:
+    """在单次排他锁内「读 → 过滤 → 原子重写」jsonl，避免与 append_jsonl 竞争丢新行。
+
+    返回移除条数。损坏行原样保留（宁可保留也不静默丢审计）。
+    """
+    removed = 0
+    with file_lock(path):
+        if not path.exists():
+            return 0
+        kept_lines: list[str] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except json.JSONDecodeError:
+                    kept_lines.append(line)
+                    continue
+                if isinstance(obj, dict) and should_remove(obj):
+                    removed += 1
+                    continue
+                kept_lines.append(line)
+        _atomic_write_unlocked(path, "".join(kept_lines))
+    return removed
 
 
 def read_text(path: Path, default: str = "") -> str:

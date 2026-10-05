@@ -30,6 +30,7 @@ a:hover{text-decoration:underline}
 .badge.pending{background:rgba(100,116,139,.2);color:#94a3b8}
 .badge.done,.badge.success{background:rgba(138,180,255,.15);color:#8ab4ff}
 .badge.failed{background:rgba(248,113,113,.15);color:#f87171}
+.badge.resource{background:rgba(251,146,60,.15);color:#fb923c}
 .badge.stopped{background:rgba(100,116,139,.2);color:#94a3b8}
 .badge.disabled{background:rgba(100,116,139,.25);color:#94a3b8}
 .badge.enabled{background:rgba(74,222,128,.12);color:#4ade80}
@@ -190,6 +191,7 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
         <label><input type="checkbox" value="waiting"/> 等待中</label>
         <label><input type="checkbox" value="done"/> 已完成</label>
         <label><input type="checkbox" value="failed"/> 失败</label>
+        <label><input type="checkbox" value="resource"/> 资源不足</label>
         <label><input type="checkbox" value="stopped"/> 已停止</label>
       </div>
     </div>
@@ -636,11 +638,16 @@ function openSubtask(sid){ window.open('subtask.html?sid='+encodeURIComponent(si
 let procPage=1, procPSize=20;
 
 function _procStatusLabel(s){
-  // 统一中文展示；cls 保持原始状态值以命中徽标配色
-  const map = {running:'运行中', waiting:'等待中', done:'已完成', success:'已完成',
-               failed:'失败', stopped:'已停止', archived:'已归档', rejected:'已拒绝',
-               resource:'资源不足', preempted:'被抢占', timeout:'超时', killed:'已终止', interrupted:'已中断'};
-  return {label: map[s] || s, cls: s};
+  // 统一中文展示；cls 归一到配色桶（复用 .badge.done/failed/stopped/resource 等）
+  const map = {
+    running:{label:'运行中', cls:'running'}, waiting:{label:'等待中', cls:'waiting'},
+    done:{label:'已完成', cls:'done'}, success:{label:'已完成', cls:'done'},
+    failed:{label:'失败', cls:'failed'}, resource:{label:'资源不足', cls:'resource'},
+    stopped:{label:'已停止', cls:'stopped'}, archived:{label:'已归档', cls:'stopped'}, rejected:{label:'已拒绝', cls:'stopped'},
+    preempted:{label:'被抢占', cls:'stopped'}, timeout:{label:'超时', cls:'stopped'},
+    killed:{label:'已终止', cls:'stopped'}, interrupted:{label:'已中断', cls:'stopped'},
+  };
+  return map[s] || {label:s, cls:s};
 }
 
 async function refreshProcesses(){
@@ -649,7 +656,7 @@ async function refreshProcesses(){
   const statusParam = chosen.length? chosen.join(',') : '';
   const btn = qs('#procStatusBtn');
   btn.textContent = chosen.length? `已选 ${chosen.length} 项 ▾` : '状态筛选 ▾';
-  qs('#procStatusHint').textContent = chosen.length? chosen.map(v=>({running:'运行中',waiting:'等待中',done:'已完成',failed:'失败',stopped:'已停止'}[v])||v).join(' / ') : '（不选=全部）';
+  qs('#procStatusHint').textContent = chosen.length? chosen.map(v=>({running:'运行中',waiting:'等待中',done:'已完成',failed:'失败',resource:'资源不足',stopped:'已停止'}[v])||v).join(' / ') : '（不选=全部）';
 
   const sp = new URLSearchParams({page:procPage,page_size:procPSize});
   if(statusParam) sp.set('status', statusParam);
@@ -658,7 +665,7 @@ async function refreshProcesses(){
   const items = d.items||[];
 
   const rows = items.map(i=>{
-    const canLog = ['done','success','failed','stopped','running'].includes(i.status);
+    const canLog = i.status !== 'waiting';
     const canStop = isStoppable(i.status);       // 运行中/等待中 → 可停止
     const canDelete = isDeletable(i.status);     // 终态 → 可删除
     const started = i.started_at || i.enqueued_at || null;

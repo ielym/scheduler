@@ -36,6 +36,14 @@ class Monitor:
         self.tick_interval_sec = tick_interval_sec
         self._overload_cnt: dict[str, int] = {}
 
+    def reconfigure(self, heartbeat_timeout_sec: int, overload_ratio: float,
+                    overload_sustain_ticks: int, tick_interval_sec: float) -> None:
+        """热更新监测阈值（settings.json 热加载用）。保留超限计数窗口免于重置。"""
+        self.heartbeat_timeout_sec = heartbeat_timeout_sec
+        self.overload_ratio = overload_ratio
+        self.overload_sustain_ticks = max(1, int(overload_sustain_ticks))
+        self.tick_interval_sec = tick_interval_sec
+
     def tick(self, obs_list: list[RunningObs]) -> list[MonitorAction]:
         actions: list[MonitorAction] = []
         seen: set[str] = set()

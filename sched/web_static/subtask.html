@@ -26,6 +26,7 @@ a:hover{text-decoration:underline}
 .badge.pending{background:rgba(100,116,139,.2);color:#94a3b8}
 .badge.done,.badge.success{background:rgba(138,180,255,.15);color:#8ab4ff}
 .badge.failed{background:rgba(248,113,113,.15);color:#f87171}
+.badge.resource{background:rgba(251,146,60,.15);color:#fb923c}
 .badge.stopped{background:rgba(100,116,139,.2);color:#94a3b8}
 .badge.disabled{background:rgba(100,116,139,.25);color:#94a3b8}
 .badge.enabled{background:rgba(74,222,128,.12);color:#4ade80}
@@ -38,6 +39,9 @@ a:hover{text-decoration:underline}
 .btn.danger:hover{background:#3f1d1d}
 .btn.ghost{border-color:#2a3040;background:transparent;color:#94a3b8}
 .btn.ghost:hover{color:#e6e6e6}
+.op-cell{white-space:nowrap}
+.op-cell .btn{padding:3px 8px;font-size:11px;margin-right:6px}
+.op-cell .btn:last-child{margin-right:0}
 .switch{position:relative;width:38px;height:20px;cursor:pointer;user-select:none;display:inline-block;vertical-align:middle}
 .switch input{display:none}
 .switch .slider{position:absolute;inset:0;background:#2a3040;border-radius:10px;transition:background .15s}
@@ -87,7 +91,7 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
     <div class="config-grid" id="configGrid"></div>
   </div>
   <div class="panel">
-    <h3>意图状态分布</h3>
+    <h3>运行统计</h3>
     <div class="intent-chips" id="intentChips"></div>
   </div>
   <div class="panel">
@@ -100,6 +104,7 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
           <label><input type="checkbox" value="waiting"/> 等待中</label>
           <label><input type="checkbox" value="done"/> 已完成</label>
           <label><input type="checkbox" value="failed"/> 失败</label>
+          <label><input type="checkbox" value="resource"/> 资源不足</label>
           <label><input type="checkbox" value="stopped"/> 已停止</label>
         </div>
       </div>
@@ -146,8 +151,15 @@ function fmtAbs(s){
   }catch{return String(s).slice(0,19)}
 }
 function _label(s){
-  if(s==='done'||s==='success')return {label:'已完成', cls:'done'};
-  return {label:s, cls:s};
+  const map = {
+    running:{label:'运行中', cls:'running'}, waiting:{label:'等待中', cls:'waiting'},
+    success:{label:'已完成', cls:'done'}, done:{label:'已完成', cls:'done'},
+    failed:{label:'失败', cls:'failed'}, resource:{label:'资源不足', cls:'resource'},
+    preempted:{label:'被抢占', cls:'stopped'}, interrupted:{label:'已中断', cls:'stopped'},
+    killed:{label:'已终止', cls:'stopped'}, timeout:{label:'超时', cls:'stopped'},
+    stopped:{label:'已停止', cls:'stopped'},
+  };
+  return map[s] || {label:s, cls:s};
 }
 function debounce(fn,ms=300){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}}
 
@@ -169,28 +181,25 @@ async function loadSubtask(){
   `;
   window._curPri = sub.priority;
 
-  // 意图状态分布
-  const imap = intentsRaw[SID] || {};
-  const c = {running:0,waiting:0,done:0,failed:0,stopped:0};
-  for(const info of Object.values(imap)){
-    const st = info.status||'unknown';
-    if(st==='pending') c.waiting++;
-    else if(st==='running') c.running++;
-    else if(st==='done'||st==='success') c.done++;
-    else if(st==='failed') c.failed++;
-    else if(st==='stopped') c.stopped++;
-    else c.waiting++;
-  }
+  // 意图数量仅作备注；运行统计 chips 由 refreshProcesses 基于 /api/processes 渲染
+  window._intentCount = Object.keys(intentsRaw[SID] || {}).length;
+
+  refreshProcesses();
+}
+
+function renderChips(stats){
+  const c = stats || {};
   const chips = [];
   if(c.running) chips.push(`<span class="badge running">▶️ 运行 ${c.running}</span>`);
   if(c.waiting) chips.push(`<span class="badge waiting">⏳ 等待 ${c.waiting}</span>`);
-  if(c.done) chips.push(`<span class="badge done">✅ 完成 ${c.done}</span>`);
+  if(c.success) chips.push(`<span class="badge done">✅ 完成 ${c.success}</span>`);
   if(c.failed) chips.push(`<span class="badge failed">❌ 失败 ${c.failed}</span>`);
-  if(c.stopped) chips.push(`<span class="badge stopped">⏹️ 停止 ${c.stopped}</span>`);
-  chips.push(`<span style="color:#6b7280;font-size:12px">共 ${Object.keys(imap).length} 条 intent</span>`);
-  qs('#intentChips').innerHTML = chips.join(' ') || '<span style="color:#6b7280">暂无 intent</span>';
-
-  refreshProcesses();
+  if(c.resource) chips.push(`<span class="badge resource">🔄 资源退避 ${c.resource}</span>`);
+  const stopped = (c.preempted||0)+(c.interrupted||0)+(c.killed||0)+(c.timeout||0)+(c.stopped||0);
+  if(stopped) chips.push(`<span class="badge stopped">⏹️ 停止 ${stopped}</span>`);
+  const total = Object.values(c).reduce((a,b)=>a+b,0);
+  chips.push(`<span style="color:#6b7280;font-size:12px">共 ${total} 条运行记录 · 意图 ${window._intentCount??0} 条</span>`);
+  qs('#intentChips').innerHTML = chips.join(' ') || '<span style="color:#6b7280">暂无运行记录</span>';
 }
 
 async function refreshProcesses(){
@@ -200,22 +209,25 @@ async function refreshProcesses(){
   if(chosen.length) sp.set('status', chosen.join(','));
   const d = await fetch(API+'/api/processes?'+sp).then(r=>r.json()).catch(()=>({items:[],total:0}));
 
+  renderChips(d.stats);
   const items = d.items||[];
 
   const rows = items.map(i=>{
-    const canLog = ['done','success','failed','stopped','running'].includes(i.status);
-    const canStop = i.status==='running';
+    const canLog = i.status !== 'waiting';
+    const canStop = i.status==='running' || i.status==='waiting';
     const started = i.started_at || i.enqueued_at || null;
     const {label, cls} = _label(i.status);
     return `<tr>
       <td><input type="checkbox" data-select value="${i.run_id}"></td>
-      <td><div class="rid-col">${i.run_id}</div></td>
+      <td><div class="rid-col">${i.run_id}</div>${i.request_id?`<div class="rid-col" style="margin-top:2px;color:#64748b">↳ ${i.request_id}</div>`:''}</td>
       <td><span class="badge ${cls}">${label}</span></td>
       <td class="time-col">${fmtAbs(started)}</td>
       <td class="time-col">${fmtAbs(i.finished_at)}</td>
-      <td>${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">📜 日志</button>`:'<span style="color:#3b4252">—</span>'}
-        ${canStop?`<button class="btn danger" onclick="stopProcess('${i.run_id}')" style="margin-left:6px">停止</button>`:''}
-        <button class="btn danger" onclick="deleteProcess('${i.run_id}')" style="margin-left:6px">删除</button></td>
+      <td class="op-cell">
+        ${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">📜 日志</button>`:''}
+        ${canStop?`<button class="btn danger" onclick="stopProcess('${i.run_id}')">停止</button>`:''}
+        <button class="btn danger" onclick="deleteProcess('${i.run_id}')">删除</button>
+      </td>
     </tr>`;
   }).join('') || `<tr><td colspan="6" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
 
@@ -224,7 +236,7 @@ async function refreshProcesses(){
   renderPage('#procPagination', d.total||0, procPage, PAGE_SIZE, np=>{procPage=np;refreshProcesses()});
 
   // 状态筛选 hint
-  qs('#procStatusHint').textContent = chosen.length? chosen.map(v=>({running:'运行中',waiting:'等待中',done:'已完成',failed:'失败',stopped:'已停止'}[v])||v).join(' / ') : '（不选=全部）';
+  qs('#procStatusHint').textContent = chosen.length? chosen.map(v=>({running:'运行中',waiting:'等待中',done:'已完成',failed:'失败',resource:'资源不足',stopped:'已停止'}[v])||v).join(' / ') : '（不选=全部）';
 }
 
 function renderPage(sel, total, p, ps, onChg){

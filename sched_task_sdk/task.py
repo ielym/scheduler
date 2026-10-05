@@ -121,6 +121,14 @@ class SchedTask:
         """公开的断点落盘（子任务在业务步骤结束时主动调用）。"""
         self.state.save_checkpoint(marker)
 
+    def resume_point(self) -> dict | None:
+        """读取当前断点（等价于 self.state.resume_point()，便于子类直读）。"""
+        return self.state.resume_point()
+
+    def heartbeat(self) -> None:
+        """显式写一次心跳（正常由后台心跳线程自动写）。"""
+        self.state.heartbeat()
+
     # ---- 控制 ----
 
     def request_stop(self, reason: str = "") -> None:

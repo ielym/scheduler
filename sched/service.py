@@ -175,6 +175,29 @@ class SchedulerService:
         _scanner.prune_orphan_intents(set(entries))
         return {"subtasks": len(entries), "ok": sum(1 for e in entries.values() if e.ok)}
 
+    def _reload_settings(self) -> None:
+        """热加载 settings.json：重读并同步 __init__ 里被缓存的派生量。
+
+        绝大多数参数在用到时才读 self.settings（重赋值即生效）；这里只需同步
+        三个在 __init__ 里被拷贝/烘焙出来的量：preempt_exempt_sec、
+        profile_live_interval_sec 与 monitor 阈值。
+        """
+        try:
+            new_settings = config.load_settings()
+        except Exception as exc:
+            log.warning("settings 热加载失败，保持旧值：%s", exc)
+            return
+        self.settings = new_settings
+        self.preempt_exempt_sec = float(new_settings.preempt_exempt_sec)
+        self.profile_live_interval_sec = max(5.0, float(new_settings.resource.profile_live_interval_sec))
+        self.monitor.reconfigure(
+            heartbeat_timeout_sec=new_settings.runner.heartbeat_timeout_sec,
+            overload_ratio=new_settings.resource.overload_ratio,
+            overload_sustain_ticks=new_settings.resource.overload_sustain_sec //
+                                  max(1, int(new_settings.resource.sample_interval_sec)),
+            tick_interval_sec=new_settings.resource.sample_interval_sec,
+        )
+
     def _recover_running(self) -> None:
         """重启恢复：上次 running 的意图，其进程已随 serve 退出而消失。
 
@@ -272,8 +295,16 @@ class SchedulerService:
     def _cur_concurrency(self, stid: str) -> int:
         return self._cur_limit.get(stid, int(self.settings.resource.init_concurrency))
 
-    def _running_count(self, stid: str) -> int:
-        return sum(1 for re in self.running.values() if re.run.get("subtask_id") == stid)
+    def _running_worker_count(self, stid: str) -> int:
+        """仅统计 oneshot 派生意图；daemon 常驻进程不计入 AIMD 并发预算。"""
+        return sum(1 for re in self.running.values()
+                   if re.run.get("subtask_id") == stid and re.run.get("kind") != "daemon")
+
+    def _concurrency_gateopen(self, it: dict) -> bool:
+        """daemon 常驻进程不受 per-subtask AIMD 并发闸限制；only oneshot 才受限。"""
+        if it.get("kind") == "daemon":
+            return True
+        return self._running_worker_count(it.get("subtask_id")) < self._cur_concurrency(it.get("subtask_id"))
 
     def _entry_enabled(self, stid: str) -> bool:
         e = self.entries.get(stid)
@@ -340,6 +371,7 @@ class SchedulerService:
                     self.refresh()
                     if isinstance(self.capacity, resources.Capacity):
                         self.capacity.refresh()
+                    self._reload_settings()
                     last_refresh = time.monotonic()
                 self._tick_scan()
                 self._tick_admit()
@@ -385,8 +417,47 @@ class SchedulerService:
                 # 已消失（running 态）→ 进程 stop 由 cancel 触发；pending 态直接终结
                 for r in diff.disappeared_requests:
                     self._drain_gone_request(stid, r["request_id"], r["reason"])
+            # 状态对账：intents_state 里 pending、意图文件仍在、但掉出 WQ 的意图重新入队，
+            # 防止「入队→退出→重入」环节掉出 WQ 后永久搁浅（重启/crash 窗口的兜底自愈）。
+            self._reconcile_states(all_states, save=False)
             _scanner.save_intents_state(all_states)
         persist.save_scheduler_state(self.state)
+
+    def _reconcile_states(self, all_states: dict, save: bool = False) -> int:
+        """对账：pending、意图文件仍在、且不在 WQ 的意图重新入队。返回重新入队数量。
+
+        主循环里用 all_states（已加载）传 save=False，由 _tick_scan 末尾统一落盘；
+        CLI/独立实例调用传 save=True 立即落盘 WQ。
+        """
+        wq_keys = {(it.get("subtask_id"), it.get("request_id")) for it in self.state.wq}
+        requeued = 0
+        for stid, states in all_states.items():
+            e = self.entries.get(stid)
+            if e is None or not e.ok or e.doc is None:
+                continue
+            for rid, st in states.items():
+                if st.get("status") != "pending":
+                    continue
+                if (stid, rid) in wq_keys:
+                    continue
+                if not (e.task_dir / "requests" / (rid + ".json")).exists():
+                    continue
+                try:
+                    self._enqueue_intent(stid, rid, trigger="resume", resume_ref=True, save=save)
+                    wq_keys.add((stid, rid))
+                    requeued += 1
+                except Exception as exc:
+                    log.warning("reconcile intent %s/%s failed: %s", stid, rid, exc)
+        return requeued
+
+    def requeue_pending(self, subtask_id: str | None = None) -> dict:
+        """手动对账入口：把 pending 但不在 WQ 的意图重新入队（CLI/运维用）。"""
+        with _scanner.STATE_LOCK:
+            all_states = _scanner.load_intents_state()
+            if subtask_id is not None:
+                all_states = {subtask_id: all_states.get(subtask_id, {})}
+            n = self._reconcile_states(all_states, save=True)
+        return {"requeued": n, "subtask_id": subtask_id}
 
     def _drain_gone_request(self, subtask_id: str, request_id: str, reason: str) -> None:
         # WQ 里还有这条 → 踢掉
@@ -417,11 +488,13 @@ class SchedulerService:
         # 优先级唯一来源：manifest.json（意图文件不再携带 priority）
         priority = int(e.doc.priority)
 
-        # 读取意图文件取资源覆盖值
+        # 读取意图文件取资源覆盖值 + kind（daemon/oneshot，供并发/AIMD 区分）
+        kind = "oneshot"
         try:
             intent_path = e.task_dir / "requests" / (request_id + ".json")
             from . import intent as intent_mod
             doc = intent_mod.load_intent(intent_path, e.task_dir)
+            kind = doc.kind or "oneshot"
             cpu = float(doc.resources.get("cpu") or e.doc.resources.cpu)
             mem = int(doc.resources.get("memory_mb") or e.doc.resources.memory_mb)
         except Exception as exc:
@@ -435,6 +508,7 @@ class SchedulerService:
             "subtask_id": subtask_id,
             "request_id": request_id,
             "task_dir": str(e.task_dir),
+            "kind": kind,
             "priority": priority,
             "trigger": trigger,
             "attempt": attempt,
@@ -475,8 +549,8 @@ class SchedulerService:
                      and not self._is_backoff(it.get("subtask_id"))
                      # 已达 per-subtask 并发上限的子任务不参与本轮：否则其意图会在
                      # _admit 里被 re-enqueue，白白消耗全局 budget，饿死其他子任务
-                     and self._running_count(it.get("subtask_id"))
-                         < self._cur_concurrency(it.get("subtask_id"))
+                     # （daemon 常驻进程不计入，避免与派生的 oneshot 工人抢同一批额度）
+                     and self._concurrency_gateopen(it)
                      # 已禁用子任务不参与本轮准入（stop 后 WQ 残留的防御性兜底）
                      and self._entry_enabled(it.get("subtask_id"))]
         if not items:
@@ -522,8 +596,8 @@ class SchedulerService:
 
         stid = it["subtask_id"]
         rid = it["request_id"]
-        # per-subtask 动态并发上限检查（超出则放回 WQ 等待下一轮）
-        if self._running_count(stid) >= self._cur_concurrency(stid):
+        # per-subtask 动态并发上限检查（daemon 豁免；超出则放回 WQ 等待下一轮）
+        if not self._concurrency_gateopen(it):
             with self._lock:
                 self.state.enqueue(it)
             return
@@ -820,13 +894,16 @@ class SchedulerService:
         self.ledger.release(rec["run_id"])
         cgroup.Cgroup(re.cgroup_name).remove()
 
-        # AIMD 动态并发调节：成功放量（+1，上限 max_running），资源错误缩量（减半，下限 1）
+        # AIMD 动态并发调节：成功放量（+1，上限 max_running），资源错误缩量（减半，下限 1）。
+        # 只依据 oneshot 派生意图的结果调节；daemon 常驻进程的崩溃不作为缩量信号，
+        # 否则 daemon 自身占满缩到 1 的额度会让派生的工人永远进不来。
         stid = rec.get("subtask_id")
-        cur = self._cur_concurrency(stid)
-        if outcome.status == "success":
-            self._cur_limit[stid] = min(int(self.settings.resource.max_running), cur + 1)
-        elif outcome.status == "resource":
-            self._cur_limit[stid] = max(1, cur // 2)
+        if rec.get("kind") != "daemon":
+            cur = self._cur_concurrency(stid)
+            if outcome.status == "success":
+                self._cur_limit[stid] = min(int(self.settings.resource.max_running), cur + 1)
+            elif outcome.status == "resource":
+                self._cur_limit[stid] = max(1, cur // 2)
 
         rec["status"] = outcome.status
         rec["reason"] = outcome.reason
@@ -1214,6 +1291,9 @@ class SchedulerService:
                     st["rejected_reason"] = f"进程 {run_id} 被删除"
                     _scanner.save_intents_state(intents)
 
+        # 从运行历史 jsonl 中移除该 run 记录，让"历史进程"列表真正少一条
+        removed_history = runlog.remove_run(subtask_id, run_id) if subtask_id else 0
+
         return {"ok": True, "run_id": run_id, "subtask_id": subtask_id,
                 "request_id": request_id, "deleted_files": delete_files,
-                "removed_wq": removed_wq}
+                "removed_wq": removed_wq, "removed_history": removed_history}

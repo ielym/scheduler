@@ -268,122 +268,115 @@ def start_in_thread(svc) -> None:
         """删除单个进程：勾选 delete_files 才删日志/缓存；否则只停止并从界面移除，不影响任务/其他进程。"""
         return svc.delete_run(run_id, delete_files=delete_files)
 
-    # ---------- 进程管理（全部状态 + 历史） ----------
+    # ---------- 进程管理（真实运行历史 + 在途） ----------
+    _STATUS_ALIAS = {
+        "done": {"done", "success"},
+        "failed": {"failed"},
+        "stopped": {"stopped", "preempted", "interrupted", "killed", "timeout"},
+    }
+
     @app.get("/api/processes")
     def processes(_req: Request, subtask_id: str | None = None,
                   status: str | None = None,
                   page: int = Query(1, ge=1),
                   page_size: int = Query(50, ge=1, le=200)):
-        """返回全部进程（running / waiting / done / failed / success / stopped）。
+        """返回进程记录：当前 running / waiting + 历史终态运行记录（data/runs/*.jsonl）。
 
-        只返回有 run_id 的条目——intent 还没被 scheduler 拉起的（pending、stopped-无runid）不算进程。
-        status 参数支持逗号分隔多值，且 done 和 success 被视为同一个筛选值 "done"。
+        语义：一行一个 run 记录。历史记录直接读 data/runs/<subtask>.jsonl（真实每次运行），
+        不再从 intents_state 去重派生——避免漏掉重试产生的 run 以及 run_id 被清空的进程。
+        status 参数支持逗号分隔多值，done/failed/stopped 为展示桶，会映射到原始终态值。
+        返回的 stats 为未过滤的全量状态分布（供顶部汇总 chips 使用）。
         """
-        merged = []
+        rows: dict[str, dict] = {}
 
-        # 1) 运行中
+        # 1) 运行中（active 快照）
         for r in persist.load_active():
-            merged.append({
-                "run_id": r.get("run_id"),
+            if subtask_id and r.get("subtask_id") != subtask_id:
+                continue
+            rid = r.get("run_id")
+            if not rid:
+                continue
+            rows[rid] = {
+                "run_id": rid,
                 "subtask_id": r.get("subtask_id"),
+                "request_id": r.get("request_id", ""),
                 "priority": r.get("priority"),
                 "pid": r.get("pid"),
                 "status": "running",
                 "started_at": r.get("started_at"),
                 "enqueued_at": None,
                 "finished_at": None,
-            })
+                "exit_code": None,
+                "reason": None,
+            }
+
         # 2) WQ 中等待
-        wq_rows = []
         for r in persist.load_scheduler_state().wq:
-            wq_rows.append({
-                "run_id": r.get("run_id"),
+            if subtask_id and r.get("subtask_id") != subtask_id:
+                continue
+            rid = r.get("run_id")
+            if not rid or rid in rows:
+                continue
+            rows[rid] = {
+                "run_id": rid,
                 "subtask_id": r.get("subtask_id"),
+                "request_id": r.get("request_id", ""),
                 "priority": r.get("priority"),
                 "pid": None,
                 "status": "waiting",
                 "started_at": None,
                 "enqueued_at": r.get("enqueued_at"),
                 "finished_at": None,
-            })
-        merged.extend(wq_rows)
-        # 运行中/等待中已由 active/WQ 展示，intents 侧同 run_id 跳过，避免重复行
-        covered_rids = {x["run_id"] for x in merged if x["run_id"]}
-        # 3) intents_state 里所有状态的历史
-        intents = scanner.load_intents_state()
-        # 预索引 run log mtime（避免每条都 stat 目录）
-        _run_log_mtime_cache: dict[tuple[str, str], str | None] = {}
+                "exit_code": None,
+                "reason": None,
+            }
 
-        def _guess_started_at(sid: str, run_id: str) -> str | None:
-            """fallback：从 data/runs/{sid}/{run_id}.stdout.log 的 mtime 推算 started_at（ISO）。"""
-            if not run_id:
-                return None
-            key = (sid, run_id)
-            if key in _run_log_mtime_cache:
-                return _run_log_mtime_cache[key]
-            run_root = config.runs_dir() / sid / f"{run_id}.stdout.log"
-            result = None
-            try:
-                import datetime as _dt
-                mtime = run_root.stat().st_mtime
-                # 转 Asia/Shanghai（与 intents_state 其他时间串保持一致）
-                try:
-                    from zoneinfo import ZoneInfo
-                    result = _dt.datetime.fromtimestamp(mtime, tz=_dt.timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).isoformat()
-                except Exception:
-                    # tzdata 缺失 → +08:00 手动近似
-                    dt_utc = _dt.datetime.fromtimestamp(mtime, tz=_dt.timezone.utc)
-                    result = (dt_utc + _dt.timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-            except OSError:
-                pass
-            _run_log_mtime_cache[key] = result
-            return result
-
-        for sid, rid_map in intents.items():
-            if subtask_id and sid != subtask_id:
+        # 3) 历史终态运行记录（data/runs/*.jsonl）；同一 run_id 以终态记录为准（覆盖 active 残影）
+        for rec in runlog.query_runs(subtask_id=subtask_id, limit=0):
+            rid = rec.get("run_id")
+            if not rid:
                 continue
-            for rid, info in rid_map.items():
-                st = info.get("status", "unknown")
-                if st == "pending":
-                    continue
-                run_id = info.get("run_id") or ""
-                if not run_id or run_id in covered_rids:
-                    continue  # intent 从未被 scheduler 拉起，或已由 active/WQ 展示 → 跳过
-                first_seen = info.get("first_seen") or None
-                started = first_seen or _guess_started_at(sid, run_id)
-                merged.append({
-                    "run_id": run_id,
-                    "subtask_id": sid,
-                    "priority": None,
-                    "pid": None,
-                    "status": st,
-                    "started_at": started,
-                    "enqueued_at": first_seen,
-                    "finished_at": info.get("finished_at") or None,
-                })
+            rows[rid] = {
+                "run_id": rid,
+                "subtask_id": rec.get("subtask_id"),
+                "request_id": rec.get("request_id", ""),
+                "priority": rec.get("priority"),
+                "pid": rec.get("pid"),
+                "status": rec.get("status") or "success",
+                "started_at": rec.get("started_at") or rec.get("scheduled_at") or rec.get("queued_at"),
+                "enqueued_at": rec.get("enqueued_at") or rec.get("queued_at"),
+                "finished_at": rec.get("finished_at"),
+                "exit_code": rec.get("exit_code"),
+                "reason": rec.get("reason"),
+            }
 
-        # 4) 过滤：多值 status 支持（逗号分隔），done+success 归一
-        _STATUS_ALIAS = {"done": {"done", "success"}}
+        all_rows = list(rows.values())
+
+        # 未过滤状态分布（顶部 chips）
+        stats: dict[str, int] = {}
+        for x in all_rows:
+            stats[x["status"]] = stats.get(x["status"], 0) + 1
+
+        # 过滤：展示桶映射到原始状态（comma 多值）
         if status:
             want = set(s.strip() for s in status.split(","))
             expanded: set[str] = set()
             for w in want:
                 expanded |= _STATUS_ALIAS.get(w, {w})
-            merged = [x for x in merged if x["status"] in expanded]
-        if subtask_id:
-            merged = [x for x in merged if x["subtask_id"] == subtask_id]
+            filtered = [x for x in all_rows if x["status"] in expanded]
+        else:
+            filtered = all_rows
 
-        # 5) 排序：状态优先级（running > waiting > 其他）然后 started_at 降序
-        _PRIO = {"running": 0, "waiting": 1}
-        merged.sort(key=lambda x: (
-            _PRIO.get(x["status"], 2),
-            x.get("started_at") or x.get("enqueued_at") or "",
-        ), reverse=True)
+        # 排序：running > waiting > 终态；同组按 started_at 降序（稳定两段排序）
+        _prio = {"running": 0, "waiting": 1}
+        filtered.sort(key=lambda x: x.get("started_at") or x.get("enqueued_at") or "", reverse=True)
+        filtered.sort(key=lambda x: _prio.get(x["status"], 2))
 
-        total = len(merged)
+        total = len(filtered)
         start = (page - 1) * page_size
         return {"total": total, "page": page, "page_size": page_size,
-                "items": merged[start:start + page_size]}
+                "stats": stats,
+                "items": filtered[start:start + page_size]}
 
     # ---------- 进程日志 ----------
     @app.get("/api/runs/{run_id}/log")

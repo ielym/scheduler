@@ -82,6 +82,14 @@ def append_run(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+def remove_run(subtask_id: str, run_id: str) -> int:
+    """从 data/runs/<subtask>.jsonl 中移除指定 run 记录（原子重写，与 append 串行）。
+
+    返回移除条数。用于「删除进程」时让该历史 run 真正从列表消失。
+    """
+    return store.remove_jsonl(run_log_path(subtask_id), lambda rec: rec.get("run_id") == run_id)
+
+
 def iter_all_runs() -> Iterator[dict]:
     d = config.runs_dir()
     if not d.exists():
