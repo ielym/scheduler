@@ -246,10 +246,22 @@ def start_in_thread(svc) -> None:
     # ---------- 进程控制 ----------
     @app.post("/api/process/stop/{run_id}")
     def stop_run(run_id: str, _req: Request):
+        # 1) 运行中 → cancel
         try:
             return svc.stop_run(run_id, reason="web 手动停止")
         except KeyError:
-            raise HTTPException(404, f"run not running: {run_id}")
+            pass
+        # 2) 等待中（WQ）→ 出队取消排队：进程从未拉起，直接移除队列项即可
+        with svc._lock:
+            wq = svc.state.wq
+            kept = [r for r in wq if r.get("run_id") != run_id]
+            removed = len(wq) - len(kept)
+            if removed:
+                svc.state.wq = kept
+                persist.save_scheduler_state(svc.state)
+                return {"ok": True, "run_id": run_id, "dequeued": True,
+                        "removed_wq": removed}
+        raise HTTPException(404, f"run not running or waiting: {run_id}")
 
     @app.delete("/api/process/{run_id}")
     def delete_run(run_id: str, _req: Request, delete_files: bool = Query(False)):
@@ -282,8 +294,9 @@ def start_in_thread(svc) -> None:
                 "finished_at": None,
             })
         # 2) WQ 中等待
+        wq_rows = []
         for r in persist.load_scheduler_state().wq:
-            merged.append({
+            wq_rows.append({
                 "run_id": r.get("run_id"),
                 "subtask_id": r.get("subtask_id"),
                 "priority": r.get("priority"),
@@ -293,6 +306,9 @@ def start_in_thread(svc) -> None:
                 "enqueued_at": r.get("enqueued_at"),
                 "finished_at": None,
             })
+        merged.extend(wq_rows)
+        # 运行中/等待中已由 active/WQ 展示，intents 侧同 run_id 跳过，避免重复行
+        covered_rids = {x["run_id"] for x in merged if x["run_id"]}
         # 3) intents_state 里所有状态的历史
         intents = scanner.load_intents_state()
         # 预索引 run log mtime（避免每条都 stat 目录）
@@ -331,8 +347,8 @@ def start_in_thread(svc) -> None:
                 if st == "pending":
                     continue
                 run_id = info.get("run_id") or ""
-                if not run_id:
-                    continue  # intent 从未被 scheduler 拉起 → 不是进程，跳过
+                if not run_id or run_id in covered_rids:
+                    continue  # intent 从未被 scheduler 拉起，或已由 active/WQ 展示 → 跳过
                 first_seen = info.get("first_seen") or None
                 started = first_seen or _guess_started_at(sid, run_id)
                 merged.append({

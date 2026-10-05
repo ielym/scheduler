@@ -79,6 +79,17 @@ a:hover{text-decoration:underline}
 .btn.primary{border-color:#0ea5e9;color:#7dd3fc}
 .btn.primary:hover{background:#0c3a55}
 .btn[disabled]{opacity:.35;cursor:not-allowed}
+/* ---------- 操作列（不换行、小按钮） ---------- */
+.op-cell{white-space:nowrap}
+.op-cell .btn{padding:3px 8px;font-size:11px;margin-right:6px}
+.op-cell .btn:last-child{margin-right:0}
+/* ---------- toast 非阻塞提示 ---------- */
+.toast-box{position:fixed;top:16px;right:16px;z-index:1000;display:flex;flex-direction:column;gap:8px;max-width:420px;pointer-events:none}
+.toast{display:flex;align-items:flex-start;gap:10px;background:#181b22;border:1px solid #2a3040;border-radius:8px;padding:10px 14px;font-size:13px;color:#e6e6e6;box-shadow:0 8px 24px rgba(0,0,0,.5);opacity:0;transform:translateX(20px);transition:all .25s;pointer-events:auto;word-break:break-all;line-height:1.5}
+.toast.show{opacity:1;transform:none}
+.toast-success{border-color:#14532d;border-left:3px solid #16a34a}
+.toast-error{border-color:#7f1d1d;border-left:3px solid #ef4444}
+.toast-info{border-color:#1e3a8a;border-left:3px solid #3b82f6}
 /* ---------- 优先级 inline 编辑 ---------- */
 .pri-val{font-family:Menlo,monospace;color:#cbd5e1;cursor:pointer;padding:2px 6px;border-radius:4px;border:1px solid transparent;min-width:28px;display:inline-block;text-align:center}
 .pri-val:hover{border-color:#2a3040}
@@ -144,7 +155,8 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
     <button class="btn ghost" onclick="selectAll('subtasksTable',true)">全选</button>
     <button class="btn ghost" onclick="selectAll('subtasksTable',false)">全不选</button>
     <button class="btn ghost" onclick="invertSelect('subtasksTable')">反选</button>
-    <button class="btn danger" onclick="batchDeleteSubtasks()">批量删除</button>
+    <button class="btn ghost" id="batchStopSubtasksBtn" onclick="batchStopSubtasks()" disabled>批量停止</button>
+    <button class="btn danger" id="batchDeleteSubtasksBtn" onclick="batchDeleteSubtasks()" disabled>批量删除</button>
     <button class="btn ghost" onclick="openRegisterModal()">注册本地任务</button>
     <span style="flex:1"></span>
     <span id="subtaskPagedInfo" style="color:#6b7280;font-size:12px"></span>
@@ -158,7 +170,7 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
         <th style="width:120px">优先级 <span style="color:#6b7280;font-weight:normal;font-size:11px">(点击修改)</span></th>
         <th style="width:60px">运行</th>
         <th style="width:60px">等待</th>
-        <th style="width:60px">已完成</th>
+        <th style="width:60px">完成</th>
         <th style="width:60px">失败</th>
         <th style="width:120px">操作</th>
       </tr></thead>
@@ -185,8 +197,8 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
     <button class="btn ghost" onclick="selectAll('processesTable',true)">全选</button>
     <button class="btn ghost" onclick="selectAll('processesTable',false)">全不选</button>
     <button class="btn ghost" onclick="invertSelect('processesTable')">反选</button>
-    <button class="btn danger" onclick="batchStopProcesses()">批量停止</button>
-    <button class="btn danger" onclick="batchDeleteProcesses()">批量删除</button>
+    <button class="btn danger" id="batchStopProcessesBtn" onclick="batchStopProcesses()" disabled>批量停止</button>
+    <button class="btn danger" id="batchDeleteProcessesBtn" onclick="batchDeleteProcesses()" disabled>批量删除</button>
     <span style="flex:1"></span>
     <span id="procPagedInfo" style="color:#6b7280;font-size:12px"></span>
   </div>
@@ -197,9 +209,10 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
         <th>子任务</th>
         <th>进程</th>
         <th>状态</th>
+        <th style="width:80px">日志</th>
         <th>开始时间</th>
         <th>结束时间</th>
-        <th style="width:200px">操作</th>
+        <th style="width:120px">操作</th>
       </tr></thead>
       <tbody id="processesTable"></tbody>
     </table>
@@ -234,6 +247,75 @@ function fmtRel(s){
     if(diff<86400)return Math.round(diff/3600)+'h前';
     return Math.round(diff/86400)+'d前';
   }catch{return s}}
+
+/* ========== 非阻塞 toast + 按钮忙态 + 通用确认弹窗 ========== */
+function toast(msg, type='info', ms=4000){
+  let box = document.getElementById('toastBox');
+  if(!box){ box=document.createElement('div'); box.id='toastBox'; box.className='toast-box'; document.body.appendChild(box); }
+  const el=document.createElement('div');
+  el.className='toast toast-'+type;
+  const icon = type==='success' ? '<span style="color:#4ade80;line-height:1.5">✓</span>'
+    : type==='error' ? '<span style="color:#f87171;line-height:1.5">✕</span>'
+    : '<span class="loading" style="margin-top:2px"></span>';
+  el.innerHTML = icon + '<span></span>';
+  el.querySelector('span:last-child').textContent = msg;
+  box.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add('show'));
+  setTimeout(()=>{ el.classList.remove('show'); setTimeout(()=>el.remove(), 300); }, ms);
+}
+/* 按钮忙态：转圈 + 文字，不阻塞页面其他交互；完成后还原或随刷新重建 */
+function busyBtn(btn, busy, text){
+  if(!btn) return;
+  if(busy){
+    btn.dataset.orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loading" style="margin-right:4px"></span>'+text;
+  }else{
+    btn.disabled = false;
+    btn.innerHTML = btn.dataset.orig || btn.innerHTML;
+  }
+}
+/* 通用确认弹窗（非阻塞 overlay）：resolve {ok, overlay}，overlay 保留由调用方关闭 */
+function askConfirm(title, bodyHTML, okText='确认', okCls='danger'){
+  return new Promise(resolve=>{
+    const overlay=document.createElement('div');
+    overlay.className='modal-overlay';
+    overlay.innerHTML = `<div class="modal" style="max-width:460px"><div class="modal-head">
+      <div><h3>${title}</h3></div>
+      <button class="btn ghost modal-close">✕</button>
+    </div><div class="modal-body">
+      ${bodyHTML}
+      <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn ghost modal-cancel">取消</button>
+        <button class="btn ${okCls} modal-ok">${okText}</button>
+      </div>
+    </div></div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('.modal-close').onclick = ()=>resolve({ok:false, overlay});
+    overlay.querySelector('.modal-cancel').onclick = ()=>resolve({ok:false, overlay});
+    overlay.querySelector('.modal-ok').onclick = ()=>resolve({ok:true, overlay});
+  });
+}
+
+/* ========== 批量按钮可用性（多选场景：有一个未停止则批量删除不可用） ========== */
+const STOPPABLE_STATUS = new Set(['running','waiting']);
+const isStoppable = s => STOPPABLE_STATUS.has(s);
+const isDeletable = s => !STOPPABLE_STATUS.has(s);
+function updateBatchButtons(){
+  // 子任务：checkbox 带 data-busy（1=有运行/等待中）
+  const scbs=[...document.querySelectorAll('#subtasksTable input[data-select]:checked')];
+  const sStop=qs('#batchStopSubtasksBtn'), sDel=qs('#batchDeleteSubtasksBtn');
+  if(sStop) sStop.disabled = !(scbs.length && scbs.some(cb=>cb.dataset.busy==='1'));
+  if(sDel)  sDel.disabled  = !(scbs.length && scbs.every(cb=>cb.dataset.busy!=='1'));
+  // 进程：checkbox 带 data-status
+  const pcbs=[...document.querySelectorAll('#processesTable input[data-select]:checked')];
+  const pStop=qs('#batchStopProcessesBtn'), pDel=qs('#batchDeleteProcessesBtn');
+  if(pStop) pStop.disabled = !(pcbs.length && pcbs.some(cb=>isStoppable(cb.dataset.status)));
+  if(pDel)  pDel.disabled  = !(pcbs.length && pcbs.every(cb=>!isStoppable(cb.dataset.status)));
+}
+document.addEventListener('change', e=>{
+  if(e.target.matches('input[type=checkbox][data-select]')) updateBatchButtons();
+});
 
 /* ========== Tab 切换 ========== */
 function switchTab(name){
@@ -347,7 +429,7 @@ async function refreshSubtasks(){
       el.addEventListener('click',()=>enterPriEdit(el));
     });
   } else {
-    // 逐条更新：优先级显示、开关、status badge
+    // 逐条更新：优先级显示、开关、status badge、操作按钮可用性
     for(const s of pageItems){
       const tr = tbody.querySelector(`tr[data-sid="${s.subtask_id}"]`);
       if(!tr){/* 不认识了 → 全量重建 */ tbody.innerHTML=''; return refreshSubtasks();}
@@ -361,6 +443,7 @@ async function refreshSubtasks(){
       }
       // 4 个状态计数单元格
       const c = summarizeIntents(intents[s.subtask_id]||{});
+      const busy = c.running + c.waiting > 0;
       const tds = tr.querySelectorAll('td');
       tds[4].textContent = c.running || '';
       tds[4].style.color = c.running ? '#4ade80' : '#94a3b8';
@@ -370,11 +453,19 @@ async function refreshSubtasks(){
       tds[6].style.color = c.done ? '#8ab4ff' : '#94a3b8';
       tds[7].textContent = c.failed || '';
       tds[7].style.color = c.failed ? '#f87171' : '#94a3b8';
+      // 操作按钮：有运行/等待 → 可停止不可删除；全终态 → 可删除不可停止
+      const selCb = tr.querySelector('input[data-select]');
+      if(selCb) selCb.dataset.busy = busy?'1':'0';
+      const stopBtn = tr.querySelector('[data-stop-btn]');
+      const delBtn = tr.querySelector('[data-del-btn]');
+      if(stopBtn) stopBtn.disabled = !busy;
+      if(delBtn) delBtn.disabled = busy;
     }
   }
 
   qs('#subtaskPagedInfo').textContent = `共 ${total} · 第 ${p}/${Math.max(1,Math.ceil(total/ps))} 页`;
   renderPage('#subtaskPagination', total, p, ps, np=>{subtaskPage=np;refreshSubtasks()});
+  updateBatchButtons();
 }
 
 function summarizeIntents(m){
@@ -393,8 +484,9 @@ function summarizeIntents(m){
 function subtaskRowHTML(s, intentsMap){
   const c = summarizeIntents(intentsMap);
   const n = v => v || '';
+  const busy = c.running + c.waiting > 0;  // 有运行/等待中 → 须先停止才能删
   return `<tr data-sid="${s.subtask_id}">
-    <td><input type="checkbox" data-select value="${s.subtask_id}"></td>
+    <td><input type="checkbox" data-select value="${s.subtask_id}" data-busy="${busy?'1':'0'}"></td>
     <td><a href="javascript:void(0)" onclick="openSubtask('${s.subtask_id}')">${s.name||s.subtask_id}</a></td>
     <td><label class="switch"><input type="checkbox" data-toggle data-sid="${s.subtask_id}" ${s.enabled?'checked':''}/><span class="slider"></span></label></td>
     <td><span class="pri-val" data-pri-val data-sid="${s.subtask_id}">${s.priority||0}</span></td>
@@ -402,7 +494,10 @@ function subtaskRowHTML(s, intentsMap){
     <td style="color:${c.waiting?'#fbbf24':'#94a3b8'}">${n(c.waiting)}</td>
     <td style="color:${c.done?'#8ab4ff':'#94a3b8'}">${n(c.done)}</td>
     <td style="color:${c.failed?'#f87171':'#94a3b8'}">${n(c.failed)}</td>
-    <td><button class="btn danger" onclick="deleteSubtask('${s.subtask_id}')">删除</button></td>
+    <td class="op-cell">
+      <button class="btn ghost" data-stop-btn onclick="stopSubtask('${s.subtask_id}', this)" ${busy?'':'disabled'}>停止</button>
+      <button class="btn danger" data-del-btn onclick="deleteSubtask('${s.subtask_id}')" ${busy?'disabled':''}>删除</button>
+    </td>
   </tr>`;
 }
 
@@ -411,10 +506,12 @@ async function toggleSubtask(sid, wantEnable){
     const url = wantEnable? API+'/api/start/'+encodeURIComponent(sid) : API+'/api/stop/'+encodeURIComponent(sid);
     const r = await fetch(url,{method:'POST'}).then(r=>r.json());
     if(!wantEnable){
-      alert(`已禁用 ${sid}\n· kill running ${(r.killed_running||[]).length} 个\n· 清除 WQ ${r.removed_wq||0} 个\n· 273 个意图已停止，调度器不再自动拉起`);
+      toast(`已停止 ${sid}：kill 运行 ${(r.killed_running||[]).length} 个 · 清除排队 ${r.removed_wq||0} 个 · 意图回退 ${r.reset_pending||0} 个，调度器不再自动拉起`, 'success');
+    }else{
+      toast(`已启用 ${sid}：重新入队 ${r.requeued||0} 个意图`, 'success');
     }
     refreshDashboard(true); refreshSubtasks();
-  }catch(e){ alert('操作失败: '+e.message); refreshSubtasks(); }
+  }catch(e){ toast('操作失败: '+e.message, 'error'); refreshSubtasks(); }
 }
 
 function openRegisterModal(){
@@ -469,62 +566,42 @@ function openRegisterModal(){
     .catch(e=>{ list.innerHTML = '<div style="color:#f87171;padding:16px;text-align:center">加载失败: '+e.message+'</div>'; });
 }
 
-function clearAllTasks(){
-  qs('#clearAllModal')?.remove();
-  const overlay = document.createElement('div');
-  overlay.className='modal-overlay'; overlay.id='clearAllModal';
-  overlay.innerHTML = `<div class="modal" style="max-width:460px"><div class="modal-head">
-    <div><h3>清空全部调度状态</h3></div>
-    <button class="btn ghost" onclick="document.getElementById('clearAllModal').remove()">✕</button>
-  </div><div class="modal-body">
-    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止所有进程，并清空注册表 / 等待队列 / 意图状态 / 运行历史。此操作不可恢复。</div>
-    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
-      <input type="checkbox" id="clearAllRequests" checked> 同时清空所有子任务 requests/ 意图文件（保留任务代码）
-    </label>
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn ghost" onclick="document.getElementById('clearAllModal').remove()">取消</button>
-      <button class="btn danger" id="clearAllConfirm">确认清空</button>
-    </div>
-  </div></div>`;
-  document.body.appendChild(overlay);
-  overlay.querySelector('#clearAllConfirm').onclick = async ()=>{
-    const delReq = overlay.querySelector('#clearAllRequests').checked;
-    try{
-      const r = await fetch(API+'/api/admin/clear',{
-        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({delete_requests:delReq})
-      }).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
-      overlay.remove();
-      alert(`清空完成：kill ${r.killed_running||0}，删运行历史 ${r.removed_run_files||0}，删意图文件 ${r.removed_requests||0}`);
-      refreshDashboard(true); refreshSubtasks(); refreshProcesses();
-    }catch(e){ alert('清空失败: '+e.message); }
-  };
+async function clearAllTasks(){
+  const {ok, overlay} = await askConfirm('清空全部调度状态',
+    `<div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止所有进程，并清空注册表 / 等待队列 / 意图状态 / 运行历史。此操作不可恢复。</div>
+     <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+       <input type="checkbox" id="clearAllRequests" checked> 同时清空所有子任务 requests/ 意图文件（保留任务代码）
+     </label>`, '确认清空');
+  if(!ok){ overlay.remove(); return; }
+  const delReq = overlay.querySelector('#clearAllRequests').checked;
+  const btn = overlay.querySelector('.modal-ok');
+  busyBtn(btn, true, '清空中…');
+  try{
+    const r = await fetch(API+'/api/admin/clear',{
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({delete_requests:delReq})
+    }).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
+    overlay.remove();
+    toast(`清空完成：kill ${r.killed_running||0}，删运行历史 ${r.removed_run_files||0}，删意图文件 ${r.removed_requests||0}`, 'success');
+    refreshDashboard(true); refreshSubtasks(); refreshProcesses();
+  }catch(e){ toast('清空失败: '+e.message, 'error'); busyBtn(btn, false); }
 }
 
-function deleteSubtask(sid){
-  qs('#delSubtaskModal')?.remove();
-  const overlay = document.createElement('div');
-  overlay.className='modal-overlay'; overlay.id='delSubtaskModal';
-  overlay.innerHTML = `<div class="modal" style="max-width:440px"><div class="modal-head">
-    <div><h3>删除子任务 ${sid}</h3></div>
-    <button class="btn ghost" onclick="document.getElementById('delSubtaskModal').remove()">✕</button>
-  </div><div class="modal-body">
-    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止该任务所有进程，并移除调度器内记录（注册 / 队列 / 意图状态 / 历史 / 日志）。</div>
-    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
-      <input type="checkbox" id="delSubtaskDir"> 同时删除本地目录 tasks/${sid}/
-    </label>
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn ghost" onclick="document.getElementById('delSubtaskModal').remove()">取消</button>
-      <button class="btn danger" id="delSubtaskConfirm">确认删除</button>
-    </div>
-  </div></div>`;
-  document.body.appendChild(overlay);
-  overlay.querySelector('#delSubtaskConfirm').onclick = async ()=>{
-    const delDir = overlay.querySelector('#delSubtaskDir').checked;
-    try{
-      await fetch(API+'/api/subtasks/'+encodeURIComponent(sid)+'?delete_dir='+delDir,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
-      overlay.remove(); refreshDashboard(true); refreshSubtasks();
-    }catch(e){ alert('删除失败: '+e.message); }
-  };
+async function deleteSubtask(sid){
+  const {ok, overlay} = await askConfirm('删除子任务 '+sid,
+    `<div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止该任务所有进程，并移除调度器内记录（注册 / 队列 / 意图状态 / 历史 / 日志）。</div>
+     <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+       <input type="checkbox" id="delSubtaskDir"> 同时删除本地目录 tasks/${sid}/
+     </label>`, '确认删除');
+  if(!ok){ overlay.remove(); return; }
+  const delDir = overlay.querySelector('#delSubtaskDir').checked;
+  const btn = overlay.querySelector('.modal-ok');
+  busyBtn(btn, true, '删除中…');
+  try{
+    const r = await fetch(API+'/api/subtasks/'+encodeURIComponent(sid)+'?delete_dir='+delDir,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
+    overlay.remove();
+    toast(`已删除子任务 ${sid}：kill 运行 ${(r.killed_running||[]).length} · 清除排队 ${r.removed_wq||0}`, 'success');
+    refreshDashboard(true); refreshSubtasks();
+  }catch(e){ toast('删除失败: '+e.message, 'error'); busyBtn(btn, false); }
 }
 
 function enterPriEdit(el){
@@ -559,9 +636,11 @@ function openSubtask(sid){ window.open('subtask.html?sid='+encodeURIComponent(si
 let procPage=1, procPSize=20;
 
 function _procStatusLabel(s){
-  // done 和 success 在界面上统一显示为"已完成"
-  if(s==='done'||s==='success') return {label:'已完成', cls:'done'};
-  return {label:s, cls:s};
+  // 统一中文展示；cls 保持原始状态值以命中徽标配色
+  const map = {running:'运行中', waiting:'等待中', done:'已完成', success:'已完成',
+               failed:'失败', stopped:'已停止', archived:'已归档', rejected:'已拒绝',
+               resource:'资源不足', preempted:'被抢占', timeout:'超时', killed:'已终止', interrupted:'已中断'};
+  return {label: map[s] || s, cls: s};
 }
 
 async function refreshProcesses(){
@@ -580,28 +659,30 @@ async function refreshProcesses(){
 
   const rows = items.map(i=>{
     const canLog = ['done','success','failed','stopped','running'].includes(i.status);
-    const canStop = i.status==='running';
+    const canStop = isStoppable(i.status);       // 运行中/等待中 → 可停止
+    const canDelete = isDeletable(i.status);     // 终态 → 可删除
     const started = i.started_at || i.enqueued_at || null;
     const {label, cls} = _procStatusLabel(i.status);
     return `<tr>
-      <td><input type="checkbox" data-select value="${i.run_id}"></td>
+      <td><input type="checkbox" data-select value="${i.run_id}" data-status="${i.status}"></td>
       <td><a href="javascript:void(0)" onclick="openSubtask('${i.subtask_id}')">${i.subtask_id}</a></td>
       <td>
         <div class="rid-col">${i.run_id}</div>
       </td>
       <td><span class="badge ${cls}">${label}</span></td>
+      <td>${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">日志</button>`:'<span style="color:#3b4252">—</span>'}</td>
       <td class="time-col">${fmtAbs(started)}</td>
       <td class="time-col">${fmtAbs(i.finished_at)}</td>
-      <td>
-        ${canLog?`<button class="btn ghost" onclick="showLog('${i.run_id}')">📜 日志</button>`:'<span style="color:#3b4252">—</span>'}
-        ${canStop?`<button class="btn danger" onclick="stopProcess('${i.run_id}')" style="margin-left:6px">停止</button>`:''}
-        <button class="btn danger" onclick="deleteProcess('${i.run_id}')" style="margin-left:6px">删除</button>
+      <td class="op-cell">
+        ${canStop?`<button class="btn danger" onclick="stopProcess('${i.run_id}', this)">停止</button>`:''}
+        <button class="btn danger" onclick="deleteProcess('${i.run_id}')" ${canDelete?'':'disabled'}>删除</button>
       </td>
     </tr>`;
-  }).join('') || `<tr><td colspan="7" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
+  }).join('') || `<tr><td colspan="8" style="text-align:center;color:#6b7280;padding:30px">无匹配进程</td></tr>`;
   qs('#processesTable').innerHTML = rows;
   qs('#procPagedInfo').textContent = `共 ${d.total||0} · 第 ${procPage}/${Math.max(1,Math.ceil((d.total||0)/procPSize))} 页`;
   renderPage('#procPagination', d.total||0, procPage, procPSize, np=>{procPage=np;refreshProcesses()});
+  updateBatchButtons();
 }
 
 // 状态多选下拉交互
@@ -615,37 +696,31 @@ document.addEventListener('click', ()=>{
   qs('#procStatusDropdown').classList.remove('open');
 });
 
-async function stopProcess(rid){
-  if(!confirm('确认停止进程 '+rid+' ?')) return;
-  try{ await fetch(API+'/api/process/stop/'+encodeURIComponent(rid),{method:'POST'}); refreshProcesses(); refreshDashboard(true); }
-  catch(e){ alert('停止失败: '+e.message); }
+async function stopProcess(rid, btn){
+  busyBtn(btn, true, '停止中…');
+  try{
+    const r = await fetch(API+'/api/process/stop/'+encodeURIComponent(rid),{method:'POST'}).then(r=>{ if(!r.ok) return r.json().then(e=>{throw new Error(e.detail||r.statusText)}); return r.json(); });
+    toast(r.dequeued ? `已取消排队 ${rid}（等待中的进程不会启动）` : `已发送停止指令 ${rid}，进程正在退出…`, 'success');
+    refreshProcesses(); refreshDashboard(true);
+  }catch(e){ toast('停止失败: '+e.message, 'error'); busyBtn(btn, false); }
 }
 
-function deleteProcess(rid){
-  qs('#delProcModal')?.remove();
-  const overlay = document.createElement('div');
-  overlay.className='modal-overlay'; overlay.id='delProcModal';
-  overlay.innerHTML = `<div class="modal" style="max-width:440px"><div class="modal-head">
-    <div><h3>删除进程 ${rid}</h3></div>
-    <button class="btn ghost" onclick="document.getElementById('delProcModal').remove()">✕</button>
-  </div><div class="modal-body">
-    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止该进程（若运行中）并从界面移除，不影响任务与其他进程。</div>
-    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
-      <input type="checkbox" id="delProcFiles"> 同时删除该进程的日志与缓存文件
-    </label>
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn ghost" onclick="document.getElementById('delProcModal').remove()">取消</button>
-      <button class="btn danger" id="delProcConfirm">确认删除</button>
-    </div>
-  </div></div>`;
-  document.body.appendChild(overlay);
-  overlay.querySelector('#delProcConfirm').onclick = async ()=>{
-    const delFiles = overlay.querySelector('#delProcFiles').checked;
-    try{
-      await fetch(API+'/api/process/'+encodeURIComponent(rid)+'?delete_files='+delFiles,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
-      overlay.remove(); refreshProcesses(); refreshDashboard(true);
-    }catch(e){ alert('删除失败: '+e.message); }
-  };
+async function deleteProcess(rid){
+  const {ok, overlay} = await askConfirm('删除进程 '+rid,
+    `<div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止该进程（若运行中）并从界面移除，不影响任务与其他进程。</div>
+     <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+       <input type="checkbox" id="delProcFiles"> 同时删除该进程的日志与缓存文件
+     </label>`, '确认删除');
+  if(!ok){ overlay.remove(); return; }
+  const delFiles = overlay.querySelector('#delProcFiles').checked;
+  const btn = overlay.querySelector('.modal-ok');
+  busyBtn(btn, true, '删除中…');
+  try{
+    await fetch(API+'/api/process/'+encodeURIComponent(rid)+'?delete_files='+delFiles,{method:'DELETE'}).then(r=>{ if(!r.ok) return r.json().then(e=>{throw new Error(e.detail||r.statusText)}); return r.json(); });
+    overlay.remove();
+    toast(`已删除进程 ${rid}`, 'success');
+    refreshProcesses(); refreshDashboard(true);
+  }catch(e){ toast('删除失败: '+e.message, 'error'); busyBtn(btn, false); }
 }
 
 async function showLog(rid){
@@ -714,88 +789,137 @@ document.addEventListener('keydown', e=>{ if(e.key==='Escape') qs('#logModal')?.
 /* ========== 批量选择 ========== */
 function selectAll(tableId, checked){
   document.querySelectorAll('#'+tableId+' input[type=checkbox][data-select]').forEach(cb=>cb.checked=checked);
+  updateBatchButtons();
 }
 function invertSelect(tableId){
   document.querySelectorAll('#'+tableId+' input[type=checkbox][data-select]').forEach(cb=>cb.checked=!cb.checked);
+  updateBatchButtons();
 }
 function selectedIds(tableId){
   return [...document.querySelectorAll('#'+tableId+' input[type=checkbox][data-select]:checked')].map(cb=>cb.value);
 }
-function batchDeleteSubtasks(){
-  const sids = selectedIds('subtasksTable');
-  if(!sids.length) return alert('请先勾选要删除的子任务');
-  qs('#batchModal')?.remove();
-  const overlay = document.createElement('div');
-  overlay.className='modal-overlay'; overlay.id='batchModal';
-  overlay.innerHTML = `<div class="modal" style="max-width:460px"><div class="modal-head">
-    <div><h3>批量删除 ${sids.length} 个子任务</h3></div>
-    <button class="btn ghost" onclick="document.getElementById('batchModal').remove()">✕</button>
-  </div><div class="modal-body">
-    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止这些任务所有进程，并移除调度器内记录（注册 / 队列 / 意图状态 / 历史 / 日志）。</div>
-    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
-      <input type="checkbox" id="batchDelDir"> 同时删除本地目录 tasks/&lt;id&gt;/
-    </label>
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn ghost" onclick="document.getElementById('batchModal').remove()">取消</button>
-      <button class="btn danger" id="batchConfirm">确认删除</button>
-    </div>
-  </div></div>`;
-  document.body.appendChild(overlay);
-  overlay.querySelector('#batchConfirm').onclick = async ()=>{
-    const delDir = overlay.querySelector('#batchDelDir').checked;
-    overlay.remove();
-    let ok=0, fail=0;
-    for(const sid of sids){
-      try{ await fetch(API+'/api/subtasks/'+encodeURIComponent(sid)+'?delete_dir='+delDir,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
-      catch(e){ fail++; }
-    }
-    alert(`批量删除完成：成功 ${ok}，失败 ${fail}`);
+
+/* 子任务行内停止：等价于该子任务批量停止（杀运行 + 清排队 + 回退意图） */
+async function stopSubtask(sid, btn){
+  busyBtn(btn, true, '停止中…');
+  try{
+    const r = await fetch(API+'/api/stop/'+encodeURIComponent(sid),{method:'POST'}).then(r=>{ if(!r.ok) return r.json().then(e=>{throw new Error(e.detail||r.statusText)}); return r.json(); });
+    toast(`已停止 ${sid}：kill 运行 ${(r.killed_running||[]).length} · 清除排队 ${r.removed_wq||0}`, 'success');
     refreshDashboard(true); refreshSubtasks();
-  };
+  }catch(e){ toast('停止失败: '+e.message, 'error'); busyBtn(btn, false); }
 }
-async function batchStopProcesses(){
-  const rids = selectedIds('processesTable');
-  if(!rids.length) return alert('请先勾选要停止的进程');
-  if(!confirm(`确认停止 ${rids.length} 个进程？`)) return;
-  let ok=0, fail=0;
-  for(const rid of rids){
-    try{ await fetch(API+'/api/process/stop/'+encodeURIComponent(rid),{method:'POST'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
-    catch(e){ fail++; }
+
+/* 批量执行：进度 toast 非阻塞，不锁死页面其他交互 */
+let _batchRunning = false;
+let _batchToastEl = null;
+function batchToast(msg){
+  if(!_batchToastEl || !_batchToastEl.isConnected){
+    let box = document.getElementById('toastBox');
+    if(!box){ box=document.createElement('div'); box.id='toastBox'; box.className='toast-box'; document.body.appendChild(box); }
+    _batchToastEl = document.createElement('div');
+    _batchToastEl.className='toast toast-info show';
+    _batchToastEl.innerHTML='<span class="loading" style="margin-top:2px"></span><span></span>';
+    box.appendChild(_batchToastEl);
   }
-  alert(`批量停止完成：成功 ${ok}，失败 ${fail}`);
-  refreshProcesses(); refreshDashboard(true);
+  _batchToastEl.querySelector('span:last-child').textContent = msg;
 }
-function batchDeleteProcesses(){
+function closeBatchToast(){
+  if(_batchToastEl && _batchToastEl.isConnected){ _batchToastEl.remove(); _batchToastEl=null; }
+}
+async function runBatch({items, progressText, doneText, doOne, refresh}){
+  if(_batchRunning){ toast('已有批量操作进行中，请稍候', 'info'); return; }
+  _batchRunning = true;
+  let ok=0, fail=0; const errs=[];
+  for(let i=0;i<items.length;i++){
+    batchToast(`${progressText} ${i+1}/${items.length}…`);
+    try{ await doOne(items[i]); ok++; }
+    catch(e){ fail++; if(errs.length<3) errs.push(`${items[i]}: ${e.message}`); }
+  }
+  closeBatchToast(); _batchRunning=false;
+  toast(`${doneText}：成功 ${ok}，失败 ${fail}` + (errs.length?`（${errs.join('；')}）`:''), fail?'error':'success');
+  refresh();
+}
+
+/* 子任务批量停止：停止所选子任务下所有进程 */
+function batchStopSubtasks(){
+  const sids = selectedIds('subtasksTable');
+  const busy = sids.filter(sid=>{
+    const cb = document.querySelector('#subtasksTable input[data-select][value="'+sid+'"]');
+    return cb && cb.dataset.busy==='1';
+  });
+  if(!busy.length){ toast('所选子任务均已停止，无需批量停止', 'info'); return; }
+  const skipped = sids.length - busy.length;
+  runBatch({
+    items: busy,
+    progressText: '正在停止子任务',
+    doneText: `批量停止完成` + (skipped?`（跳过 ${skipped} 个已停止）`:''),
+    doOne: sid=>fetch(API+'/api/stop/'+encodeURIComponent(sid),{method:'POST'}).then(r=>{ if(!r.ok) throw new Error(r.statusText); return r.json(); }),
+    refresh: ()=>{ refreshDashboard(true); refreshSubtasks(); },
+  });
+}
+async function batchDeleteSubtasks(){
+  const sids = selectedIds('subtasksTable');
+  if(!sids.length) return toast('请先勾选要删除的子任务', 'info');
+  const anyBusy = sids.some(sid=>{
+    const cb = document.querySelector('#subtasksTable input[data-select][value="'+sid+'"]');
+    return cb && cb.dataset.busy==='1';
+  });
+  if(anyBusy) return toast('存在运行/等待中的子任务，请先停止后再批量删除', 'error');
+  const {ok, overlay} = await askConfirm(`批量删除 ${sids.length} 个子任务`,
+    `<div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将移除这些任务在调度器内的记录（注册 / 队列 / 意图状态 / 历史 / 日志）。</div>
+     <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+       <input type="checkbox" id="batchDelDir"> 同时删除本地目录 tasks/&lt;id&gt;/
+     </label>`, '确认删除');
+  if(!ok){ overlay.remove(); return; }
+  const delDir = overlay.querySelector('#batchDelDir').checked;
+  overlay.remove();
+  runBatch({
+    items: sids,
+    progressText: '正在删除子任务',
+    doneText: '批量删除完成',
+    doOne: sid=>fetch(API+'/api/subtasks/'+encodeURIComponent(sid)+'?delete_dir='+delDir,{method:'DELETE'}).then(r=>{ if(!r.ok) throw new Error(r.statusText); return r.json(); }),
+    refresh: ()=>{ refreshDashboard(true); refreshSubtasks(); },
+  });
+}
+function batchStopProcesses(){
   const rids = selectedIds('processesTable');
-  if(!rids.length) return alert('请先勾选要删除的进程');
-  qs('#batchModal')?.remove();
-  const overlay = document.createElement('div');
-  overlay.className='modal-overlay'; overlay.id='batchModal';
-  overlay.innerHTML = `<div class="modal" style="max-width:460px"><div class="modal-head">
-    <div><h3>批量删除 ${rids.length} 个进程</h3></div>
-    <button class="btn ghost" onclick="document.getElementById('batchModal').remove()">✕</button>
-  </div><div class="modal-body">
-    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止这些进程（若运行中）并从界面移除，不影响任务与其他进程。</div>
-    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
-      <input type="checkbox" id="batchDelFiles"> 同时删除这些进程的日志与缓存文件
-    </label>
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn ghost" onclick="document.getElementById('batchModal').remove()">取消</button>
-      <button class="btn danger" id="batchConfirm">确认删除</button>
-    </div>
-  </div></div>`;
-  document.body.appendChild(overlay);
-  overlay.querySelector('#batchConfirm').onclick = async ()=>{
-    const delFiles = overlay.querySelector('#batchDelFiles').checked;
-    overlay.remove();
-    let ok=0, fail=0;
-    for(const rid of rids){
-      try{ await fetch(API+'/api/process/'+encodeURIComponent(rid)+'?delete_files='+delFiles,{method:'DELETE'}).then(r=>{if(!r.ok) throw new Error(r.statusText)}); ok++; }
-      catch(e){ fail++; }
-    }
-    alert(`批量删除完成：成功 ${ok}，失败 ${fail}`);
-    refreshProcesses(); refreshDashboard(true);
-  };
+  const stoppable = rids.filter(rid=>{
+    const cb = document.querySelector('#processesTable input[data-select][value="'+rid+'"]');
+    return cb && isStoppable(cb.dataset.status);
+  });
+  if(!stoppable.length){ toast('所选进程均已结束，无需停止', 'info'); return; }
+  const skipped = rids.length - stoppable.length;
+  runBatch({
+    items: stoppable,
+    progressText: '正在停止进程',
+    doneText: `批量停止完成` + (skipped?`（跳过 ${skipped} 个已结束）`:''),
+    doOne: rid=>fetch(API+'/api/process/stop/'+encodeURIComponent(rid),{method:'POST'}).then(r=>{ if(!r.ok) throw new Error(r.statusText); return r.json(); }),
+    refresh: ()=>{ refreshProcesses(); refreshDashboard(true); },
+  });
+}
+async function batchDeleteProcesses(){
+  const rids = selectedIds('processesTable');
+  if(!rids.length) return toast('请先勾选要删除的进程', 'info');
+  const anyActive = rids.some(rid=>{
+    const cb = document.querySelector('#processesTable input[data-select][value="'+rid+'"]');
+    return cb && !isDeletable(cb.dataset.status);
+  });
+  if(anyActive) return toast('存在运行/等待中的进程，请先停止后再批量删除', 'error');
+  const {ok, overlay} = await askConfirm(`批量删除 ${rids.length} 个进程`,
+    `<div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将从界面移除这些进程记录，不影响任务与其他进程。</div>
+     <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+       <input type="checkbox" id="batchDelFiles"> 同时删除这些进程的日志与缓存文件
+     </label>`, '确认删除');
+  if(!ok){ overlay.remove(); return; }
+  const delFiles = overlay.querySelector('#batchDelFiles').checked;
+  overlay.remove();
+  runBatch({
+    items: rids,
+    progressText: '正在删除进程',
+    doneText: '批量删除完成',
+    doOne: rid=>fetch(API+'/api/process/'+encodeURIComponent(rid)+'?delete_files='+delFiles,{method:'DELETE'}).then(r=>{ if(!r.ok) throw new Error(r.statusText); return r.json(); }),
+    refresh: ()=>{ refreshProcesses(); refreshDashboard(true); },
+  });
 }
 </script>
 </body>

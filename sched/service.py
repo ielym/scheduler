@@ -1170,6 +1170,22 @@ class SchedulerService:
                 subtask_id = rec.get("subtask_id")
                 request_id = rec.get("request_id")
 
+        # 等待中（WQ）→ 直接出队；进程从未拉起，无日志/缓存可删
+        removed_wq = 0
+        with self._lock:
+            wq = self.state.wq
+            kept = [r for r in wq if r.get("run_id") != run_id]
+            removed_wq = len(wq) - len(kept)
+            if removed_wq:
+                self.state.wq = kept
+                persist.save_scheduler_state(self.state)
+                if subtask_id is None:
+                    for r in wq:
+                        if r.get("run_id") == run_id:
+                            subtask_id = r.get("subtask_id")
+                            request_id = r.get("request_id")
+                            break
+
         # 等待运行中的进程真正退出（cancel → _terminate → _finalize）
         if th is not None:
             th.join(timeout=max(10, int(self.settings.runner.kill_grace_sec or 10)) + 10)
@@ -1199,4 +1215,5 @@ class SchedulerService:
                     _scanner.save_intents_state(intents)
 
         return {"ok": True, "run_id": run_id, "subtask_id": subtask_id,
-                "request_id": request_id, "deleted_files": delete_files}
+                "request_id": request_id, "deleted_files": delete_files,
+                "removed_wq": removed_wq}
