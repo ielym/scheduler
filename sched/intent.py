@@ -59,7 +59,6 @@ class IntentFile(BaseModel):
     kind: Literal["daemon", "oneshot"] = "oneshot"
     config: str = ""
     entry: EntryOverride = Field(default_factory=EntryOverride)
-    priority: int | None = None
     resources: dict[str, Any] = Field(default_factory=lambda: {"cpu": 0.0, "memory_mb": 0})
     lifetime: LifetimeSpec = Field(default_factory=LifetimeSpec)
 
@@ -77,15 +76,6 @@ class IntentFile(BaseModel):
     def _rid_ok(cls, v: str) -> str:
         if not REQUEST_ID_RE.match(v or ""):
             raise ValueError(f"request_id 非法：{v!r}")
-        return v
-
-    @field_validator("priority")
-    @classmethod
-    def _pri_ok(cls, v: int | None) -> int | None:
-        if v is None:
-            return v
-        if isinstance(v, bool) or not (0 <= v <= 100):
-            raise ValueError("priority 必须在 0~100 之间（或不填）")
         return v
 
     @model_validator(mode="after")

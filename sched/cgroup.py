@@ -177,5 +177,28 @@ def ensure_scheduler_subtree() -> bool:
     return _delegate_controllers()
 
 
+def reap_orphans() -> int:
+    """启动时回收 sched 子树下残留的进程（上个调度器实例崩溃/异常退出遗留的孤儿）。
+
+    只在调度器刚启动、尚未拉起任何任务进程时调用——此刻子树内的一切进程都属于
+    已消亡的旧实例。通过根 cgroup 的 cgroup.kill 一次性整组杀死（含所有后代），
+    返回回收前统计到的进程数（供日志）。当前 serve 进程位于 systemd 服务 cgroup，
+    不在本子树内，因此不受影响。
+    """
+    if not _cgroup_fs_mounted() or not FALLBACK_ROOT.exists():
+        return 0
+    total = 0
+    for procs_file in FALLBACK_ROOT.rglob("cgroup.procs"):
+        try:
+            total += len([x for x in procs_file.read_text().split() if x.strip()])
+        except OSError:
+            continue
+    try:
+        (FALLBACK_ROOT / "cgroup.kill").write_text("1")
+    except OSError:
+        pass
+    return total
+
+
 def new_cgroup(name: str) -> Cgroup:
     return Cgroup(name)

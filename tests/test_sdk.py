@@ -114,15 +114,14 @@ class TestSchedTaskOneshot:
 class TestEmitIntent:
     def test_atomic_write(self, sdk_env):
         rid = emit_intent(config="config/2026-10-01.json", kind="daemon",
-                          resources={"cpu": 0.2, "memory_mb": 64},
-                          priority=80)
+                          resources={"cpu": 0.2, "memory_mb": 64})
         p = sdk_env / "requests" / f"{rid}.json"
         assert p.exists()
         data = json.loads(p.read_text("utf-8"))
         assert data["schema_version"] == 1
         assert data["kind"] == "daemon"
         assert data["resources"]["cpu"] == 0.2
-        assert data["priority"] == 80
+        assert "priority" not in data  # 优先级唯一来源是 manifest，意图文件不再写 priority
 
     def test_emit_without_sched_workspace_raises(self, tmp_path, monkeypatch):
         monkeypatch.delenv("SCHED_WORKSPACE", raising=False)
@@ -137,9 +136,9 @@ class TestEmitIntent:
         assert len(list((sdk_env / "requests").glob(f"{rid}.json"))) == 1
 
     def test_duplicate_different_content_raises(self, sdk_env):
-        rid = emit_intent(kind="oneshot", priority=50)
+        rid = emit_intent(kind="oneshot")
         with pytest.raises(FileExistsError):
-            emit_intent(kind="daemon", priority=80, request_id=rid)
+            emit_intent(kind="daemon", request_id=rid)
 
     def test_list_intents_reads_all(self, sdk_env):
         emit_intent(kind="oneshot", request_id="r1")

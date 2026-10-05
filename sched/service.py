@@ -129,6 +129,11 @@ class SchedulerService:
             log.warning("cgroup v2 不可用：降级运行（无硬资源边界）")
             persist.append_decision({"ts": runlog.now_iso(), "act": "cgroup_degraded",
                                      "reason": "cgroup 不可用"})
+        else:
+            # 启动时回收上一个实例崩溃/异常退出留下的孤儿任务进程（严格防孤儿积累）
+            reaped = cgroup.reap_orphans()
+            if reaped:
+                log.info("reaped %d orphan task processes left by previous instance", reaped)
         self.refresh()
         self._recover_running()
         self.started_at = runlog.now_iso()
@@ -165,6 +170,9 @@ class SchedulerService:
         entries = registry.load_registered()
         with self._lock:
             self.entries = entries
+        # 自愈清理：任何方式注销的子任务（jobs.json 已无记录）其意图即为孤儿，
+        # 立即从 intents_state 移除，保证前端统计不再出现幽灵计数。
+        _scanner.prune_orphan_intents(set(entries))
         return {"subtasks": len(entries), "ok": sum(1 for e in entries.values() if e.ok)}
 
     def _recover_running(self) -> None:
@@ -173,22 +181,77 @@ class SchedulerService:
         把它们重置回 pending 并重新入队（trigger=resume），配合 SDK 断点续跑不重复工作。
         重置 pending 让下次 scan 不会被当成新意图，重新入队让它们能继续被准出。
         """
-        state = _scanner.load_intents_state()
         recovered = 0
-        for stid, rid_map in state.items():
-            for rid, st in rid_map.items():
-                if st.get("status") != "running":
-                    continue
-                st["status"] = "pending"
-                st["run_id"] = ""
-                recovered += 1
-                try:
-                    self._enqueue_intent(stid, rid, trigger="resume", resume_ref=True)
-                except Exception:
-                    log.warning("recover intent %s/%s failed", stid, rid)
+        with _scanner.STATE_LOCK:
+            state = _scanner.load_intents_state()
+            for stid, rid_map in state.items():
+                for rid, st in rid_map.items():
+                    if st.get("status") != "running":
+                        continue
+                    st["status"] = "pending"
+                    st["run_id"] = ""
+                    recovered += 1
+                    try:
+                        self._enqueue_intent(stid, rid, trigger="resume", resume_ref=True)
+                    except Exception:
+                        log.warning("recover intent %s/%s failed", stid, rid)
+            if recovered:
+                _scanner.save_intents_state(state)
         if recovered:
-            _scanner.save_intents_state(state)
             log.info("recovered %d running intents after restart", recovered)
+
+    def bootstrap_subtask(self, name: str) -> dict:
+        """为子任务写首个「引导意图」，仅在 requests/ 无任何意图文件时创建。
+
+        通用引导：用 manifest 的默认 entry 作为引导入口（entry.file 通常是
+        controller.py 驱动进程，或 run.py 的 daemon）。引导意图跑一次后，
+        由驱动代码自行 emit_intent 派生真正的业务意图。request_id 每次唯一，
+        避免与 append-only 契约下的历史 id 冲突。
+        """
+        e = self.entries.get(name)
+        if e is None:
+            raise KeyError(name)
+        if not e.ok or e.doc is None:
+            return {"ok": False, "subtask_id": name, "bootstrapped": False,
+                    "error": e.error or "manifest 加载失败"}
+
+        requests_dir = e.task_dir / "requests"
+        if _scanner._visible_intent_files(requests_dir):
+            return {"ok": True, "subtask_id": name, "bootstrapped": False}
+
+        import json as _json
+        import os as _os
+        import uuid as _uuid
+
+        rid = f"bootstrap-{_uuid.uuid4().hex[:8]}"
+        entry_doc = e.doc.entry
+        payload = {
+            "schema_version": 1,
+            "request_id": rid,
+            "kind": "oneshot",
+            "config": "",
+            "entry": {
+                "file": entry_doc.file,
+                "interpreter": entry_doc.interpreter,
+                "args": list(entry_doc.args),
+                "cwd": entry_doc.cwd or ".",
+            },
+            "resources": {
+                "cpu": float(e.doc.resources.cpu),
+                "memory_mb": int(e.doc.resources.memory_mb),
+            },
+            "lifetime": {
+                "completion": "terminal",
+                "retry": {"backoff_base_sec": 5, "backoff_cap_sec": 60, "not_after": ""},
+            },
+        }
+        requests_dir.mkdir(parents=True, exist_ok=True)
+        target = requests_dir / f"{rid}.json"
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _os.replace(tmp, target)
+        log.info("bootstrap 子任务 %s：写引导意图 %s（entry=%s）", name, rid, entry_doc.file)
+        return {"ok": True, "subtask_id": name, "bootstrapped": True, "request_id": rid}
 
     def _record_res_failure(self, stid: str) -> None:
         """记录一次资源错误退出，窗口内达阈值则触发该子任务的准入退避（反压）。"""
@@ -211,6 +274,10 @@ class SchedulerService:
 
     def _running_count(self, stid: str) -> int:
         return sum(1 for re in self.running.values() if re.run.get("subtask_id") == stid)
+
+    def _entry_enabled(self, stid: str) -> bool:
+        e = self.entries.get(stid)
+        return bool(e and e.ok and e.enabled)
 
     def register_subtask(self, name: str) -> dict:
         """导入一个子任务目录（必须含 manifest.json）。"""
@@ -284,30 +351,41 @@ class SchedulerService:
     # ================= 扫描 → WQ =================
 
     def _tick_scan(self) -> None:
-        """扫描所有已启用子任务的 requests/，新意图入队。"""
+        """扫描所有已启用子任务的 requests/，新意图入队；空任务自动引导。"""
         now_iso = runlog.now_iso()
-        all_states = _scanner.load_intents_state()
-        for stid, entry in self.entries.items():
-            if not entry.ok or not entry.enabled:
-                continue
-            persisted = all_states.get(stid, {})
-            try:
-                diff = _scanner.scan_subtask(stid, entry.task_dir, persisted)
-            except Exception as e:
-                log.warning("scan_subtask %s failed: %s", stid, e)
-                continue
-            # 新意图入 WQ
-            for r in diff.new_requests:
-                self._enqueue_intent(stid, r["request_id"], trigger="auto", save=False)
-            # 改写违规 → reject（仅审计，不入队）
-            for r in diff.modified_requests:
-                persist.append_decision({"ts": now_iso, "act": "intent_modified_rejected",
-                                         "subtask_id": stid, "request_id": r["request_id"],
-                                         "reason": r["reason"]})
-            # 已消失（running 态）→ 进程 stop 由 cancel 触发；pending 态直接终结
-            for r in diff.disappeared_requests:
-                self._drain_gone_request(stid, r["request_id"], r["reason"])
-        _scanner.save_intents_state(all_states)
+        # 与 mark_running/mark_terminal 等共享 STATE_LOCK，保证 intents_state 读-改-写原子，
+        # 避免本 tick 的 save 覆盖 worker 线程刚写下的 done/running（lost update）。
+        with _scanner.STATE_LOCK:
+            all_states = _scanner.load_intents_state()
+            for stid, entry in self.entries.items():
+                if not entry.ok or not entry.enabled:
+                    continue
+                # setdefault：新子任务（intents_state 里尚无该 stid）也必须写回 all_states，
+                # 否则其「pending」状态被丢到脱离的临时 dict，下一 tick 又被当成新意图无限入队。
+                persisted = all_states.setdefault(stid, {})
+                try:
+                    diff = _scanner.scan_subtask(stid, entry.task_dir, persisted)
+                except Exception as e:
+                    log.warning("scan_subtask %s failed: %s", stid, e)
+                    continue
+                # 无任何意图文件 → 首次上线/被清理后：写一个引导意图（manifest 默认 entry）
+                if diff.total_visible == 0:
+                    try:
+                        self.bootstrap_subtask(stid)
+                    except Exception as e:
+                        log.warning("bootstrap_subtask %s failed: %s", stid, e)
+                # 新意图入 WQ
+                for r in diff.new_requests:
+                    self._enqueue_intent(stid, r["request_id"], trigger="auto", save=False)
+                # 改写违规 → reject（仅审计，不入队）
+                for r in diff.modified_requests:
+                    persist.append_decision({"ts": now_iso, "act": "intent_modified_rejected",
+                                             "subtask_id": stid, "request_id": r["request_id"],
+                                             "reason": r["reason"]})
+                # 已消失（running 态）→ 进程 stop 由 cancel 触发；pending 态直接终结
+                for r in diff.disappeared_requests:
+                    self._drain_gone_request(stid, r["request_id"], r["reason"])
+            _scanner.save_intents_state(all_states)
         persist.save_scheduler_state(self.state)
 
     def _drain_gone_request(self, subtask_id: str, request_id: str, reason: str) -> None:
@@ -330,26 +408,24 @@ class SchedulerService:
                 re.spec.cancel.set()
 
     def _enqueue_intent(self, subtask_id: str, request_id: str, trigger: str = "auto",
-                        priority_override: int | None = None, attempt: int = 1,
-                        resume_ref: bool = False, not_before: str = "",
+                        attempt: int = 1, resume_ref: bool = False, not_before: str = "",
                         save: bool = True) -> dict:
         e = self.entries.get(subtask_id)
         if e is None or not e.ok or e.doc is None:
             raise KeyError(subtask_id)
 
-        # 读取意图文件取覆盖值
+        # 优先级唯一来源：manifest.json（意图文件不再携带 priority）
+        priority = int(e.doc.priority)
+
+        # 读取意图文件取资源覆盖值
         try:
-            intents = _scanner.INTENT_FILENAME_RE  # 防循环 import
             intent_path = e.task_dir / "requests" / (request_id + ".json")
             from . import intent as intent_mod
             doc = intent_mod.load_intent(intent_path, e.task_dir)
-            priority = priority_override if priority_override is not None else (
-                doc.priority if doc.priority is not None else e.doc.priority)
             cpu = float(doc.resources.get("cpu") or e.doc.resources.cpu)
             mem = int(doc.resources.get("memory_mb") or e.doc.resources.memory_mb)
         except Exception as exc:
             log.warning("enqueue_intent %s/%s load failed: %s; fallback to manifest", subtask_id, request_id, exc)
-            priority = priority_override if priority_override is not None else e.doc.priority
             cpu = float(e.doc.resources.cpu)
             mem = int(e.doc.resources.memory_mb)
 
@@ -396,7 +472,13 @@ class SchedulerService:
         with self._lock:
             items = [it for it in self.state.wq
                      if not self._not_before_pending(it)
-                     and not self._is_backoff(it.get("subtask_id"))]
+                     and not self._is_backoff(it.get("subtask_id"))
+                     # 已达 per-subtask 并发上限的子任务不参与本轮：否则其意图会在
+                     # _admit 里被 re-enqueue，白白消耗全局 budget，饿死其他子任务
+                     and self._running_count(it.get("subtask_id"))
+                         < self._cur_concurrency(it.get("subtask_id"))
+                     # 已禁用子任务不参与本轮准入（stop 后 WQ 残留的防御性兜底）
+                     and self._entry_enabled(it.get("subtask_id"))]
         if not items:
             return
 
@@ -914,37 +996,47 @@ class SchedulerService:
                 "request_id": re.run.get("request_id")}
 
     def delete_subtask(self, name: str, delete_dir: bool = False) -> dict:
-        """删除子任务：停所有运行中进程 + 清调度状态 + 可选删除本地任务目录。
+        """删除子任务：先停并等待所有运行进程真正退出，再清调度状态，可选删除本地目录。
 
         delete_dir=False（默认）只移除调度器内的记录（注册表/队列/意图状态/运行历史/日志），
         保留 tasks/<name>/ 本地目录与意图文件；delete_dir=True 连本地目录一起删。
+
+        必须先等进程死透再删目录/历史：进程从收到 cancel 到真正退出这段，其 SDK 心跳/
+        断点线程仍在写 tasks/<name>/cache/，且 _finalize 会向 data/runs/<name>.jsonl 追记，
+        若在退出前就 rmtree/删历史，cache/ 与运行历史会被"复活"成残留。
         """
-        # 1) 停该任务所有 running 进程
+        # 1) 停该任务所有 running 进程，并等待它们的 worker 线程真正结束
         with self._lock:
-            run_ids = [rid for rid, re in self.running.items()
-                       if re.run.get("subtask_id") == name]
+            run_items = [(re.run.get("run_id"), re, re.thread)
+                         for re in list(self.running.values())
+                         if re.run.get("subtask_id") == name]
         killed = []
-        for rid in run_ids:
+        for rid, re, _th in run_items:
             try:
                 self.stop_run(rid, reason=f"子任务 {name} 被删除")
                 killed.append(rid)
             except KeyError:
                 pass
+        grace = max(10, int(self.settings.runner.kill_grace_sec or 10))
+        for _rid, _re, th in run_items:
+            if th is not None:
+                th.join(timeout=grace + 10)
 
         # 2) 删注册表条目
         registry.drop_state(name)
 
-        # 3) 清 WQ 中该任务项
-        st = persist.load_scheduler_state()
-        before = len(st.wq)
-        st.wq = [r for r in st.wq if r.get("subtask_id") != name]
-        removed_wq = before - len(st.wq)
-        persist.save_scheduler_state(st)
+        # 3) 清 WQ 中该任务项（改内存态 self.state，否则 _tick_admit 仍会准出）
+        with self._lock:
+            before = len(self.state.wq)
+            self.state.wq = [r for r in self.state.wq if r.get("subtask_id") != name]
+            removed_wq = before - len(self.state.wq)
+            persist.save_scheduler_state(self.state)
 
         # 4) 清意图消费状态
-        intents = _scanner.load_intents_state()
-        intents.pop(name, None)
-        __scanner.save_intents_state(intents)
+        with _scanner.STATE_LOCK:
+            intents = _scanner.load_intents_state()
+            intents.pop(name, None)
+            _scanner.save_intents_state(intents)
 
         # 5) 清运行历史 jsonl + 日志目录
         import shutil
@@ -972,24 +1064,115 @@ class SchedulerService:
                 "removed_wq": removed_wq, "removed_files": removed_files,
                 "deleted_dir": deleted_dir}
 
+    def clear_all(self, delete_requests: bool = False) -> dict:
+        """清空全部调度状态：停所有运行进程 → 清注册表/WQ/意图/运行历史/残留备份。
+
+        delete_requests=True 时同时清空所有子任务 requests/ 下的意图文件
+        （保留 run.py/manifest.json 等任务代码）。建议在服务停止状态下执行，
+        避免与运行实例的写盘竞争。
+        """
+        import shutil
+
+        # 1) 停所有 running 进程并等待其 worker 线程真正退出
+        with self._lock:
+            run_items = [(rid, re, re.thread) for rid, re in list(self.running.items())]
+        killed = []
+        for rid, re, _th in run_items:
+            try:
+                self.stop_run(rid, reason="全部清空")
+                killed.append(rid)
+            except KeyError:
+                pass
+        grace = max(10, int(self.settings.runner.kill_grace_sec or 10))
+        for _rid, _re, th in run_items:
+            if th is not None:
+                th.join(timeout=grace + 10)
+
+        # 2) 清注册表 + 内存态
+        registry.save_state({})
+        with self._lock:
+            self.entries = {}
+            self.running.clear()
+
+        # 3) 清意图消费状态
+        with _scanner.STATE_LOCK:
+            _scanner.save_intents_state({})
+
+        # 4) 清 WQ 与 active 快照
+        with self._lock:
+            self.state.wq = []
+            persist.save_scheduler_state(self.state)
+        persist.save_active([])
+
+        # 5) 清运行历史 jsonl + 日志目录
+        runs_dir = config.runs_dir()
+        removed_run_files = 0
+        if runs_dir.is_dir():
+            for p in runs_dir.iterdir():
+                if p.is_file() and p.name.endswith(".jsonl"):
+                    p.unlink(missing_ok=True)
+                    removed_run_files += 1
+                elif p.is_dir():
+                    removed_run_files += sum(1 for f in p.rglob("*") if f.is_file())
+                    shutil.rmtree(p, ignore_errors=True)
+
+        # 6) 清理残留备份/临时文件（*.tmp / *.bak*）
+        removed_tmp = 0
+        for base in (config.data_dir(), config.runtime_dir()):
+            if not base.is_dir():
+                continue
+            for p in base.iterdir():
+                if not p.is_file():
+                    continue
+                name = p.name
+                if name.endswith(".tmp") or name.endswith(".bak") or ".bak" in name:
+                    p.unlink(missing_ok=True)
+                    removed_tmp += 1
+
+        # 7) 可选：清空所有子任务 requests/ 意图文件（保留任务代码）
+        removed_requests = 0
+        if delete_requests:
+            tdir = config.tasks_dir()
+            if tdir.is_dir():
+                for sub in tdir.iterdir():
+                    req_dir = sub / "requests"
+                    if req_dir.is_dir():
+                        for f in req_dir.iterdir():
+                            if f.is_file():
+                                f.unlink(missing_ok=True)
+                                removed_requests += 1
+
+        self.refresh()
+        return {"ok": True, "killed_running": len(run_items), "killed": killed,
+                "removed_run_files": removed_run_files, "removed_tmp": removed_tmp,
+                "removed_requests": removed_requests}
+
     def delete_run(self, run_id: str, reason: str = "进程删除", delete_files: bool = False) -> dict:
-        """删除单个进程：停（若运行中）+ 标 done；delete_files=true 才删日志/缓存。
+        """删除单个进程：停（若运行中，等待其退出）+ 标 done；delete_files=true 才删日志/缓存。
 
         无论 delete_files 与否，都从界面移除（intent 标 done），不影响任务与其他进程。
+        若进程仍在运行，先等待其 worker 线程真正退出再删日志/缓存，避免 SDK 心跳线程
+        在删除后重建 cache/runs/<run_id>/state.json。
         """
         with self._lock:
             re = self.running.get(run_id)
         subtask_id = request_id = None
+        th = None
         if re is not None:
             subtask_id = re.run.get("subtask_id")
             request_id = re.run.get("request_id")
             re.spec.cancel_reason = reason
             re.spec.cancel.set()
+            th = re.thread
         else:
             rec = runlog.find_run(run_id)
             if rec:
                 subtask_id = rec.get("subtask_id")
                 request_id = rec.get("request_id")
+
+        # 等待运行中的进程真正退出（cancel → _terminate → _finalize）
+        if th is not None:
+            th.join(timeout=max(10, int(self.settings.runner.kill_grace_sec or 10)) + 10)
 
         # 可选删除日志文件 + 缓存目录（只按 run_id 定位，不动意图文件和任务目录）
         if delete_files and subtask_id:
@@ -1005,14 +1188,15 @@ class SchedulerService:
 
         # 该 run 对应的 intent 标 done（若仍指向该 run），不影响其他进程
         if subtask_id and request_id:
-            intents = _scanner.load_intents_state()
-            st = intents.get(subtask_id, {}).get(request_id)
-            if st and st.get("run_id") == run_id:
-                st["status"] = "done"
-                st["run_id"] = ""
-                st["finished_at"] = runlog.now_iso()
-                st["rejected_reason"] = f"进程 {run_id} 被删除"
-                _scanner.save_intents_state(intents)
+            with _scanner.STATE_LOCK:
+                intents = _scanner.load_intents_state()
+                st = intents.get(subtask_id, {}).get(request_id)
+                if st and st.get("run_id") == run_id:
+                    st["status"] = "done"
+                    st["run_id"] = ""
+                    st["finished_at"] = runlog.now_iso()
+                    st["rejected_reason"] = f"进程 {run_id} 被删除"
+                    _scanner.save_intents_state(intents)
 
         return {"ok": True, "run_id": run_id, "subtask_id": subtask_id,
                 "request_id": request_id, "deleted_files": delete_files}

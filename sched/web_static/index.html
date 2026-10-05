@@ -76,6 +76,8 @@ a:hover{text-decoration:underline}
 .btn.danger:hover{background:#3f1d1d}
 .btn.ghost{border-color:#2a3040;background:transparent;color:#94a3b8}
 .btn.ghost:hover{color:#e6e6e6}
+.btn.primary{border-color:#0ea5e9;color:#7dd3fc}
+.btn.primary:hover{background:#0c3a55}
 .btn[disabled]{opacity:.35;cursor:not-allowed}
 /* ---------- 优先级 inline 编辑 ---------- */
 .pri-val{font-family:Menlo,monospace;color:#cbd5e1;cursor:pointer;padding:2px 6px;border-radius:4px;border:1px solid transparent;min-width:28px;display:inline-block;text-align:center}
@@ -125,6 +127,9 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
 
 <!-- ============ Tab 1: 全局仪表盘 ============ -->
 <div class="tab-pane active" id="pane-dashboard">
+  <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+    <button class="btn danger" onclick="clearAllTasks()">清空全部</button>
+  </div>
   <div class="stats-grid" id="statsGrid"></div>
   <div class="panel">
     <h3>资源利用率</h3>
@@ -140,6 +145,7 @@ pre.log{margin:0;font-size:12px;color:#cbd5e1;white-space:pre-wrap;word-break:br
     <button class="btn ghost" onclick="selectAll('subtasksTable',false)">全不选</button>
     <button class="btn ghost" onclick="invertSelect('subtasksTable')">反选</button>
     <button class="btn danger" onclick="batchDeleteSubtasks()">批量删除</button>
+    <button class="btn ghost" onclick="openRegisterModal()">注册本地任务</button>
     <span style="flex:1"></span>
     <span id="subtaskPagedInfo" style="color:#6b7280;font-size:12px"></span>
   </div>
@@ -409,6 +415,89 @@ async function toggleSubtask(sid, wantEnable){
     }
     refreshDashboard(true); refreshSubtasks();
   }catch(e){ alert('操作失败: '+e.message); refreshSubtasks(); }
+}
+
+function openRegisterModal(){
+  qs('#registerModal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay'; overlay.id='registerModal';
+  overlay.innerHTML = `<div class="modal" style="max-width:560px"><div class="modal-head">
+    <div><h3>注册本地任务</h3></div>
+    <button class="btn ghost" onclick="document.getElementById('registerModal').remove()">✕</button>
+  </div><div class="modal-body">
+    <div style="color:#6b7280;font-size:12px;margin-bottom:12px">仅列出 tasks/ 下含 manifest.json 的目录。注册会执行契约校验（dry 跑通），可能耗时数秒。</div>
+    <div id="discoverList" style="display:flex;flex-direction:column;gap:8px;max-height:60vh;overflow:auto">
+      <div style="color:#8892a8;padding:16px;text-align:center">加载中…</div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn ghost" onclick="document.getElementById('registerModal').remove()">关闭</button>
+    </div>
+  </div></div>`;
+  document.body.appendChild(overlay);
+  const list = overlay.querySelector('#discoverList');
+  fetch(API+'/api/discover').then(r=>{ if(!r.ok) throw new Error(r.statusText); return r.json(); })
+    .then(items=>{
+      if(!items.length){
+        list.innerHTML = '<div style="color:#8892a8;padding:16px;text-align:center">没有发现任何本地任务目录（tasks/*/manifest.json）</div>';
+        return;
+      }
+      list.innerHTML = items.map(it=>`
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #1f2330;border-radius:8px">
+          <span style="flex:1"><b style="color:#e2e8f0">${it.subtask_id}</b>
+            <span style="color:#6b7280;font-size:12px;margin-left:8px">run_mode=${it.run_mode||'?'}</span>
+          </span>
+          ${it.registered
+            ? '<span style="color:#34d399;font-size:12px">已注册</span>'
+            : `<button class="btn primary" data-sid="${it.subtask_id}">注册</button>`}
+        </div>`).join('');
+      list.querySelectorAll('button[data-sid]').forEach(btn=>{
+        btn.onclick = async ()=>{
+          const sid = btn.dataset.sid;
+          btn.disabled = true; btn.textContent = '注册中…';
+          try{
+            await fetch(API+'/api/register/'+encodeURIComponent(sid), {method:'POST'})
+              .then(r=>{ if(!r.ok) return r.json().then(e=>{throw new Error(e.detail||r.statusText)}); return r.json(); });
+            btn.textContent = '✅ 已注册'; btn.classList.remove('primary');
+            refreshDashboard(true); refreshSubtasks();
+          }catch(e){
+            btn.disabled = false; btn.textContent = '注册';
+            alert('注册失败: '+e.message);
+          }
+        };
+      });
+    })
+    .catch(e=>{ list.innerHTML = '<div style="color:#f87171;padding:16px;text-align:center">加载失败: '+e.message+'</div>'; });
+}
+
+function clearAllTasks(){
+  qs('#clearAllModal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className='modal-overlay'; overlay.id='clearAllModal';
+  overlay.innerHTML = `<div class="modal" style="max-width:460px"><div class="modal-head">
+    <div><h3>清空全部调度状态</h3></div>
+    <button class="btn ghost" onclick="document.getElementById('clearAllModal').remove()">✕</button>
+  </div><div class="modal-body">
+    <div style="color:#cbd5e1;margin-bottom:12px;font-size:13px">将停止所有进程，并清空注册表 / 等待队列 / 意图状态 / 运行历史。此操作不可恢复。</div>
+    <label style="display:flex;align-items:center;gap:8px;color:#8892a8;font-size:13px">
+      <input type="checkbox" id="clearAllRequests" checked> 同时清空所有子任务 requests/ 意图文件（保留任务代码）
+    </label>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn ghost" onclick="document.getElementById('clearAllModal').remove()">取消</button>
+      <button class="btn danger" id="clearAllConfirm">确认清空</button>
+    </div>
+  </div></div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#clearAllConfirm').onclick = async ()=>{
+    const delReq = overlay.querySelector('#clearAllRequests').checked;
+    try{
+      const r = await fetch(API+'/api/admin/clear',{
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({delete_requests:delReq})
+      }).then(r=>{if(!r.ok) throw new Error(r.statusText); return r.json();});
+      overlay.remove();
+      alert(`清空完成：kill ${r.killed_running||0}，删运行历史 ${r.removed_run_files||0}，删意图文件 ${r.removed_requests||0}`);
+      refreshDashboard(true); refreshSubtasks(); refreshProcesses();
+    }catch(e){ alert('清空失败: '+e.message); }
+  };
 }
 
 function deleteSubtask(sid){

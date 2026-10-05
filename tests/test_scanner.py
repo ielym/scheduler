@@ -147,3 +147,24 @@ class TestMarkTransitions:
         st = scan_mod.load_intents_state()["hello"]["rt"]
         assert st["status"] == "pending"
         assert st["run_id"] == ""
+
+
+class TestPruneOrphanIntents:
+    def test_prunes_unregistered_keeps_registered_and_disabled(self, env):
+        scan_mod.save_intents_state({
+            "hello": {"r1": {"status": "done", "finished_at": "t", "rejected_reason": "x"}},
+            "gone": {"r2": {"status": "done", "finished_at": "t", "rejected_reason": "x"}},
+            "disabled": {"r3": {"status": "pending", "fingerprint": "fp"}},
+        })
+        removed = scan_mod.prune_orphan_intents({"hello", "disabled"})
+        assert removed == 1  # 只有 gone 是孤儿
+        st = scan_mod.load_intents_state()
+        assert set(st) == {"hello", "disabled"}
+
+    def test_no_orphan_no_write(self, env):
+        scan_mod.save_intents_state({"hello": {"r1": {"status": "pending"}}})
+        state_file = env / "data" / "runtime" / "intents_state.json"
+        before = state_file.stat().st_mtime_ns
+        removed = scan_mod.prune_orphan_intents({"hello"})
+        assert removed == 0
+        assert state_file.stat().st_mtime_ns == before  # 无孤儿时不落盘

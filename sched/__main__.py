@@ -66,8 +66,6 @@ def _cmd_status(args) -> int:
     print(f"subtasks={st['subtasks']} waiting={st['waiting']} running={st['running']} "
           f"ledger_mem={st['ledger_reserved_mem_mb']}MB ledger_cpu={st['ledger_reserved_cpu']}")
     # 展示 WQ
-    from . import store, config
-    wq = store.load_json(config.scheduler_state_file(), default={}).get("wq", []) if False else None
     from .service import persist
     st_obj = persist.load_scheduler_state()
     if st_obj.wq:
@@ -103,17 +101,33 @@ def _cmd_start(args) -> int:
 
 
 def _cmd_serve(args) -> int:
+    import signal
+    import threading
+
     svc = _service().SchedulerService()
     if args.web:
         svc._web_enabled = True
     svc.start()
-    print(f"sched serving (SCHED_HOME={svc.settings.__class__.__name__})...", flush=True)
+
+    # systemd 停止/重启发送 SIGTERM：转为优雅停机（cancel 在途子进程并落断点），
+    # 避免子进程被直接遗弃为孤儿。SIGINT（Ctrl-C）保持原行为一致。
+    stop_event = threading.Event()
+
+    def _request_shutdown(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
+    from . import config as _config
+    print(f"sched serving (SCHED_HOME={_config.home()})...", flush=True)
     try:
-        while True:
+        while not stop_event.is_set():
             import time
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nshutting down...")
+        pass
+    print("shutting down...", flush=True)
     svc.stop()
     return 0
 
@@ -171,6 +185,14 @@ def _cmd_process(args) -> int:
     return 2
 
 
+def _cmd_clear(args) -> int:
+    """清空全部调度状态（建议先停服务再执行，避免与运行实例写盘竞争）。"""
+    svc = _service().SchedulerService()
+    result = svc.clear_all(delete_requests=args.delete_requests)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sched", description="sched CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -194,6 +216,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="启动调度器主循环（前台运行）")
     p_serve.add_argument("--web", action="store_true", help="同时启动内嵌管理台（若 settings.web.enabled=false 需手动改）")
     p_serve.set_defaults(func=_cmd_serve)
+
+    p_clear = sub.add_parser("clear", help="清空全部调度状态（注册表/WQ/意图/运行历史；建议先停服务）")
+    p_clear.add_argument("--delete-requests", action="store_true",
+                        help="同时清空所有子任务 requests/ 意图文件（保留任务代码）")
+    p_clear.set_defaults(func=_cmd_clear)
 
     p_proc = sub.add_parser("process", help="子进程管理（依赖调度器已跑）")
     proc_sub = p_proc.add_subparsers(dest="action", required=True)

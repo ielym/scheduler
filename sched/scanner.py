@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,12 @@ from . import config, store, runlog
 from .intent import fingerprint as intent_fingerprint
 
 log = logging.getLogger("sched.scanner")
+
+# intents_state.json 的读-改-写互斥锁。
+# mark_* 与 service._tick_scan 都对同一文件做 load → mutate → save，若不串行化，
+# worker 线程的 mark_terminal/mark_retry_same 会与主循环的 save 互相覆盖（lost update），
+# 导致「已 done 的意图被覆盖回 running/pending，随后被 resume 重复执行」。
+STATE_LOCK = threading.RLock()
 
 INTENT_FILENAME_RE = __import__("re").compile(r"^[a-zA-Z0-9._-]{1,128}\.json$")
 # requests/ 目录里只允许意图文件（<request_id>.json）；以下文件名是 task 根目录/legacy 文件，
@@ -50,6 +57,23 @@ def load_intents_state() -> dict[str, dict[str, dict]]:
 
 def save_intents_state(state: dict[str, dict[str, dict]]) -> None:
     store.save_json(_intents_state_path(), state)
+
+
+def prune_orphan_intents(registered: set[str]) -> int:
+    """清理孤儿意图：intents_state 中 subtask_id 不在 registered 集合的记录全部删除。
+
+    语义边界：只清「未注册」子任务的意图；已注册但 disabled 的子任务意图保留
+    （启用后继续消费）。仅当确实存在孤儿时才落盘。返回删除的子任务数。
+    """
+    with STATE_LOCK:
+        state = load_intents_state()
+        orphans = [sid for sid in state if sid not in registered]
+        if not orphans:
+            return 0
+        for sid in orphans:
+            state.pop(sid, None)
+        save_intents_state(state)
+        return len(orphans)
 
 
 def _visible_intent_files(requests_dir: Path) -> list[Path]:
@@ -150,31 +174,34 @@ def scan_subtask(subtask_id: str, task_dir: Path, persisted: dict[str, dict[str,
 
 def mark_running(subtask_id: str, request_id: str, run_id: str) -> None:
     """意图被准出拉起后持久态标记 running。"""
-    state = load_intents_state()
-    st = state.setdefault(subtask_id, {}).setdefault(request_id, {})
-    st["status"] = "running"
-    st["run_id"] = run_id
-    save_intents_state(state)
+    with STATE_LOCK:
+        state = load_intents_state()
+        st = state.setdefault(subtask_id, {}).setdefault(request_id, {})
+        st["status"] = "running"
+        st["run_id"] = run_id
+        save_intents_state(state)
 
 
 def mark_terminal(subtask_id: str, request_id: str, status: str, reason: str = "", finished_at: str | None = None) -> None:
     """意图终结：done / archived。"""
-    state = load_intents_state()
-    st = state.setdefault(subtask_id, {}).setdefault(request_id, {})
-    st["status"] = status  # done | archived
-    st["finished_at"] = finished_at or runlog.now_iso()
-    if reason:
-        st["rejected_reason"] = reason
-    save_intents_state(state)
+    with STATE_LOCK:
+        state = load_intents_state()
+        st = state.setdefault(subtask_id, {}).setdefault(request_id, {})
+        st["status"] = status  # done | archived
+        st["finished_at"] = finished_at or runlog.now_iso()
+        if reason:
+            st["rejected_reason"] = reason
+        save_intents_state(state)
 
 
 def mark_retry_same(subtask_id: str, request_id: str) -> None:
     """同一意图的续跑/重试：状态回 pending，run_id 清空，保留指纹。"""
-    state = load_intents_state()
-    st = state.setdefault(subtask_id, {}).setdefault(request_id, {})
-    st["status"] = "pending"
-    st["run_id"] = ""
-    save_intents_state(state)
+    with STATE_LOCK:
+        state = load_intents_state()
+        st = state.setdefault(subtask_id, {}).setdefault(request_id, {})
+        st["status"] = "pending"
+        st["run_id"] = ""
+        save_intents_state(state)
 
 
 def pending_items(subtask_id: str) -> list[dict]:

@@ -17,7 +17,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
+import logging
+
 from . import config, manifest, persist, registry, runlog, store, scanner
+
+log = logging.getLogger("sched.web")
 
 
 def is_loopback(host: str) -> bool:
@@ -41,6 +45,10 @@ def validate_public_listen(cfg) -> None:
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "web_static"
+
+
+class ClearAllBody(BaseModel):
+    delete_requests: bool = False
 
 
 def start_in_thread(svc) -> None:
@@ -115,17 +123,48 @@ def start_in_thread(svc) -> None:
     # ---------- enable / disable 子任务 ----------
     @app.post("/api/start/{name}")
     def start(name: str, _req: Request):
+        """启用子任务：设 enabled=True + 重入队 pending 意图 + 空任务自动引导。
+
+        任务启用状态（registry.enabled）与意图状态（intents_state）解耦：
+        启用时只把 pending 意图重新入队，不触碰 done/running 等其他状态。
+        空任务（requests/ 无意图文件）的引导写入由调度器 _tick_scan 统一兜底，
+        这里显式调用 bootstrap 保证立即生效。
+        """
         from . import registry as _reg
         st = _reg.load_state()
         if name not in st:
             raise HTTPException(404, "not registered")
         _reg.upsert_state(name, {"enabled": True})
         svc.refresh()
-        return {"ok": True, "subtask_id": name}
+
+        # 1) 把该子任务所有 pending 意图重新入队（去重：已在 WQ 的跳过）
+        intents = scanner.load_intents_state()
+        wq_rids = {it.get("request_id") for it in persist.load_scheduler_state().wq
+                   if it.get("subtask_id") == name}
+        requeued = 0
+        if name in intents:
+            for rid, info in intents[name].items():
+                if info.get("status") != "pending" or rid in wq_rids:
+                    continue
+                try:
+                    svc._enqueue_intent(name, rid, trigger="resume", resume_ref=True)
+                    requeued += 1
+                except Exception:
+                    log.warning("requeue pending intent %s/%s failed", name, rid)
+
+        # 2) 空任务引导（复用 service.bootstrap_subtask，与 _tick_scan 同源）
+        boot = svc.bootstrap_subtask(name)
+
+        return {"ok": True, "subtask_id": name,
+                "requeued": requeued, "bootstrapped": boot.get("bootstrapped", False)}
 
     @app.post("/api/stop/{name}")
     def stop(name: str, _req: Request):
-        """禁用子任务：设 enabled=False + kill 所有运行中进程 + 清除 WQ 中该子任务的 pending intent。"""
+        """禁用子任务：设 enabled=False + kill 运行中进程 + 清 WQ + running→pending。
+
+        任务启用状态与意图状态解耦：禁用不把意图标 stopped，只把 running 回退 pending。
+        pending 意图保留，下次启用时重新入队；done 意图不受影响。
+        """
         from . import registry as _reg
         # 1) 关闭 registry 开关
         st = _reg.load_state()
@@ -145,25 +184,31 @@ def start_in_thread(svc) -> None:
             except KeyError:
                 pass
 
-        # 3) 清除 scheduler_state.json 的 WQ 中属于该 subtask 的 pending 项
-        st = persist.load_scheduler_state()
-        before = len(st.wq)
-        st.wq = [r for r in st.wq if r.get("subtask_id") != name]
-        removed_wq = before - len(st.wq)
-        persist.save_scheduler_state(st)
+        # 3) 清除 WQ 中属于该 subtask 的项（改内存态 self.state，否则 _tick_admit 仍会准出）
+        with svc._lock:
+            before = len(svc.state.wq)
+            svc.state.wq = [r for r in svc.state.wq if r.get("subtask_id") != name]
+            removed_wq = before - len(svc.state.wq)
+            persist.save_scheduler_state(svc.state)
 
-        # 4) 同时清 intents_state 里标记成 stopped（防止被重新 enqueue）
-        intents = scanner.load_intents_state()
-        if name in intents:
-            for rid, info in intents[name].items():
-                if info.get("status") in ("pending", "waiting", "running"):
-                    info["status"] = "stopped"
-                    info["rejected_reason"] = f"子任务 {name} 被禁用"
-            store.save_json(config.runtime_dir() / "intents_state.json", intents)
+        # 4) running 意图回退 pending（进程已被杀，不再是 running）
+        #    不标 stopped：意图生命周期与任务启用状态解耦
+        with scanner.STATE_LOCK:
+            intents = scanner.load_intents_state()
+            reset_pending = 0
+            if name in intents:
+                for info in intents[name].values():
+                    if info.get("status") == "running":
+                        info["status"] = "pending"
+                        info["run_id"] = ""
+                        reset_pending += 1
+                if reset_pending:
+                    scanner.save_intents_state(intents)
 
         svc.refresh()
         return {"ok": True, "subtask_id": name,
-                "killed_running": killed, "removed_wq": removed_wq}
+                "killed_running": killed, "removed_wq": removed_wq,
+                "reset_pending": reset_pending}
 
     @app.post("/api/subtasks/{name}/priority")
     def set_priority(name: str, body: dict, _req: Request):
@@ -191,6 +236,12 @@ def start_in_thread(svc) -> None:
         if name not in svc.entries:
             raise HTTPException(404, f"not registered: {name}")
         return svc.delete_subtask(name, delete_dir=delete_dir)
+
+    @app.post("/api/admin/clear")
+    def clear_all(body: ClearAllBody, _req: Request):
+        """清空全部调度状态：停所有进程、清注册表/WQ/意图/运行历史；
+        delete_requests=true 时同时清空所有子任务 requests/ 意图文件（保留任务代码）。"""
+        return svc.clear_all(delete_requests=body.delete_requests)
 
     # ---------- 进程控制 ----------
     @app.post("/api/process/stop/{run_id}")
@@ -391,6 +442,30 @@ def start_in_thread(svc) -> None:
     @app.get("/api/wq")
     def wq(_req: Request):
         return persist.load_scheduler_state().wq
+
+    @app.get("/api/discover")
+    def discover(_req: Request):
+        """列出 tasks/ 下所有含 manifest.json 的本地任务目录，标注是否已注册。
+
+        供前端"注册本地任务"使用：清空/删除后任务目录仍存在，需要入口重新注册。
+        """
+        svc.refresh()
+        registered = set(svc.entries)
+        tdir = config.tasks_dir()
+        out = []
+        if tdir.is_dir():
+            for sub in sorted(tdir.iterdir()):
+                if not sub.is_dir() or sub.name.startswith("."):
+                    continue
+                if not (sub / "manifest.json").is_file():
+                    continue
+                item = {"subtask_id": sub.name, "registered": sub.name in registered}
+                try:
+                    item["run_mode"] = manifest.load_manifest(sub).run_mode
+                except manifest.ManifestError:
+                    item["run_mode"] = "?"
+                out.append(item)
+        return out
 
     @app.post("/api/register/{name}")
     def register(name: str, _req: Request):

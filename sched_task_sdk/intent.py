@@ -50,7 +50,6 @@ def emit_intent(
     config: str = "",
     kind: str = "daemon",
     entry: dict | None = None,
-    priority: int | None = None,
     resources: dict | None = None,
     lifetime: dict | None = None,
     request_id: str | None = None,
@@ -80,7 +79,6 @@ def emit_intent(
         "kind": kind,
         "config": config or "",
         "entry": entry,
-        "priority": priority if priority is not None else 0,
         "resources": resources,
         "lifetime": lifetime,
     }
