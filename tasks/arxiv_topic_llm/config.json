@@ -1,6 +1,0 @@
-{
-  "topic": "LLM",
-  "query": "(all:\"large language model\" OR all:LLM OR all:\"post-training\" OR all:\"supervised fine-tuning\" OR all:\"in-context learning\" OR all:\"instruction tuning\")",
-  "start_date": "2026-01-01",
-  "end_date": "2026-09-30"
-}

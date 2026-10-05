@@ -1,6 +1,0 @@
-{
-  "topic": "Embodied",
-  "query": "(all:\"embodied agent\" OR all:\"embodied intelligence\" OR all:\"embodied AI\" OR all:\"embodied learning\" OR all:\"vision-language-action\" OR all:\"world action model\" OR all:\"robot manipulation\" OR all:\"robot learning\" OR all:\"sim-to-real\" OR all:\"humanoid robot\" OR all:\"mobile manipulation\" OR all:\"embodied reasoning\" OR all:VLA)",
-  "start_date": "2026-01-01",
-  "end_date": "2026-09-30"
-}

@@ -1,6 +1,0 @@
-{
-  "topic": "WorldModel",
-  "query": "(all:\"world model\" OR all:\"world simulator\" OR all:\"world modeling\" OR all:\"world action model\" OR all:\"action-conditioned\" OR all:\"latent world model\" OR all:\"embodied world model\")",
-  "start_date": "2026-01-01",
-  "end_date": "2026-09-30"
-}

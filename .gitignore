@@ -5,6 +5,5 @@ __pycache__/
 .venv/
 data/
 
-# 任务运行时产物
-tasks/*/cache/
-tasks/*/results/
+# 子任务/子进程目录（tasks/）不受 git 管理：任务代码、运行时意图、缓存等
+tasks/
