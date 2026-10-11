@@ -1,404 +1,198 @@
-"""进程拉起 + cgroup + 信号 + 退出码归因。
+"""执行进程拉起 + 身份握手 + 进程树回收 + 退出码归因。
 
-启动协议（调度器注入环境变量）：
-  SCHED_SUBTASK_ID / SCHED_REQUEST_ID / SCHED_RUN_ID / SCHED_CONFIG /
-  SCHED_TRIGGER / SCHED_WORKSPACE / SCHED_ATTEMPT
-
-退出码统一（复用 errors.py）：
-  0 成功 → 意图 done
-  99 抢占/停止（断点已保存）→ 续跑同意图
-  100/101 资源错误 → 重试同意图
-  110 数据风险 → 二刷
-  其他非 0 / SIGKILL → 兜底按资源错误
-
-支持的生命周期信号：
-  - cancel（SIGTERM → 优雅停止；进程走 stop/exit_skip 控制则终结）
-  - preempt（SIGTERM → 抢占，期待 exit 99）
+执行身份（设计文档第十三节）：PID + 进程启动时间 + attempt_id + 执行令牌 + cgroup。
+每次执行使用独立 cgroup 做统计与身份管理，不配置预设 CPU/内存/IO 强制配额（只观测）。
 """
 
 from __future__ import annotations
 
 import json
 import os
-import pwd
+import secrets
 import signal
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import cgroup as cg
-from . import errors, runlog
+from . import config
+from .config import EventKind
 
-
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 POLL_INTERVAL_SEC = 0.25
 KILL_WAIT_SEC = 5
-TRUNCATE_HEAD = "[truncated]\n".encode("utf-8")
 
-# SDK 根目录（让任务进程可 import sched_task_sdk）
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "TZ", "LC_ALL", "PYTHONPATH", "PYTHONUNBUFFERED")
+ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "TZ", "LC_ALL", "PYTHONUNBUFFERED")
 ENV_BLACKLIST = frozenset({
     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
-    "PYTHONSTARTUP", "PYTHONINSPECT", "BASH_ENV", "ENV", "IFS",
-    "PATH",  # 防注入伪造解释器/工具链劫持
+    "PYTHONSTARTUP", "PYTHONINSPECT", "BASH_ENV", "ENV", "IFS", "PATH",
 })
 
 
-def build_argv(task_dir: Path, entry_file: str, interpreter: str | None, args: list[str],
-               config: str | None = None) -> list[str]:
-    argv: list[str] = []
-    if interpreter:
-        argv.append(interpreter)
-    argv.append(str((task_dir / entry_file).resolve()))
-    argv.extend(list(args))
-    if config:
-        argv.extend(["--config", config])
-    return argv
-
-
-def build_env(
-    task_dir: Path,
-    subtask_id: str,
-    request_id: str,
-    run_id: str,
-    trigger: str,
-    attempt: int,
-    scheduled_at: str,
-    config: str | None,
-    extra: dict[str, str] | None = None,
-    run_user: str | None = None,
-    error_rules: dict[str, Any] | None = None,
-) -> dict[str, str]:
-    import json as _json
-
-    env = {k: os.environ[k] for k in ENV_PASSTHROUGH if k in os.environ}
-    if extra:
-        env.update({k: v for k, v in extra.items() if k not in ENV_BLACKLIST})
-    env.update({
-        "SCHED_SUBTASK_ID": subtask_id,
-        "SCHED_REQUEST_ID": request_id,
-        "SCHED_RUN_ID": run_id,
-        "SCHED_TRIGGER": trigger,
-        "SCHED_ATTEMPT": str(attempt),
-        "SCHED_SCHEDULED_AT": scheduled_at,
-        "SCHED_WORKSPACE": str(task_dir),
-    })
-    if config:
-        env["SCHED_CONFIG"] = config
-    if run_user:
-        try:
-            env["HOME"] = pwd.getpwnam(run_user).pw_dir
-        except KeyError:
-            pass
-    if error_rules:
-        env["SCHED_ERROR_RULES"] = _json.dumps(error_rules, ensure_ascii=False)
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(_PROJECT_ROOT) + (os.pathsep + existing if existing else "")
-    env["PYTHONUNBUFFERED"] = "1"
-    return env
-
-
-def _drop_privileges(user: str | None):
-    if not user:
-        return
-    try:
-        pw = pwd.getpwnam(user)
-    except KeyError:
-        raise
-    if pw.pw_uid == os.getuid():
-        return
-    os.setgid(pw.pw_gid)
-    os.setuid(pw.pw_uid)
+def new_id(prefix: str) -> str:
+    return f"{prefix}-{secrets.token_hex(8)}"
 
 
 @dataclass
-class RunSpec:
-    subtask_id: str
-    request_id: str
-    run_id: str
-    task_dir: Path
-    entry_file: str
-    interpreter: str | None
-    args: list[str]
-    cwd: str
+class AttemptSpec:
+    attempt_id: str
+    job_id: str
+    task_id: str
+    token: str
+    task_root: Path
+    executor_entry: config.EntrySpec
+    entry_args: list[str]
+    workdir: str
     env: dict[str, str]
-    trigger: str              # manual | auto | retry | second_pass
-    attempt: int
-    scheduled_at: str
-    config: str | None = None
-    cancel: threading.Event = field(default_factory=threading.Event)
-    cancel_reason: str = ""
-    preempt: threading.Event = field(default_factory=threading.Event)
-    run_user: str | None = None
-    cgroup_name: str | None = None
-    memory_high: int | None = None
-    memory_max: int | None = None
-    cpu_quota: float | None = None
-    cancel_grace_sec: int = 10
-    preempt_grace_sec: int = 40
-    error_rules: dict[str, Any] = field(default_factory=dict)
-    max_log_bytes: int = 32 * 1024 * 1024
+    progress_semver: str
 
-    pid: int | None = None
-    pgid: int | None = None
+
+class AttemptRun:
+    """一个存活执行尝试的运行句柄。"""
+
+    def __init__(self, spec: AttemptSpec, proc: subprocess.Popen,
+                 run_dir: Path, cgrp: "cg.Cgroup", input_refs: list[str]):
+        self.spec = spec
+        self.proc = proc
+        self.run_dir = run_dir
+        self.cgrp = cgrp
+        self.input_refs = input_refs
+        self.pid = proc.pid
+        self.pgid = proc.pid
+        self.start_time = _proc_start_time(self.pid)
+        self.started_at = now_iso()
+        self._pause: dict | None = None
+        self._terminating = threading.Event()
 
     @property
-    def workdir(self) -> Path:
-        rel = self.cwd or "."
-        return self.task_dir if rel == "." else (self.task_dir / rel)
+    def event_file(self) -> Path:
+        return self.run_dir / "events.jsonl"
 
-    def argv(self) -> list[str]:
-        return build_argv(self.task_dir, self.entry_file, self.interpreter, self.args, self.config)
+    @property
+    def control_file(self) -> Path:
+        return self.run_dir / "control.json"
 
-    def environ(self) -> dict[str, str]:
-        return build_env(
-            self.task_dir, self.subtask_id, self.request_id, self.run_id,
-            self.trigger, self.attempt, self.scheduled_at, self.config,
-            self.env, run_user=self.run_user, error_rules=self.error_rules,
-        )
+    @property
+    def checkpoint_file(self) -> Path:
+        return self.run_dir / "checkpoint.json"
 
+    def is_alive(self) -> bool:
+        if self.proc.poll() is not None:
+            return False
+        return _pid_alive(self.pid)
 
-@dataclass
-class RunOutcome:
-    status: str
-    exit_code: int | None
-    reason: str
-    pid: int | None
-    pgid: int | None
-    started_at: str
-    finished_at: str
-    duration_ms: int
-    scheduler_signaled: bool = False
-    memory_peak_mb: int = 0
-    cpu_usage_usec: int = 0
-    oom_killed: bool = False
+    def alive_procs(self) -> list[int]:
+        procs = self.cgrp.procs()
+        return procs if procs else ([self.pid] if self.is_alive() else [])
 
-
-def _terminate(proc: subprocess.Popen, grace_sec: int) -> int | None:
-    """整组 SIGTERM → 等 grace → SIGKILL；返回最终退出码。"""
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    try:
-        proc.wait(timeout=grace_sec)
-        return proc.returncode
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    try:
-        proc.wait(timeout=KILL_WAIT_SEC)
-    except subprocess.TimeoutExpired:
-        pass
-    return proc.returncode
-
-
-def _pump_stream(src, dst_path: Path, max_bytes: int) -> None:
-    written = 0
-    marked = False
-    try:
-        with open(dst_path, "wb") as out:
-            while True:
-                chunk = src.read(65536)
-                if not chunk:
-                    break
-                if written < max_bytes:
-                    room = max_bytes - written
-                    out.write(chunk[:room])
-                    out.flush()
-                    written += min(len(chunk), room)
-                    if len(chunk) > room and not marked:
-                        out.write(TRUNCATE_HEAD)
-                        marked = True
-    except (OSError, ValueError):
-        pass
-    finally:
+    # ---- 事件 ----
+    def read_events(self, after_seq: int = 0) -> list[dict]:
+        """读 events.jsonl 中 seq > after_seq 的事件。"""
+        out = []
+        if not self.event_file.exists():
+            return out
         try:
-            src.close()
-        except (OSError, ValueError):
+            with open(self.event_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict) and int(obj.get("seq") or 0) > after_seq:
+                        out.append(obj)
+        except OSError:
+            pass
+        return out
+
+    def read_checkpoint(self) -> dict | None:
+        p = self.checkpoint_file
+        if not p.exists():
+            return None
+        try:
+            obj = json.loads(p.read_text("utf-8"))
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    # ---- 控制 ----
+    def write_pause(self, command_id: str, reason: str, deadline: str) -> None:
+        self._pause = {"command_id": command_id, "action": "pause",
+                       "job_id": self.spec.job_id, "attempt_id": self.spec.attempt_id,
+                       "token": self.spec.token, "reason": reason, "deadline": deadline}
+        _atomic_write(self.control_file, self._pause)
+
+    @property
+    def pause_command(self) -> dict | None:
+        return self._pause
+
+    def signal_pause(self) -> None:
+        """协作暂停：先写控制文件，再发 SIGTERM 让 worker 进入安全边界落断点。"""
+        try:
+            os.killpg(self.pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
             pass
 
-
-def _read_control_from_state(task_dir: Path, run_id: str) -> str:
-    """读 state.json 的 control.action（进程可能主动 stop/no_retry/reschedule）。"""
-    import json as _json
-    candidates = [
-        task_dir / "cache" / "runs" / run_id / "state.json",
-        task_dir / "cache" / "state.json",
-    ]
-    for p in candidates:
+    def terminate(self, grace_sec: float) -> int | None:
+        """整棵进程树 SIGTERM → 等 grace → SIGKILL。返回退出码。"""
+        self._terminating.set()
         try:
-            st = _json.loads(p.read_text("utf-8"))
-        except (json.JSONDecodeError, OSError):  # noqa: F821
-            continue
-        ctrl = st.get("control") if isinstance(st, dict) else None
-        if isinstance(ctrl, dict) and ctrl.get("action"):
-            return str(ctrl.get("action"))
-    return ""
-
-
-def _read_last_error_category(task_dir: Path, run_id: str) -> str:
-    import json as _json
-    candidates = [
-        task_dir / "cache" / "runs" / run_id / "state.json",
-        task_dir / "cache" / "state.json",
-    ]
-    for p in candidates:
+            os.killpg(self.pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
         try:
-            st = _json.loads(p.read_text("utf-8"))
-        except (json.JSONDecodeError, OSError):  # noqa: F821
-            continue
-        if isinstance(st, dict):
-            last = st.get("last_error")
-            if isinstance(last, dict) and isinstance(last.get("category"), str):
-                return last["category"]
-    return ""
+            self.proc.wait(timeout=grace_sec)
+            return self.proc.returncode
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(self.pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            self.proc.wait(timeout=KILL_WAIT_SEC)
+        except subprocess.TimeoutExpired:
+            pass
+        return self.proc.returncode
+
+    def cleanup(self) -> None:
+        self.cgrp.remove()
 
 
-def execute(spec: RunSpec, on_started=None) -> RunOutcome:
-    stdout = runlog.stdout_path(spec.subtask_id, spec.run_id)
-    stderr = runlog.stderr_path(spec.subtask_id, spec.run_id)
-    stdout.parent.mkdir(parents=True, exist_ok=True)
-
-    started_at = runlog.now_iso()
-    t0 = time.monotonic()
-    pid = pgid = exit_code = None
-    kind = "exited"
-    reason = ""
-    scheduler_signaled = False
-    cgrp = cg.new_cgroup(spec.cgroup_name or f"{spec.subtask_id}/{spec.request_id}")
-    if cgrp.available:
-        cgrp.set_limits(spec.memory_high, spec.memory_max, spec.cpu_quota)
-
+def _atomic_write(path: Path, obj: Any) -> None:
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
-        workdir = spec.workdir
-        workdir.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.Popen(
-            spec.argv(),
-            cwd=str(workdir),
-            env=spec.environ(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            close_fds=True,
-            preexec_fn=(lambda: _drop_privileges(spec.run_user)) if spec.run_user else None,
-        )
-        pump_out = threading.Thread(target=_pump_stream, args=(proc.stdout, stdout, spec.max_log_bytes), daemon=True)
-        pump_err = threading.Thread(target=_pump_stream, args=(proc.stderr, stderr, spec.max_log_bytes), daemon=True)
-        pump_out.start()
-        pump_err.start()
-        pid, pgid = proc.pid, proc.pid
-        if cgrp.available:
-            cgrp.add_process(pid)
-        spec.pid = pid
-        spec.pgid = pgid
-        if on_started:
-            try:
-                on_started(pid, pgid)
-            except Exception:
-                pass
-
-        while True:
-            # 进程主动请求 stop/no_retry → 调度器优雅 stop
-            active = _read_control_from_state(spec.task_dir, spec.run_id)
-            if active == "stop":
-                scheduler_signaled = True
-                _terminate(proc, spec.cancel_grace_sec)
-                exit_code = proc.returncode
-                kind, reason = "killed", ("进程请求 stop：" + (spec.cancel_reason or ""))
-                break
-            if active == "no_retry":
-                # no_retry 不发信号，进程会自退出
-                pass
-
-            if spec.cancel.is_set():
-                scheduler_signaled = True
-                _terminate(proc, spec.cancel_grace_sec)
-                exit_code = proc.returncode
-                kind, reason = "killed", (spec.cancel_reason or "被手动终止")
-                break
-            if spec.preempt.is_set():
-                scheduler_signaled = True
-                _terminate(proc, spec.preempt_grace_sec)
-                exit_code = proc.returncode
-                break
-            rc = proc.poll()
-            if rc is not None:
-                exit_code = rc
-                if spec.cancel.is_set() or active == "stop":
-                    kind, reason, scheduler_signaled = "killed", (spec.cancel_reason or "被终止"), True
-                elif spec.preempt.is_set() and rc not in (0, errors.EXIT_PREEMPTED):
-                    scheduler_signaled = True
-                    exit_code = errors.EXIT_PREEMPTED
-                break
-            time.sleep(POLL_INTERVAL_SEC)
-
-        pump_out.join(timeout=5)
-        pump_err.join(timeout=5)
-    except FileNotFoundError as e:
-        kind, reason = "failed", f"无法拉起入口：{e}"
-    except Exception as e:  # noqa: BLE001
-        kind, reason = "failed", f"执行异常：{type(e).__name__}: {e}"
-    finally:
-        mem_peak = (cgrp.read_peak_mem() or 0) // (1024 * 1024)
-        cpu_usec = cgrp.read_cpu_usage_usec() or 0
-        oom = (cgrp.read_oom_kill_count() or 0) > 0
-
-    finished_at = runlog.now_iso()
-    duration_ms = int((time.monotonic() - t0) * 1000)
-
-    # 退出码归因
-    if kind == "exited":
-        if exit_code == 0:
-            status = "success"
-        elif exit_code == errors.EXIT_PREEMPTED:
-            status = "preempted"
-            reason = "抢占/停止：断点已保存"
-        elif exit_code in (errors.EXIT_RESOURCE, errors.EXIT_EXTERNAL_RESOURCE):
-            status = "resource"
-            reason = f"资源错误（退出码 {exit_code}）"
-        elif exit_code == errors.EXIT_DATA_RISK:
-            status = "data_risk"
-            reason = "数据风险（跳过项）"
-        elif exit_code == errors.EXIT_SIGKILL or exit_code == -signal.SIGKILL:
-            if oom:
-                status, reason = "resource", "cgroup OOM（超限被内核杀）"
-            elif scheduler_signaled:
-                status, reason = "preempted", "抢占超时未落断点被 SIGKILL（回退重跑）"
-            else:
-                status, reason = "failed", f"被 SIGKILL（rc={exit_code}）"
-        else:
-            cat = _read_last_error_category(spec.task_dir, spec.run_id)
-            if cat == "logic":
-                status, reason = "failed", f"逻辑错误（退出码 {exit_code}，任务自报 logic）"
-            else:
-                # 兜底按资源错误
-                status, reason = "resource", f"资源错误兜底（退出码 {exit_code}）"
-    elif kind == "killed":
-        status = "interrupted"
-    else:
-        status = "failed"
-
-    return RunOutcome(
-        status=status, exit_code=exit_code, reason=reason,
-        pid=pid, pgid=pgid,
-        started_at=started_at, finished_at=finished_at, duration_ms=duration_ms,
-        scheduler_signaled=scheduler_signaled,
-        memory_peak_mb=mem_peak, cpu_usage_usec=cpu_usec, oom_killed=oom,
-    )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
-def pgid_alive(pgid: int) -> bool:
+def _proc_start_time(pid: int) -> float:
     try:
-        os.killpg(pgid, 0)
+        return os.stat(f"/proc/{pid}").st_ctime
+    except OSError:
+        return 0.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
@@ -406,34 +200,94 @@ def pgid_alive(pgid: int) -> bool:
         return True
 
 
-def kill_process_group(pgid: int, grace_sec: int = 10) -> bool:
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    deadline = time.monotonic() + grace_sec
-    while time.monotonic() < deadline:
-        if not pgid_alive(pgid):
-            return True
-        time.sleep(POLL_INTERVAL_SEC)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    return True
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def scan_outputs(task_dir: Path) -> list[dict]:
-    """扫描 results/ 下的交付物（用于 UI 展示，不再做强绑定验收）。"""
-    d = task_dir / "results"
-    if not d.is_dir():
-        return []
-    out = []
-    for p in sorted(d.iterdir()):
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        out.append({"path": str(p.relative_to(task_dir)), "size": st.st_size if p.is_file() else None,
-                    "is_dir": p.is_dir()})
-    return out
+def build_argv(task_root: Path, entry: config.EntrySpec, entry_args: list[str]) -> list[str]:
+    argv: list[str] = []
+    if entry.interpreter:
+        argv.append(entry.interpreter)
+    argv.append(str((task_root / entry.file).resolve()))
+    argv.extend(list(entry.args))
+    argv.extend(list(entry_args))
+    return argv
+
+
+def build_env(spec: AttemptSpec, input_refs: list[str]) -> dict[str, str]:
+    env = {k: os.environ[k] for k in ENV_PASSTHROUGH if k in os.environ}
+    for k, v in spec.env.items():
+        if k not in ENV_BLACKLIST:
+            env[k] = v
+    env.update({
+        "SCHED_ATTEMPT_ID": spec.attempt_id,
+        "SCHED_JOB_ID": spec.job_id,
+        "SCHED_TASK_ID": spec.task_id,
+        "SCHED_TOKEN": spec.token,
+        "SCHED_RUN_DIR": str(config.run_dir(spec.attempt_id)),
+        "SCHED_EVENT_FILE": str(config.run_dir(spec.attempt_id) / "events.jsonl"),
+        "SCHED_CONTROL_FILE": str(config.run_dir(spec.attempt_id) / "control.json"),
+        "SCHED_CHECKPOINT_FILE": str(config.run_dir(spec.attempt_id) / "checkpoint.json"),
+        "SCHED_WORKSPACE": str(spec.task_root),
+        "SCHED_PROGRESS_SEMVER": spec.progress_semver,
+    })
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + existing if existing else "")
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def launch(spec: AttemptSpec, input_refs: list[str] | None = None) -> AttemptRun:
+    run_dir = config.run_dir(spec.attempt_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    input_refs = input_refs or []
+    workdir = spec.task_root if spec.workdir in (".", "") else (spec.task_root / spec.workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    cgrp = cg.new_cgroup(f"{spec.task_id}/{spec.attempt_id}")
+    argv = build_argv(spec.task_root, spec.executor_entry, spec.entry_args)
+    env = build_env(spec, input_refs)
+
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(workdir),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        close_fds=True,
+    )
+    if cgrp.available:
+        cgrp.add_process(proc.pid)
+    return AttemptRun(spec, proc, run_dir, cgrp, input_refs)
+
+
+@dataclass
+class AttemptOutcome:
+    status: str
+    exit_code: int | None
+    reason: str
+    completed: bool = False
+    shortage: bool = False
+
+
+def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool,
+                   had_shortage: bool) -> AttemptOutcome:
+    """把进程退出 + 事件证据归因为作业状态。
+
+    status_ctx: scheduler 发起 PAUSING（协作暂停）或 CANCELLED（显式取消）。
+    """
+    from .config import JobStatus
+
+    if status_ctx == JobStatus.CANCELLED:
+        return AttemptOutcome(JobStatus.CANCELLED, exit_code, "显式取消")
+    if status_ctx == JobStatus.PAUSING:
+        return AttemptOutcome(JobStatus.PAUSED, exit_code, "协作暂停，断点已保存")
+    if had_shortage:
+        return AttemptOutcome(JobStatus.BACKOFF, exit_code, "统一外部不足")
+    if exit_code == 0 and had_completed:
+        return AttemptOutcome(JobStatus.SUCCEEDED, exit_code, "完成", completed=True)
+    if exit_code == 0 and not had_completed:
+        return AttemptOutcome(JobStatus.RECOVERING, exit_code, "退出 0 但无完成记录，待核实")
+    return AttemptOutcome(JobStatus.FAILED, exit_code, f"业务/未知失败（退出码 {exit_code}）")

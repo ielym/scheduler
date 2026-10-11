@@ -1,30 +1,23 @@
-"""任务侧退出码协议（复用 sched.errors 的常量，SDK 独立可用）。
+"""退出码与事件种类约定（与调度器 sched/config.py 镜像）。
 
-与 sched.errors 完全对齐，避免任务侧额外依赖 sched 包。
+协议约定（设计文档第六、十二节）：
+- 0  成功完成（必须已写入持久化完成记录）
+- 75 统一外部不足（可恢复退让）
+- 其他非 0 业务/未知失败
+
+协作暂停：worker 在收到暂停命令后，提交检查点、发送 control_ack + checkpoint 事件，
+随后正常退出；调度器由自身发起的 PAUSING 意图识别为 PAUSED，而不依赖特殊退出码。
 """
 
-from __future__ import annotations
-
-from enum import Enum
-
-
-class Category(str, Enum):
-    RESOURCE = "resource"
-    LOGIC = "logic"
-    UNCLASSIFIED = "unclassified"
-
-
 EXIT_OK = 0
-EXIT_PREEMPTED = 99
-EXIT_RESOURCE = 100
-EXIT_EXTERNAL_RESOURCE = 101
-EXIT_DATA_RISK = 110
-EXIT_LOGIC = 1
-EXIT_SIGKILL = 137
-EXIT_STOP_REQUESTED = 98  # 进程主动 stop（SDK 的 request_stop 路径）
-EXIT_NO_RETRY = 97        # 进程 no_retry 后正常终结
-EXIT_SKIP_SCHEDULE = 102  # 任务判定当前不该跑（时间窗/节假日等），跳过本轮
+EXIT_SHORTAGE = 75
 
-RESERVED_EXIT_CODES = {EXIT_PREEMPTED, EXIT_RESOURCE, EXIT_EXTERNAL_RESOURCE,
-                       EXIT_DATA_RISK, EXIT_STOP_REQUESTED, EXIT_NO_RETRY,
-                       EXIT_SKIP_SCHEDULE, EXIT_SIGKILL}
+
+class EventKind:
+    STARTED = "started"
+    HEARTBEAT = "heartbeat"
+    PROGRESS = "progress"
+    SHORTAGE = "external_shortage"
+    CONTROL_ACK = "control_ack"
+    CHECKPOINT = "checkpoint"
+    COMPLETED = "completed"

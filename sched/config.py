@@ -1,193 +1,330 @@
-"""sched 路径常量与全局设置。
+"""sched 路径常量、全局配置（config.json）、任务清单（task.json）与就绪请求（outbox JSON）协议。
 
-项目根（tasks/、data/ 的父目录）默认取本包所在目录的上一级——代码可整体 clone/搬迁到
-任意路径，无需改配置。SCHED_HOME 环境变量可覆盖根目录（多实例/测试隔离用）。
+目录布局（设计文档第二节）：
+    SCHED_HOME/
+      config.json          全局配置
+      tasks/<task_id>/     task.json + 生产者入口 + 执行入口 + producer_state + outbox + receipts
+      runtime/             单实例锁、执行数据库、请求归档、隔离、执行事件、控制文件、检查点、状态日志
+
+任务不填写最大运行/排队数量或默认资源申请；生产者由调度器独立守护且不施加执行资源控制。
 """
 
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # sched/config.py -> sched/ -> 项目根
 DEFAULT_HOME = Path(__file__).resolve().parent.parent
 
+# 协议版本
+TASK_SCHEMA_VERSION = 1
+READY_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 1
+
+TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+JOB_ID_RE = re.compile(r"^[a-zA-Z0-9._:-]{1,256}$")
+
+
+# ---------- 作业 / attempt 状态（设计文档第十二节） ----------
+class JobStatus:
+    QUEUED = "QUEUED"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    PAUSING = "PAUSING"
+    PAUSED = "PAUSED"
+    BACKOFF = "BACKOFF"          # 外部不足已退出、等待到期探测
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"            # 业务逻辑 / 未知非资源失败
+    RECOVERING = "RECOVERING"
+    RECOVERY_BLOCKED = "RECOVERY_BLOCKED"
+    CANCELLED = "CANCELLED"      # 显式取消
+
+    # 存活状态：STARTING/RUNNING/PAUSING 及尚未确认退出的状态都算存活
+    LIVE = {STARTING, RUNNING, PAUSING, RECOVERING, RECOVERY_BLOCKED}
+    TERMINAL = {SUCCEEDED, FAILED, CANCELLED}
+    RESUMPTABLE = {PAUSED, BACKOFF}
+
+
+# 执行事件种类（设计文档第六节）
+class EventKind:
+    STARTED = "started"
+    HEARTBEAT = "heartbeat"
+    PROGRESS = "progress"
+    SHORTAGE = "external_shortage"   # 统一外部不足
+    CONTROL_ACK = "control_ack"
+    CHECKPOINT = "checkpoint"
+    COMPLETED = "completed"
+
+
+# 退出码（与 sched_task_sdk/errors.py 镜像）
+EXIT_OK = 0
+EXIT_SHORTAGE = 75   # 统一外部不足
+
 
 def home() -> Path:
-    """项目根目录。测试通过 SCHED_HOME 覆盖。"""
     return Path(os.environ.get("SCHED_HOME") or DEFAULT_HOME)
+
+
+def config_file() -> Path:
+    return home() / "config.json"
 
 
 def tasks_dir() -> Path:
     return home() / "tasks"
 
 
-def data_dir() -> Path:
-    return home() / "data"
-
-
-def runs_dir() -> Path:
-    return data_dir() / "runs"
-
-
 def runtime_dir() -> Path:
-    return data_dir() / "runtime"
+    return home() / "runtime"
 
 
-def jobs_file() -> Path:
-    return data_dir() / "jobs.json"
+def lock_file() -> Path:
+    return runtime_dir() / "scheduler.lock"
 
 
-def settings_file() -> Path:
-    return data_dir() / "settings.json"
+def db_file() -> Path:
+    return runtime_dir() / "exec.db"
 
 
-def scheduler_state_file() -> Path:
-    return runtime_dir() / "scheduler_state.json"
+def logs_dir() -> Path:
+    return runtime_dir() / "logs"
 
 
-def admission_state_file() -> Path:
-    return runtime_dir() / "admission.json"
+def runs_root() -> Path:
+    return runtime_dir() / "runs"
 
 
-def decisions_log() -> Path:
-    return runtime_dir() / "decisions.jsonl"
+def status_log() -> Path:
+    return runtime_dir() / "status.jsonl"
 
 
-def profiles_file() -> Path:
-    return runtime_dir() / "profiles.json"
+def task_dir(task_id: str) -> Path:
+    return tasks_dir() / task_id
 
 
-def ledger_file() -> Path:
-    return runtime_dir() / "ledger.json"
+def producer_state_dir(task_id: str) -> Path:
+    return task_dir(task_id) / "producer_state"
 
 
-def sched_user_conf() -> Path:
-    return home() / "deploy" / "sched-run.conf"
+def outbox_dir(task_id: str) -> Path:
+    return task_dir(task_id) / "outbox"
 
 
-class RunnerConfig(BaseModel):
-    # 这些都是引擎内部参数，不在管理台暴露；重试节奏/放弃策略由意图文件 lifetime.retry 段声明
-    # 调度器不设全局冷却/退避/重试上限。
-    kill_grace_sec: int = 10
-    heartbeat_timeout_sec: int = 120
-    grace_sec: int = 40
+def receipts_dir(task_id: str) -> Path:
+    return task_dir(task_id) / "receipts"
 
 
-# 资源阈值阶梯（v04 R29，并经评估建议改为 memory.high 软限 + memory.max 硬限双水位）
-class ResourceConfig(BaseModel):
-    # 画像三级窗口
-    window_samples: int = 8          # 最近 N 次正式 run
-    overshoot: float = 1.2           # 画像上浮系数（P95 ×1.2）
-    # cgroup 双水位（进程内软限 + 硬兜底，比例基于画像预估值）
-    memory_high_ratio: float = 1.5   # memory.high = 预估值 ×1.5（软限节流）
-    memory_max_ratio: float = 2.5    # memory.max = 预估值 ×2.5（硬兜底）
-    # monitor 超限判定
-    overload_ratio: float = 2.0      # 实际/预估 >2.0 视为超限
-    overload_sustain_sec: int = 60   # 持续判定窗口
-    sample_interval_sec: int = 3     # monitor 采样间隔
-    # 运行中动态画像：每隔这么多秒把 cgroup 实测（CPU 速率/内存）落入画像滑窗并落盘
-    profile_live_interval_sec: int = 60
-    # 准出时对非调度进程占用的感知（R14）：est_mem > MemAvailable - margin → 退让等待
-    external_safety_margin_mb: int = 512
-    # 最大并发运行进程数：CPU/内存再空闲也不超过此上限，防文件描述符/进程数耗尽
-    max_running: int = 50
-    # 每个子任务初始并发上限：保守起量，运行健康后逐步放量（成功 +1），资源错误则缩量（减半）
-    init_concurrency: int = 8
+def run_dir(attempt_id: str) -> Path:
+    return runs_root() / attempt_id
 
 
-class WebConfig(BaseModel):
-    # 内嵌管理台：serve 进程内起 uvicorn，所有写操作与同一个
-    # SchedulerService 实例（另开进程写 scheduler_state.json 会与 serve 内存态互相覆盖，故只允许内嵌）。
-    enabled: bool = True
-    host: str = "127.0.0.1"   # 默认仅本机；对外暴露必须配 auth_token（或显式风险开关，见下）
-    port: int = 8765
-    # HTTP Basic Auth 密码（用户名任意，只校验密码）。非空即对全部页面/接口启用。
-    # 管理台可在线改任务 .py 并注册执行（等同 RCE），绑非回环地址时必须配 token。
-    auth_token: str = ""
-    # 显式承认"无密码暴露公网"的风险开关：host 非回环且 auth_token 为空时，
-    # 必须显式置 true 才允许启动，防止改 host 后不知不觉裸奔。
-    allow_public_no_auth: bool = False
+# ---------- 全局配置 config.json ----------
+class ControlConfig(BaseModel):
+    loop_tick_sec: float = 1.0              # 主循环 + 事件消费
+    sample_interval_sec: float = 2.0        # 执行资源采样
+    heartbeat_interval_sec: float = 5.0     # 心跳初值
+    producer_restart_base_sec: float = 1.0  # 生产者崩溃退避起点
+    producer_restart_cap_sec: float = 30.0  # 生产者崩溃退避上限
+    producer_crash_reset_after_sec: float = 300.0  # 崩溃退避连续无崩溃后的复位
+    start_interval_sec: float = 1.0         # 全局启动间隔（错开启动，防突发）
+    grow_observe_sec: float = 30.0          # 扩容观察期初值
+    pause_grace_base_sec: float = 10.0      # 暂停宽限节奏初值
+    pause_grace_max_sec: float = 60.0
+    pulse_wait_sec: float = 1.0             # 暂停确认轮询间隔
+    shortage_retry_base_sec: float = 5.0    # 不足重试指数退避起点
+    shortage_retry_cap_sec: float = 900.0
+    protect_deadline_sec: float = 300.0     # 整轮保护截止时间初值
+    protect_round_backoff_sec: float = 60.0 # 失败保护轮间等待
+    slow_confidence_sec: float = 120.0      # 变慢判定连续证据窗口
+    recovery_probe_sec: float = 60.0        # 恢复探测最小机会间隔
 
 
-class Settings(BaseModel):
+class SchedulerConfig(BaseModel):
+    schema_version: int = CONFIG_SCHEMA_VERSION
     timezone: str = "Asia/Shanghai"
-    runner: RunnerConfig = Field(default_factory=RunnerConfig)
-    resource: ResourceConfig = Field(default_factory=ResourceConfig)
-    web: WebConfig = Field(default_factory=WebConfig)
-    max_log_mb: int = 32
-    # 非 root 执行用户；为空 = 以调度器当前用户运行；系统无此用户时自动降级为空
-    run_user: str = ""
-    # ---- 调度行为参数（引擎内部，不进管理台；任务自治参数在意图文件 lifetime.retry 段）----
-    starvation_sec: float = 60.0          # 饿死看门狗阈值（60s，同优先级冷启动轮转的兜底）
-    preempt_exempt_sec: float = 60.0      # 任务启动后的抢占豁免期
-    data_risk_max_reschedules: int = 3    # 110 数据风险二刷轮数上限
-    hot_reload_sec: float = 30.0          # serve 主循环周期性热加载 jobs.json/tasks 目录
-    # ---- 资源错误反压（动态提交思想落地）：某子任务窗口内连续多次资源错误退出 → 暂停其新准入 ----
-    res_backoff_window_sec: float = 60.0     # 观测窗口
-    res_backoff_threshold: int = 5           # 窗口内失败次数达此值触发退避
-    res_backoff_duration_sec: float = 180.0  # 退避持续时长
+    control: ControlConfig = Field(default_factory=ControlConfig)
+
+    model_config = {"extra": "ignore"}
 
     @field_validator("timezone")
     @classmethod
     def _tz_ok(cls, v: str) -> str:
         try:
+            from zoneinfo import ZoneInfo
             ZoneInfo(v)
-        except (ZoneInfoNotFoundError, ValueError, KeyError) as e:
-            raise ValueError(f"无效时区：{v!r}（例如 Asia/Shanghai）") from e
+        except Exception as e:
+            raise ValueError(f"无效时区：{v!r}") from e
         return v
 
-    @field_validator("run_user")
+
+# ---------- 任务清单 task.json ----------
+class EntrySpec(BaseModel):
+    file: str
+    interpreter: str = "python3"
+    args: list[str] = Field(default_factory=list)
+    cwd: str = "."
+
+    model_config = {"extra": "ignore"}
+
+
+class RecoverySpec(BaseModel):
+    """生产者恢复方式说明：数据源如何重放、保留多久、如何识别遗漏。"""
+    replay: str = "outbox"       # outbox | source | none
+    retain: str = ""             # 数据源保留描述
+    replay_note: str = ""        # 如何识别遗漏
+
+    model_config = {"extra": "ignore"}
+
+
+class TaskSpec(BaseModel):
+    schema_version: int = TASK_SCHEMA_VERSION
+    task_id: str
+    enabled: bool = True
+    priority: int = 0
+    producer_entry: EntrySpec      # 生产者入口（常驻）
+    executor_entry: EntrySpec      # 执行入口
+    workdir: str = "."
+    progress_semver: str = "1.0.0"
+    recovery: RecoverySpec = Field(default_factory=RecoverySpec)
+
+    model_config = {"extra": "ignore"}
+
+    @field_validator("task_id")
     @classmethod
-    def _run_user_ok(cls, v: str) -> str:
-        if not v:
-            return v
-        import pwd
-        try:
-            pwd.getpwnam(v)
-        except KeyError:
-            # 用户不存在时降级为空（以调度器当前用户运行），避免 preexec_fn raise 导致进程 exit 2
-            import warnings
-            warnings.warn(f"run_user='{v}' 不存在，降级为空（以当前用户运行）")
-            return ""
+    def _task_id_ok(cls, v: str) -> str:
+        if not TASK_ID_RE.match(v or ""):
+            raise ValueError(f"task_id 非法：{v!r}")
+        if v.startswith("_") or v.startswith("."):
+            raise ValueError(f"task_id 不能以 '_' 或 '.' 开头：{v!r}")
+        return v
+
+    @field_validator("priority")
+    @classmethod
+    def _pri_ok(cls, v: int) -> int:
+        if isinstance(v, bool):
+            raise ValueError("priority 必须是整数")
         return v
 
 
-def default_settings() -> Settings:
-    return Settings()
+class TaskError(Exception):
+    def __init__(self, errors: list[str] | str):
+        self.errors = [errors] if isinstance(errors, str) else errors
+        super().__init__("; ".join(self.errors))
 
 
-def ensure_layout() -> None:
-    from . import store
+def _rel_within(base: Path, rel: str, field: str) -> Path:
+    p = Path(rel or ".")
+    if p.is_absolute():
+        raise TaskError(f"{field} 必须是相对路径：{rel}")
+    if ".." in p.parts:
+        raise TaskError(f"{field} 不能包含 '..'：{rel}")
+    target = (base / p).resolve()
+    if target != base.resolve() and base.resolve() not in target.parents:
+        raise TaskError(f"{field} 越出了任务目录：{rel}")
+    return target
 
-    for d in (tasks_dir(), data_dir(), runs_dir(), runtime_dir()):
-        d.mkdir(parents=True, exist_ok=True)
 
-    if not settings_file().exists():
-        store.save_json(settings_file(), default_settings().model_dump())
-
-
-def load_settings() -> Settings:
-    from . import store
-
-    raw = store.load_json(settings_file(), default=None)
-    if not isinstance(raw, dict) or not raw:
-        s = default_settings()
-        store.save_json(settings_file(), s.model_dump())
-        return s
+def parse_task(raw: Any, task_id: str) -> TaskSpec:
+    if not isinstance(raw, dict):
+        raise TaskError("task.json 顶层必须是对象")
     try:
-        s = Settings.model_validate(raw)
-    except Exception:
-        s = default_settings()
-        store.save_json(settings_file(), s.model_dump())
-    return s
+        doc = TaskSpec.model_validate(raw)
+    except Exception as e:
+        raise TaskError(str(e)) from e
+    if doc.task_id != task_id:
+        raise TaskError(f"task.json 内 task_id '{doc.task_id}' 与目录名 '{task_id}' 不一致")
+    base = task_dir(task_id)
+    for field, entry in (("producer_entry", doc.producer_entry),
+                         ("executor_entry", doc.executor_entry)):
+        p = _rel_within(base, entry.file, f"{field}.file")
+        if not p.exists():
+            raise TaskError(f"{field}.file 不存在：{entry.file}")
+    _rel_within(base, doc.workdir or ".", "workdir")
+    return doc
 
 
-def save_settings(s: Settings) -> Settings:
+def load_task(task_id: str) -> TaskSpec:
+    if not TASK_ID_RE.match(task_id or ""):
+        raise TaskError(f"task_id 非法：{task_id!r}")
+    td = task_dir(task_id)
+    if not td.is_dir():
+        raise TaskError(f"任务目录不存在：{td}")
+    tj = td / "task.json"
+    if not tj.exists():
+        raise TaskError(f"缺少 task.json：{tj}")
+    try:
+        import json
+        raw = json.loads(tj.read_text("utf-8"))
+    except json.JSONDecodeError as e:
+        raise TaskError(f"task.json 不是合法 JSON：{e}") from e
+    except OSError as e:
+        raise TaskError(f"读取 task.json 失败：{e}") from e
+    return parse_task(raw, task_id)
+
+
+# ---------- 就绪请求 outbox JSON ----------
+class ReadyJob(BaseModel):
+    schema_version: int = READY_SCHEMA_VERSION
+    job_id: str
+    task_id: str
+    entry_args: list[str] = Field(default_factory=list)
+    workdir: str = "."
+    input_refs: list[str] = Field(default_factory=list)
+    idempotency_key: str = ""
+    progress_semver: str = "1.0.0"
+    env: dict[str, str] = Field(default_factory=dict)
+
+    model_config = {"extra": "ignore"}
+
+    @field_validator("job_id")
+    @classmethod
+    def _job_id_ok(cls, v: str) -> str:
+        if not JOB_ID_RE.match(v or ""):
+            raise ValueError(f"job_id 非法：{v!r}")
+        return v
+
+
+class ReadyError(Exception):
+    def __init__(self, errors: list[str] | str):
+        self.errors = [errors] if isinstance(errors, str) else errors
+        super().__init__("; ".join(self.errors))
+
+
+def parse_ready(raw: Any) -> ReadyJob:
+    if not isinstance(raw, dict):
+        raise ReadyError("就绪 JSON 顶层必须是对象")
+    try:
+        return ReadyJob.model_validate(raw)
+    except Exception as e:
+        raise ReadyError(str(e)) from e
+
+
+# ---------- 全局配置读写 ----------
+def ensure_layout() -> None:
+    for d in (tasks_dir(), runtime_dir(), runs_root(), logs_dir()):
+        d.mkdir(parents=True, exist_ok=True)
+    cf = config_file()
+    if not cf.exists():
+        from . import store
+        store.save_json(cf, SchedulerConfig().model_dump())
+
+
+def load_config() -> SchedulerConfig:
     from . import store
+    raw = store.load_json(config_file(), default=None)
+    if not isinstance(raw, dict):
+        return SchedulerConfig()
+    try:
+        return SchedulerConfig.model_validate(raw)
+    except Exception:
+        return SchedulerConfig()
 
-    store.save_json(settings_file(), s.model_dump())
-    return s
+
+def save_config(c: SchedulerConfig) -> SchedulerConfig:
+    from . import store
+    store.save_json(config_file(), c.model_dump())
+    return c
