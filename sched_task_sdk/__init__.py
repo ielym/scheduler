@@ -13,15 +13,18 @@ from .executor import (
     emit_event,
     report_progress,
     report_shortage,
+    report_shortage_event,
     run_task,
 )
-from .producer import Producer, ProducerError, job_id_of, run_producer
+from .producer import Producer, ProducerError, atomic_write_json, job_id_of, run_producer
 from .checkpoint import CheckpointStore
 
 __all__ = [
     "ExecutorTask", "Shortage", "PauseRequested", "run_task",
-    "report_progress", "report_shortage", "complete", "emit_event",
+    "report_progress", "report_shortage", "report_shortage_event",
+    "complete", "emit_event",
     "Producer", "ProducerError", "job_id_of", "run_producer",
+    "atomic_write_json",
     "CheckpointStore",
     "EXIT_OK", "EXIT_SHORTAGE", "EventKind",
 ]

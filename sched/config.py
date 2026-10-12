@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
@@ -45,7 +46,7 @@ class JobStatus:
     CANCELLED = "CANCELLED"      # 显式取消
 
     # 存活状态：STARTING/RUNNING/PAUSING 及尚未确认退出的状态都算存活
-    LIVE = {STARTING, RUNNING, PAUSING, RECOVERING, RECOVERY_BLOCKED}
+    LIVE = {STARTING, RUNNING, PAUSING}
     TERMINAL = {SUCCEEDED, FAILED, CANCELLED}
     RESUMPTABLE = {PAUSED, BACKOFF}
 
@@ -102,6 +103,20 @@ def status_log() -> Path:
     return runtime_dir() / "status.jsonl"
 
 
+def snapshot_file() -> Path:
+    """serve 进程每轮发布的运行时快照（CLI status 读取）。"""
+    return runtime_dir() / "snapshot.json"
+
+
+def commands_file() -> Path:
+    """CLI → serve 控制命令队列（JSONL，serve 消费后写入 ack 文件）。"""
+    return runtime_dir() / "commands.jsonl"
+
+
+def commands_ack_file() -> Path:
+    return runtime_dir() / "commands_ack.jsonl"
+
+
 def task_dir(task_id: str) -> Path:
     return tasks_dir() / task_id
 
@@ -134,13 +149,29 @@ class ControlConfig(BaseModel):
     grow_observe_sec: float = 30.0          # 扩容观察期初值
     pause_grace_base_sec: float = 10.0      # 暂停宽限节奏初值
     pause_grace_max_sec: float = 60.0
-    pulse_wait_sec: float = 1.0             # 暂停确认轮询间隔
     shortage_retry_base_sec: float = 5.0    # 不足重试指数退避起点
     shortage_retry_cap_sec: float = 900.0
     protect_deadline_sec: float = 300.0     # 整轮保护截止时间初值
-    protect_round_backoff_sec: float = 60.0 # 失败保护轮间等待
+    protect_round_backoff_sec: float = 60.0 # 失败保护轮间等待（起点）
+    protect_round_backoff_cap_sec: float = 600.0  # 失败保护轮间等待上限（逐渐增加）
+    yield_observe_sec: float = 10.0         # 保护轮每次退让后需观察的间隔（确认退出+观察 A）
     slow_confidence_sec: float = 120.0      # 变慢判定连续证据窗口
     recovery_probe_sec: float = 60.0        # 恢复探测最小机会间隔
+    scan_batch_size: int = 200              # 每任务每轮接收时间片（文件数上限）
+    heartbeat_stale_sec: float = 30.0       # 心跳过期阈值下限（不固定，实际取梯形与反馈间隔的较大者）
+    heartbeat_stale_multiplier: float = 6.0 # 心跳过期 = 承诺反馈间隔 × 该倍数（依据实际延迟推导）
+    starting_timeout_sec: float = 60.0      # STARTING 无 started 事件超时
+    resource_unhealthy_ratio: float = 0.9   # 持续超过判定不健康
+    resource_healthy_ratio: float = 0.8     # 持续低于判定恢复健康（滞回）
+    resource_stable_samples: int = 3        # 滞回连续样本数
+    mem_growth_ratio: float = 0.05          # 单采样区间执行内存净增占容量比例，判"快速增长"
+    observability_slow_factor: float = 3.0  # 观测不足时扩容观察期放大倍数
+    recover_grace_sec: float = 30.0         # 重启后旧执行进程协作退出宽限
+    cmd_ack_wait_sec: float = 6.0           # CLI 控制命令等待确认超时
+    heartbeat_resume_cooldown_sec: float = 60.0  # 心跳过期暂停的作业恢复排队前冷却，防卡死循环
+    cleanup_terminal_after_sec: float = 604800.0  # 已完结作业（成功/取消）attempt 工件保留时长
+
+    model_config = {"extra": "forbid"}
 
 
 class SchedulerConfig(BaseModel):
@@ -148,7 +179,7 @@ class SchedulerConfig(BaseModel):
     timezone: str = "Asia/Shanghai"
     control: ControlConfig = Field(default_factory=ControlConfig)
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     @field_validator("timezone")
     @classmethod
@@ -166,9 +197,18 @@ class EntrySpec(BaseModel):
     file: str
     interpreter: str = "python3"
     args: list[str] = Field(default_factory=list)
-    cwd: str = "."
+    cwd: str = "."    # 入口工作目录（相对任务目录；workdir 在此基础上再解析）
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
+
+    @field_validator("interpreter")
+    @classmethod
+    def _interp_ok(cls, v: str) -> str:
+        # interpreter 只能是命令名（经 PATH 解析），不得带路径：契约要求
+        # 解释器版本由环境统一管理，路径写法会绑定部署位置绕过该约定
+        if not v or "/" in v or v.startswith("."):
+            raise ValueError(f"interpreter 必须是无路径的命令名：{v!r}")
+        return v
 
 
 class RecoverySpec(BaseModel):
@@ -177,7 +217,7 @@ class RecoverySpec(BaseModel):
     retain: str = ""             # 数据源保留描述
     replay_note: str = ""        # 如何识别遗漏
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
 
 class TaskSpec(BaseModel):
@@ -190,8 +230,12 @@ class TaskSpec(BaseModel):
     workdir: str = "."
     progress_semver: str = "1.0.0"
     recovery: RecoverySpec = Field(default_factory=RecoverySpec)
+    # 反馈间隔契约（设计第六节）：执行者承诺的心跳/进展反馈间隔与单步最长耗时，
+    # 调度器据此推导心跳过期阈值与暂停宽限（未填用全局默认推导）。
+    feedback_interval_sec: float | None = Field(None, gt=0)
+    max_step_sec: float | None = Field(None, gt=0)
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     @field_validator("task_id")
     @classmethod
@@ -237,12 +281,21 @@ def parse_task(raw: Any, task_id: str) -> TaskSpec:
         raise TaskError(str(e)) from e
     if doc.task_id != task_id:
         raise TaskError(f"task.json 内 task_id '{doc.task_id}' 与目录名 '{task_id}' 不一致")
+    # B4（设计第三节 L51）：恢复方式必须可解释——数据源保留多久（retain）与
+    # 如何识别遗漏（replay_note）缺失时任务清单不合规，拒绝加载。
+    if not (str(doc.recovery.retain).strip()
+            and str(doc.recovery.replay_note).strip()):
+        raise TaskError(
+            "recovery.retain 与 recovery.replay_note 必须是非空说明"
+            "（数据源保留多久/如何识别遗漏，设计第三节）")
     base = task_dir(task_id)
     for field, entry in (("producer_entry", doc.producer_entry),
                          ("executor_entry", doc.executor_entry)):
         p = _rel_within(base, entry.file, f"{field}.file")
         if not p.exists():
             raise TaskError(f"{field}.file 不存在：{entry.file}")
+        # 入口工作目录必须落在任务目录内（B11：cwd 声明必须被校验且生效）
+        _rel_within(base, entry.cwd or ".", f"{field}.cwd")
     _rel_within(base, doc.workdir or ".", "workdir")
     return doc
 
@@ -277,14 +330,31 @@ class ReadyJob(BaseModel):
     idempotency_key: str = ""
     progress_semver: str = "1.0.0"
     env: dict[str, str] = Field(default_factory=dict)
+    priority: int | None = None  # 作业级优先级：仅允许不高于任务优先级（接收时钳制）
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     @field_validator("job_id")
     @classmethod
     def _job_id_ok(cls, v: str) -> str:
         if not JOB_ID_RE.match(v or ""):
             raise ValueError(f"job_id 非法：{v!r}")
+        return v
+
+    @field_validator("task_id")
+    @classmethod
+    def _task_id_ok(cls, v: str) -> str:
+        if not TASK_ID_RE.match(v or ""):
+            raise ValueError(f"task_id 非法：{v!r}")
+        return v
+
+    @field_validator("priority")
+    @classmethod
+    def _job_pri_ok(cls, v: int | None) -> int | None:
+        if v is None or isinstance(v, bool):
+            if isinstance(v, bool):
+                raise ValueError("priority 必须是整数")
+            return v
         return v
 
 
@@ -298,9 +368,16 @@ def parse_ready(raw: Any) -> ReadyJob:
     if not isinstance(raw, dict):
         raise ReadyError("就绪 JSON 顶层必须是对象")
     try:
-        return ReadyJob.model_validate(raw)
+        doc = ReadyJob.model_validate(raw)
     except Exception as e:
         raise ReadyError(str(e)) from e
+    # workdir 必须落在其声明任务目录内（与 task.json 的 workdir 同一包含校验）：
+    # 执行进程以此目录为 cwd，越出任务目录即越权访问任务边界之外
+    try:
+        _rel_within(task_dir(doc.task_id), doc.workdir or ".", "workdir")
+    except TaskError as e:
+        raise ReadyError(str(e)) from e
+    return doc
 
 
 # ---------- 全局配置读写 ----------
@@ -320,7 +397,10 @@ def load_config() -> SchedulerConfig:
         return SchedulerConfig()
     try:
         return SchedulerConfig.model_validate(raw)
-    except Exception:
+    except Exception as e:
+        # 不静默回退：明确告知运维全局配置无效，正在使用默认控制参数
+        print(f"[sched] 全局配置 config.json 无效（{e}），使用默认控制参数",
+              file=sys.stderr, flush=True)
         return SchedulerConfig()
 
 

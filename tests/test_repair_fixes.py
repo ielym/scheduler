@@ -1,0 +1,545 @@
+"""本轮修复的回归测试（编号与审查报告对应）。
+
+P0-1  跨 attempt 检查点继承：_launch 前把旧检查点复制进新 run_dir，resume_data() 真正恢复
+P0-2  explore→steady 恢复链：on_success 恢复 steady；on_shortage 后持久化动态目标
+P1-3  consume_receipts 仅 status==received 才 ack（conflict/invalid 不误删）
+P1-4  Producer.advance 先持久化再推进内存游标（持久化失败不丢事件）
+P1-5  心跳过期暂停的作业恢复排队前冷却（防每秒重启循环）；_finalize 保留暂停发起原因
+P2-7  SDK 事件每行自带 job_id/attempt_id 归属
+P2-8  归档对账：archive 文件数 vs 库内作业数不一致告警
+P2-9  保护起因 cause 标签：变慢退让放回间隔加倍
+P2-10 PAUSING 中非 0/75 退出：保守归因 PAUSED（断点可能未保存）
+P2-16 切换保护对象：旧退让账合并进 pending_resume，不丢失
+P2-17 主循环内非阻塞终止状态机：PAUSING/CANCELLED/STARTING 超时路径不再
+     同步 wait(grace)，单个卡死 worker 不冻结控制平面；D 态兜底按未知码收尾
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+ROOT = str(Path(__file__).resolve().parent.parent)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from sched import config, runner, scaling, store  # noqa: E402
+from sched.config import JobStatus  # noqa: E402
+from sched.scheduler import AttMeta, SchedulerService  # noqa: E402
+
+
+def _write_task(home, task_id, priority=50, enabled=True):
+    td = home / "tasks" / task_id
+    td.mkdir(parents=True, exist_ok=True)
+    (td / "producer.py").write_text("")
+    (td / "run.py").write_text("")
+    store.save_json(td / "task.json", {
+        "schema_version": 1, "task_id": task_id, "enabled": enabled,
+        "priority": priority,
+        "producer_entry": {"file": "producer.py"},
+        "executor_entry": {"file": "run.py"},
+        "recovery": {"replay": "outbox", "retain": "测试保留", "replay_note": "测试重放"},
+    })
+    return td
+
+
+def _mk_job(db, job_id, task_id="t", priority=50):
+    ready = config.parse_ready({
+        "schema_version": 1, "job_id": job_id, "task_id": task_id,
+        "entry_args": [], "env": {}, "idempotency_key": job_id,
+    })
+    db.upsert_job(ready, f"hash-{job_id}", "2026-10-12T00:00:00+00:00", priority)
+    return job_id
+
+
+def _svc(home):
+    (home / "runtime").mkdir(parents=True, exist_ok=True)
+    return SchedulerService()
+
+
+def _spec(task_id, priority=50, **kw):
+    return config.TaskSpec(task_id=task_id, priority=priority,
+                           producer_entry={"file": "producer.py"},
+                           executor_entry={"file": "run.py"}, **kw)
+
+
+def _write_cp(attempt_id: str, seq: int, n: int, saved_at: str):
+    d = config.run_dir(attempt_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "checkpoint.json").write_text(json.dumps({
+        "format_version": 1, "input_ref": "j", "business_version": "",
+        "progress": None, "commit_seq": seq, "data": {"n": n},
+        "saved_at": saved_at,
+    }, ensure_ascii=False))
+
+
+class _FakeProc:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class _FakeCgroup:
+    """B6 _ensure_tree_gone 所需的最小 cgroup 假对象：树已空。"""
+    available = False
+
+    def procs(self):
+        return []
+
+    def kill_all(self):
+        pass
+
+
+class _FakeAttempt:
+    pid = 11
+    pgid = 11
+    start_time = 1.0
+
+    def __init__(self, returncode=0):
+        self.proc = _FakeProc(returncode)
+        self.cgrp = _FakeCgroup()
+        self.spec = SimpleNamespace(attempt_id="att-fake")
+
+    def is_alive(self):
+        return False
+
+    def read_events(self, after_seq: int = 0):
+        return []
+
+    def cleanup(self):
+        pass
+
+
+# ---------- P0-1 检查点继承 ----------
+
+def test_restore_checkpoint_picks_latest(home):
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("att-1", "j1", 1, "tok", "t0")
+    svc.db.update_attempt("att-1", status=JobStatus.PAUSED)  # 关闭在途约束
+    svc.db.create_attempt("att-2", "j1", 2, "tok", "t0")
+    svc.db.update_attempt("att-2", status=JobStatus.PAUSED)
+    _write_cp("att-1", 1, 10, "2026-10-12T01:00:00+00:00")
+    _write_cp("att-2", 2, 20, "2026-10-12T02:00:00+00:00")
+    assert svc._restore_checkpoint("j1", "att-new") is True
+    cp = json.loads((config.run_dir("att-new") / "checkpoint.json").read_text("utf-8"))
+    assert cp["data"] == {"n": 20} and cp["commit_seq"] == 2
+
+
+def test_restore_checkpoint_none_when_no_history(home):
+    svc = _svc(home)
+    _mk_job(svc.db, "j2")
+    svc.db.create_attempt("att-3", "j2", 1, "tok", "t0")
+    assert svc._restore_checkpoint("j2", "att-new2") is False
+    assert not (config.run_dir("att-new2") / "checkpoint.json").exists()
+
+
+def test_launch_copies_checkpoint_into_new_run_dir(home, monkeypatch):
+    svc = _svc(home)
+    _write_task(home, "t")
+    _mk_job(svc.db, "j1", task_id="t")
+    svc.db.create_attempt("att-old", "j1", 1, "tok", "t0")
+    svc.db.update_attempt("att-old", status=JobStatus.PAUSED)  # 关闭在途约束
+    _write_cp("att-old", 7, 42, "2026-10-12T01:00:00+00:00")
+
+    monkeypatch.setattr(runner, "launch", lambda aspec, refs: _FakeAttempt())
+    job = svc.db.queued_jobs(limit=10)[0]
+    assert svc._launch(job, _spec("t")) is True
+    new_att = svc.db.list_attempts(job_id="j1", limit=1)[0]["attempt_id"]
+    assert new_att != "att-old"
+    cp = json.loads((config.run_dir(new_att) / "checkpoint.json").read_text("utf-8"))
+    assert cp["data"] == {"n": 42} and cp["commit_seq"] == 7
+
+
+def test_sdk_resume_data_after_restore(home, monkeypatch, tmp_path):
+    """恢复链端到端：调度器搬运的检查点能被 worker 侧 CheckpointStore 读回。"""
+    from sched_task_sdk.checkpoint import CheckpointStore
+    monkeypatch.setenv("SCHED_JOB_ID", "j1")
+    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "cp.json"))
+    _write_cp("irrelevant", 5, 99, "2026-10-12T01:00:00+00:00")
+    shutil.copy(config.run_dir("irrelevant") / "checkpoint.json", tmp_path / "cp.json")
+    cs = CheckpointStore()
+    assert (cs.load() or {}).get("data") == {"n": 99}  # ExecutorTask.resume_data 同源
+    assert cs.commit_seq == 5
+    # 保存下一个检查点时提交编号从恢复点继续递增
+    cp = cs.save({"n": 100})
+    assert cp["commit_seq"] == 6
+
+
+# ---------- P0-2 explore→steady 恢复链 ----------
+
+def test_on_success_restores_steady_after_shortage(home):
+    cfg = config.SchedulerConfig()
+    sc = scaling.Scaling(cfg)
+    ts = sc.get("t")
+    ts.run_target = 3
+    ts.mode = "steady"
+    sc.on_shortage("t", 1.0, 3)
+    assert ts.mode == "explore" and ts.run_target == 2 and ts.shortage_streak == 1
+    # 恢复唯一入口不再是冷启动分支：一次真实成功即恢复 steady
+    sc.on_success("t", 2.0)
+    assert ts.mode == "steady" and ts.shortage_streak == 0
+
+
+def test_finalize_backoff_persists_scale(home):
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    svc.scaling.get("t").run_target = 3
+    svc.scaling.get("t").mode = "steady"
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.RUNNING
+    svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
+    st = svc.db.get_task_state("t")
+    assert st["run_target"] == 0 and st["mode"] == "explore"  # 收缩已持久化
+
+
+# ---------- P1-3 回执仅 received 才算 ack ----------
+
+def test_consume_receipts_ignores_conflict_and_invalid(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCHED_TASK_ID", "t")
+    monkeypatch.setenv("SCHED_WORKSPACE", str(tmp_path))
+    from sched_task_sdk.producer import Producer, job_id_of
+    p = Producer()
+    p.advance(1, [{"event_id": "e1", "business_version": "v1"},
+                  {"event_id": "e2", "business_version": "v1"}])
+    assert len(p._state["unacked"]) == 2
+    rd = tmp_path / "receipts"
+    rd.mkdir()
+    j1 = job_id_of("t", "e1", "v1")
+    j2 = job_id_of("t", "e2", "v1")
+    (rd / f"{j1}.json").write_text(json.dumps(
+        {"job_id": j1, "status": "received"}))
+    (rd / f"{j2}.json").write_text(json.dumps(
+        {"job_id": j2, "status": "conflict", "reason": "内容冲突"}))
+    assert p.consume_receipts() == 1
+    assert j1 not in p._state["unacked"]   # 正常确认 → 清理
+    assert j1 not in p._state["conflicted"]
+    # C1：conflict 回执 → 移入 conflicted 隔离桶，停止无意义重发，留待人工处理
+    assert j2 not in p._state["unacked"]
+    assert j2 in p._state["conflicted"]
+    disk = json.loads((tmp_path / "producer_state" / "state.json").read_text("utf-8"))
+    assert j2 not in disk["unacked"] and j2 in disk["conflicted"]
+
+
+# ---------- P1-4 advance 先持久化再推进内存 ----------
+
+def test_advance_failure_keeps_memory_cursor(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCHED_TASK_ID", "t")
+    monkeypatch.setenv("SCHED_WORKSPACE", str(tmp_path))
+    import sched_task_sdk.producer as pp
+    from sched_task_sdk.producer import job_id_of
+    p = pp.Producer()
+    p.advance(5, [{"event_id": "e1", "business_version": "v1"}])
+    assert p.cursor == 5
+
+    def boom(path, obj):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pp, "_atomic_write_json", boom)
+    with_error = False
+    try:
+        p.advance(10, [{"event_id": "e2", "business_version": "v1"}])
+    except OSError:
+        with_error = True
+    assert with_error
+    # 持久化失败：内存与磁盘都停留在旧游标，e2 未被跳过
+    assert p.cursor == 5
+    assert job_id_of("t", "e2", "v1") not in p._state["unacked"]
+    disk = json.loads((tmp_path / "producer_state" / "state.json").read_text("utf-8"))
+    assert disk["cursor"] == 5
+    assert job_id_of("t", "e2", "v1") not in disk["unacked"]
+
+
+def test_advance_failure_then_retry_succeeds(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCHED_TASK_ID", "t")
+    monkeypatch.setenv("SCHED_WORKSPACE", str(tmp_path))
+    import sched_task_sdk.producer as pp
+    orig_write = pp._atomic_write_json
+    p = pp.Producer()
+    p.advance(5, [{"event_id": "e1", "business_version": "v1"}])
+    monkeypatch.setattr(pp, "_atomic_write_json",
+                        lambda path, obj: (_ for _ in ()).throw(OSError("x")))
+    try:
+        p.advance(10, [{"event_id": "e2", "business_version": "v1"}])
+    except OSError:
+        pass
+    monkeypatch.setattr(pp, "_atomic_write_json", orig_write)
+    # 故障恢复后同轮结果可再次提交，不丢 e2
+    p.advance(10, [{"event_id": "e2", "business_version": "v1"}])
+    assert p.cursor == 10
+    assert len(p._state["unacked"]) == 2
+
+
+# ---------- P1-5 心跳过期恢复冷却 + 暂停原因保留 ----------
+
+def test_tick_release_heartbeat_cooldown(home):
+    svc = _svc(home)
+    _mk_job(svc.db, "jH")
+    _mk_job(svc.db, "jN")
+    hb_reason = "心跳过期，疑似卡住；协作暂停，断点已保存"
+    svc.db.set_job_status("jH", JobStatus.PAUSED, hb_reason, ts=runner.now_iso())
+    svc.db.set_job_status("jN", JobStatus.PAUSED, "高优先级保护退让；协作暂停，断点已保存",
+                          ts=runner.now_iso())
+    svc._tick_release(0.0)
+    # 普通暂停立即恢复；心跳过期暂停在冷却窗口内保持 PAUSED
+    assert svc.db.get_job("jN")["status"] == JobStatus.QUEUED
+    assert svc.db.get_job("jH")["status"] == JobStatus.PAUSED
+    # 冷却（默认 60s）过后恢复排队
+    old = (datetime.now(timezone.utc) -
+           timedelta(seconds=svc.cfg.control.heartbeat_resume_cooldown_sec + 60)
+           ).isoformat(timespec="seconds")
+    svc.db.set_job_status("jH", JobStatus.PAUSED, hb_reason, ts=old)
+    svc._tick_release(0.0)
+    assert svc.db.get_job("jH")["status"] == JobStatus.QUEUED
+
+
+def test_finalize_preserves_pause_initiator_reason(home):
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.PAUSING
+    meta.pause_command = {"reason": "心跳过期，疑似卡住"}
+    svc._finalize(_FakeAttempt(returncode=0), meta, runner.now_iso())
+    job = svc.db.get_job("j1")
+    assert job["status"] == JobStatus.PAUSED
+    assert "心跳过期" in job["reason"] and "断点已保存" in job["reason"]
+
+
+# ---------- P2-7 事件归属字段 ----------
+
+def test_event_writer_includes_job_and_attempt(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCHED_EVENT_FILE", str(tmp_path / "ev.jsonl"))
+    monkeypatch.setenv("SCHED_JOB_ID", "job-7")
+    monkeypatch.setenv("SCHED_ATTEMPT_ID", "att-7")
+    from sched_task_sdk.events import EventWriter, EventKind
+    w = EventWriter()
+    w.emit(EventKind.HEARTBEAT)
+    obj = json.loads((tmp_path / "ev.jsonl").read_text("utf-8").splitlines()[0])
+    assert obj["job_id"] == "job-7" and obj["attempt_id"] == "att-7"
+    assert obj["kind"] == EventKind.HEARTBEAT
+
+
+# ---------- P2-8 归档对账 ----------
+
+def test_reconcile_archive_detects_mismatch(home, caplog):
+    import logging
+    svc = _svc(home)
+    _write_task(home, "t")
+    svc.refresh_specs()
+    _mk_job(svc.db, "j1", task_id="t")
+    arch = home / "runtime" / "archive" / "t"
+    arch.mkdir(parents=True)
+    (arch / "j1.json").write_text("{}")
+    with caplog.at_level(logging.WARNING, logger="sched.scheduler"):
+        svc._reconcile_archive()  # 窗口内作业均有归档 → 无告警
+        assert not any("archive reconciliation" in r.message for r in caplog.records)
+        # C1：单向窗口对账（库→文件）——孤儿文件（文件有库无）不再告警，
+        # 归档是接收最后一步，不存在"库无而文件在"的遗漏证据形态
+        (arch / "ghost.json").write_text("{}")
+        svc._reconcile_archive()
+        assert not any("archive reconciliation" in r.message for r in caplog.records)
+        # 窗口内作业的归档文件缺失 → 告警
+        (arch / "j1.json").unlink()
+        svc._reconcile_archive()
+        assert any("archive reconciliation" in r.message for r in caplog.records)
+
+
+# ---------- P2-9 变慢退让放回间隔加倍 ----------
+
+def test_slow_cause_release_interval_doubled(home):
+    svc = _svc(home)
+    p = svc.protect
+    assert p.start_round("A", 50, 0.0, reason="r", cause="slow")
+    p.note_yielded("att1", "B", 10)
+    p.end_round(10.0, success=True)
+    t = 100.0
+    assert p.release_ready(t) == "B"
+    assert p.st.next_release_mono == t + 2 * svc.cfg.control.recovery_probe_sec
+
+
+def test_shortage_cause_release_interval_normal(home):
+    svc = _svc(home)
+    p = svc.protect
+    assert p.start_round("A", 50, 0.0, reason="r", cause="shortage")
+    p.note_yielded("att1", "B", 10)
+    p.end_round(10.0, success=True)
+    t = 100.0
+    assert p.release_ready(t) == "B"
+    assert p.st.next_release_mono == t + svc.cfg.control.recovery_probe_sec
+
+
+# ---------- P2-10 PAUSING 非 0/75 退出保守归因 ----------
+
+def test_decide_outcome_pausing_crash_is_conservative():
+    from sched.runner import decide_outcome
+    o = decide_outcome(JobStatus.PAUSING, 1, False, False)
+    assert o.status == JobStatus.PAUSED
+    assert "断点可能未保存" in o.reason
+    o0 = decide_outcome(JobStatus.PAUSING, 0, False, False)
+    assert o0.status == JobStatus.PAUSED and o0.reason == "协作暂停，断点已保存"
+    o75 = decide_outcome(JobStatus.PAUSING, 75, False, False)
+    assert o75.status == JobStatus.BACKOFF
+
+
+# ---------- P2-16 切换保护对象不丢退让账 ----------
+
+def test_start_round_switch_merges_yielded_into_pending_resume(home):
+    svc = _svc(home)
+    p = svc.protect
+    assert p.start_round("A", 50, 0.0, reason="r", cause="shortage")
+    p.note_yielded("att1", "B", 10)
+    # 更高优先级 C 到达 → 切换保护对象，B 的退让账进待放回队列而非被清空
+    assert p.start_round("C", 60, 5.0, reason="r2", cause="shortage")
+    assert "B" in p.st.pending_resume and not p.st.yielded_tasks
+    p.note_yielded("att2", "D", 20)
+    p.end_round(10.0)
+    assert set(p.st.pending_resume) == {"B", "D"}
+
+
+# ---------- P2-17 主循环内非阻塞终止状态机 ----------
+
+class _FakeCgrp:
+    available = False
+
+    def kill_all(self):
+        pass
+
+    def procs(self):
+        return []
+
+    def remove(self):
+        pass
+
+
+def _stuck_attempt(home, attempt_id, job_id):
+    """真实 AttemptRun 包一个忽略 SIGTERM 的真实子进程（模拟卡死 worker）。"""
+    proc = subprocess.Popen(
+        ["python3", "-c",
+         "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "print('ready', flush=True); time.sleep(300)"],
+        start_new_session=True, stdout=subprocess.PIPE)
+    proc.stdout.readline()  # 等 handler 安装完成，避免 TERM 打在 exec 窗口上
+    import types
+    spec = types.SimpleNamespace(
+        attempt_id=attempt_id, job_id=job_id, task_id="t", token="tok",
+        task_root=home / "tasks" / "t", executor_entry=None, entry_args=[],
+        workdir=".", env={}, progress_semver="1.0.0")
+    run_dir = config.run_dir(attempt_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return runner.AttemptRun(spec, proc, run_dir, _FakeCgrp(), [])
+
+
+def test_terminate_state_machine_phases(home):
+    a = _stuck_attempt(home, "att-sm", "j-sm")
+    try:
+        assert a.begin_terminate(100.0, 60.0) is True    # 首次发 TERM（进程忽略）
+        assert a.begin_terminate(120.0, 5.0) is False    # 幂等：不重发、不改截止
+        assert a.poll_terminate(159.9) == "waiting"
+        assert a.is_alive()
+        assert a.poll_terminate(160.0) == "killed"       # 到期升级 SIGKILL（只发一次）
+        assert a.poll_terminate(164.9) == "killed"
+        assert a.poll_terminate(165.1) == "gone"         # KILL 后超 KILL_WAIT_SEC 兜底
+        for _ in range(40):                              # 真实进程被杀，等收尸
+            if not a.is_alive():
+                break
+            time.sleep(0.05)
+        assert not a.is_alive()
+        assert a.proc.returncode == -signal.SIGKILL
+    finally:
+        try:
+            os.killpg(a.pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            a.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def test_pausing_grace_exceeded_nonblocking(home):
+    svc = _svc(home)
+    _write_task(home, "t")
+    _mk_job(svc.db, "j-stuck")
+    svc.db.create_attempt("att-ps", "j-stuck", 1, "tok", "t")
+    a = _stuck_attempt(home, "att-ps", "j-stuck")
+    meta = AttMeta("att-ps", "j-stuck", "t", 50, "tok")
+    meta.status = JobStatus.PAUSING
+    meta.pause_deadline_mono = 100.0
+    svc.attempts["att-ps"] = a
+    svc.meta["att-ps"] = meta
+
+    # 第一轮：宽限超时 → 发 TERM（被忽略）→ 不阻塞、不收尾
+    t0 = time.monotonic()
+    svc._tick_attempts(100.5)
+    assert time.monotonic() - t0 < 2.0            # 未发生 grace 秒级同步等待
+    assert "att-ps" in svc.attempts               # 进程未退出，保持监护
+
+    # 后续轮：到期升级 KILL → 进程退出 → 收尾为 PAUSED（断点可能未保存）
+    for t in (161.0, 161.5, 162.0, 163.0, 165.0, 166.0):
+        if "att-ps" not in svc.attempts:
+            break
+        time.sleep(0.05)
+        svc._tick_attempts(t)
+    assert "att-ps" not in svc.attempts
+    assert svc.db.get_job("j-stuck")["status"] == JobStatus.PAUSED
+    assert svc.db.get_attempt("att-ps")["exit_code"] == -signal.SIGKILL
+    lines = (home / "runtime" / "status.jsonl").read_text("utf-8").splitlines()
+    assert any('"pause_grace_exceeded"' in ln for ln in lines)
+
+
+def test_finalize_dstate_gone_does_not_block_or_raise(home):
+    svc = _svc(home)
+    _write_task(home, "t")
+    _mk_job(svc.db, "j-d")
+    svc.db.create_attempt("att-d", "j-d", 1, "tok", "t")
+
+    class _DStateProc:
+        pid = 99999
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="d", timeout=timeout)
+
+    class _DStateAttempt(_FakeAttempt):
+        def __init__(self):
+            super().__init__(None)
+            self.proc = _DStateProc()
+
+        def is_alive(self):
+            return True
+
+        def begin_terminate(self, now_mono, grace_sec):
+            return True
+
+        def poll_terminate(self, now_mono):
+            return "gone"
+
+    a = _DStateAttempt()
+    meta = AttMeta("att-d", "j-d", "t", 50, "tok")
+    meta.status = JobStatus.PAUSING
+    meta.pause_deadline_mono = 50.0
+    svc.attempts["att-d"] = a
+    svc.meta["att-d"] = meta
+    # D 态：KILL 后仍不退出 → _ensure_tree_gone 有界等满 2s 杀窗后放行
+    # （B6 设计语义），按未知退出码收尾，不抛 TimeoutExpired、不无限阻塞
+    t0 = time.monotonic()
+    svc._tick_attempts(200.0)
+    assert time.monotonic() - t0 < 4.0
+    assert "att-d" not in svc.attempts
+    assert svc.db.get_job("j-d")["status"] == JobStatus.PAUSED
+    assert svc.db.get_attempt("att-d")["exit_code"] is None

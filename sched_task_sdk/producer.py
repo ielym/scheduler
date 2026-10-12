@@ -82,6 +82,11 @@ def _atomic_write_json(path: Path, obj: Any) -> None:
         raise
 
 
+# 公共导出：业务生产者（如按日期落 JSON 记录）复用同一原子写实现（C4），
+# 杜绝半写文件被调度器当成就绪请求解析。
+atomic_write_json = _atomic_write_json
+
+
 def _fsync_dir(d: Path) -> None:
     try:
         fd = os.open(str(d), os.O_RDONLY)
@@ -108,10 +113,11 @@ class Producer:
                 obj = json.loads(p.read_text("utf-8"))
                 if isinstance(obj, dict):
                     return {"cursor": obj.get("cursor"),
-                            "unacked": obj.get("unacked") or {}}
+                            "unacked": obj.get("unacked") or {},
+                            "conflicted": obj.get("conflicted") or {}}
             except (json.JSONDecodeError, OSError):
                 pass
-        return {"cursor": None, "unacked": {}}
+        return {"cursor": None, "unacked": {}, "conflicted": {}}
 
     def _save(self) -> None:
         with self._lock:
@@ -124,19 +130,27 @@ class Producer:
 
     def advance(self, new_cursor: Any, jobs: list[dict]) -> None:
         """持久化游标与待发布记录（同一原子写）。jobs 每项含 event_id/business_version 与
-        正式的就绪 JSON 载荷字段。"""
+        正式的就绪 JSON 载荷字段。
+
+        先构造新状态并落盘，成功后才替换内存游标：持久化失败时内存与磁盘都停留在
+        旧游标，下轮从旧位置重扫，事件不丢失（游标先推进会把未发布记录永久跳过）。
+        """
         with self._lock:
             task_id = _task_id()
+            new_state = {"cursor": self._state["cursor"],
+                         "unacked": dict(self._state["unacked"]),
+                         "conflicted": dict(self._state.get("conflicted") or {})}
             for j in jobs:
                 event_id = str(j.get("event_id") or "")
                 business_version = str(j.get("business_version") or "")
                 job_id = j.get("job_id") or job_id_of(task_id, event_id, business_version)
-                self._state["unacked"][job_id] = self._ready_payload(job_id, j)
-            self._state["cursor"] = new_cursor
-        self._save()
+                new_state["unacked"][job_id] = self._ready_payload(job_id, j)
+            new_state["cursor"] = new_cursor
+            _atomic_write_json(_state_file(), new_state)
+            self._state = new_state
 
     def _ready_payload(self, job_id: str, spec: dict) -> dict:
-        return {
+        payload = {
             "schema_version": 1,
             "job_id": job_id,
             "task_id": _task_id(),
@@ -147,6 +161,11 @@ class Producer:
             "progress_semver": spec.get("progress_semver") or "1.0.0",
             "env": dict(spec.get("env") or {}),
         }
+        # 作业级优先级（可选，覆盖任务默认值）
+        pri = spec.get("priority")
+        if pri is not None:
+            payload["priority"] = int(pri)
+        return payload
 
     # ---------- 发布 ----------
     def publish_all(self) -> list[str]:
@@ -185,27 +204,71 @@ class Producer:
 
     # ---------- 接收确认 ----------
     def consume_receipts(self) -> int:
-        """扫描 receipts/ 下的回执，把已确认作业从 unacked 移除。"""
+        """扫描 receipts/ 下的回执，按状态处理未确认作业。
+
+        - received：接收方明确确认 → 从 unacked 移除（同时清掉 conflicted 隔离账）；
+        - conflict / invalid：请求被隔离（内容冲突/非法载荷）→ 从 unacked 移入
+          conflicted 桶并大声告警（C1：此前按"未确认"永远重放，隔离事实上失效、
+          冲突文件每轮重发刷屏；现在隔离可见、不再重复发布，留待人工处理）。
+
+        C1：回执是一次性确认凭证——处理账目成功落盘（_save）后删除回执文件；
+        不在 unacked 中的孤儿回执（重复确认/账目已迁移）同样删除，防止回执
+        目录无限累积拖慢每轮 O(N) 扫描。_save 失败时异常冒泡、回执保留，
+        下轮重试（不丢确认）。删除失败忽略，下轮重试。
+        """
         rd = _receipts_dir()
-        acked = []
+        acked: list[str] = []
+        conflicts: list[tuple[str, str]] = []
+        files: list[Path] = []
         if rd.is_dir():
             for p in rd.glob("*.json"):
+                files.append(p)
                 try:
                     obj = json.loads(p.read_text("utf-8"))
                 except (json.JSONDecodeError, OSError):
                     continue
-                if isinstance(obj, dict) and obj.get("job_id"):
-                    acked.append(obj["job_id"])
-        if not acked:
+                if not (isinstance(obj, dict) and obj.get("job_id")):
+                    continue
+                status = str(obj.get("status") or "")
+                if status == "received":
+                    acked.append(str(obj["job_id"]))
+                elif status in ("conflict", "invalid"):
+                    conflicts.append((str(obj["job_id"]), status))
+        if not files:
             return 0
         with self._lock:
             removed = 0
-            for job_id in acked:
-                if job_id in self._state["unacked"]:
-                    del self._state["unacked"][job_id]
-                    removed += 1
-        if removed:
-            self._save()
+            changed = False
+            # 先备份再变更：_save 落盘失败时回滚内存账目，保证"下轮重试"仍能
+            # 检测到变更并重新落盘（否则内存已改、重试轮 changed=False 会直接
+            # 删回执，确认在重启前永远到不了磁盘）
+            backup = (dict(self._state["unacked"]), dict(self._state["conflicted"]))
+            try:
+                for job_id in acked:
+                    if job_id in self._state["unacked"]:
+                        del self._state["unacked"][job_id]
+                        removed += 1
+                        changed = True
+                    if self._state["conflicted"].pop(job_id, None) is not None:
+                        changed = True
+                for job_id, status in conflicts:
+                    payload = self._state["unacked"].pop(job_id, None)
+                    if payload is not None:
+                        self._state["conflicted"][job_id] = payload
+                        changed = True
+                        print(f"[producer] 回执 {status}：作业 {job_id} 已被接收方隔离"
+                              f"（内容冲突/非法载荷），停止重发，等待人工处理", flush=True)
+                if changed:
+                    self._save()  # 账目先落盘；失败异常冒泡，本轮不删回执
+            except BaseException:
+                self._state["unacked"], self._state["conflicted"] = backup
+                raise
+        # 账目已持久化（或无需变更）→ 删除本轮全部回执（孤儿/损坏的一并清理）
+        for p in files:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         return removed
 
     # ---------- 子类实现 ----------
@@ -213,27 +276,67 @@ class Producer:
         raise NotImplementedError
 
 
+def _acquire_instance_lock():
+    """任务级单实例锁：生产者进程自身持有 flock（设计文档第三节）。
+
+    锁被其他存活进程持有时返回 None（已有生产者实例）；正常持锁返回 fd，
+    进程退出时由 OS 自动释放，供新调度器/新生产者接管。
+    """
+    import fcntl
+    p = _state_dir() / "producer.lock"
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        os.ftruncate(fd, 0)
+        start_time = os.stat(f"/proc/{os.getpid()}").st_ctime
+        os.write(fd, f"{os.getpid()} {start_time}".encode())
+    except OSError:
+        pass
+    return fd
+
+
 def run_producer(producer: Producer, tick_sec: float = 60.0, replay_only: bool = False) -> int:
-    """生产者主循环：重放未确认 → 循环发现/发布/消费回执。"""
+    """生产者主循环：任务级单实例锁 → 重放未确认 → 循环发现/发布/消费回执。"""
+    import fcntl
     import time
 
-    producer.publish_all()
-    while True:
+    lock_fd = _acquire_instance_lock()
+    if lock_fd is None:
+        print("[producer] 任务级单实例锁被持有，已有生产者实例在运行，退出", flush=True)
+        return 0
+    try:
+        producer.publish_all()
+        while True:
+            try:
+                producer.consume_receipts()
+                cursor = producer.cursor
+                new_cursor, jobs = producer.discover(cursor)
+                if jobs or new_cursor != cursor:
+                    # 空事件轮次游标前进同样要持久化，否则每轮重扫
+                    producer.advance(new_cursor, jobs)
+                published = producer.publish_all()
+                if published:
+                    print(f"[producer] published {len(published)} jobs", flush=True)
+            except Exception as e:  # noqa: BLE001  生产者不因单轮异常退出
+                print(f"[producer] 轮询异常：{type(e).__name__}: {e}", flush=True)
+            if replay_only:
+                break
+            time.sleep(tick_sec)
+        return 0
+    finally:
         try:
-            producer.consume_receipts()
-            cursor = producer.cursor
-            new_cursor, jobs = producer.discover(cursor)
-            if jobs:
-                producer.advance(new_cursor, jobs)
-            published = producer.publish_all()
-            if published:
-                print(f"[producer] published {len(published)} jobs", flush=True)
-        except Exception as e:  # noqa: BLE001  生产者不因单轮异常退出
-            print(f"[producer] 轮询异常：{type(e).__name__}: {e}", flush=True)
-        if replay_only:
-            break
-        time.sleep(tick_sec)
-    return 0
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
-__all__ = ["Producer", "ProducerError", "job_id_of", "run_producer"]
+__all__ = ["Producer", "ProducerError", "job_id_of", "run_producer",
+           "atomic_write_json"]

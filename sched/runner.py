@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +67,12 @@ class AttemptRun:
         self.started_at = now_iso()
         self._pause: dict | None = None
         self._terminating = threading.Event()
+        # 非阻塞终止状态机：TERM 已发出（记录升级 KILL 的截止）与 KILL 是否已发出
+        self._kill_at_mono: float | None = None
+        self._kill_sent = False
+        # events.jsonl 增量读游标：已消费到的字节偏移与最大 seq（避免每轮全量重读）
+        self._read_offset = 0
+        self._read_seq = 0
 
     @property
     def event_file(self) -> Path:
@@ -83,43 +89,57 @@ class AttemptRun:
     def is_alive(self) -> bool:
         if self.proc.poll() is not None:
             return False
-        return _pid_alive(self.pid)
-
-    def alive_procs(self) -> list[int]:
-        procs = self.cgrp.procs()
-        return procs if procs else ([self.pid] if self.is_alive() else [])
+        return _pid_alive(self.pid, self.start_time)
 
     # ---- 事件 ----
     def read_events(self, after_seq: int = 0) -> list[dict]:
-        """读 events.jsonl 中 seq > after_seq 的事件。"""
-        out = []
-        if not self.event_file.exists():
-            return out
-        try:
-            with open(self.event_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(obj, dict) and int(obj.get("seq") or 0) > after_seq:
-                        out.append(obj)
-        except OSError:
-            pass
-        return out
+        """增量读 events.jsonl 中 seq > after_seq 的事件。
 
-    def read_checkpoint(self) -> dict | None:
-        p = self.checkpoint_file
-        if not p.exists():
-            return None
+        记忆上次读取的字节偏移与最大 seq，本轮只读新增尾部；文件被轮转/截断
+        （size < 偏移）时重置游标从头读，保证不漏。尾部不完整的半行不推进
+        偏移，下轮重读。
+        """
+        out: list[dict] = []
+        p = self.event_file
         try:
-            obj = json.loads(p.read_text("utf-8"))
-            return obj if isinstance(obj, dict) else None
-        except (json.JSONDecodeError, OSError):
-            return None
+            size = p.stat().st_size
+        except OSError:
+            self._read_offset = 0
+            self._read_seq = 0
+            return out
+        if size < self._read_offset:
+            # 轮转/截断 → 重置增量游标
+            self._read_offset = 0
+            self._read_seq = 0
+        start = self._read_offset if self._read_seq >= after_seq else 0
+        try:
+            with open(p, "rb") as f:
+                f.seek(start)
+                data = f.read()
+        except OSError:
+            return out
+        if not data:
+            return out
+        offset = start
+        parts = data.split(b"\n")
+        for raw in parts[:-1]:  # 最后一段可能是半行，不消费
+            offset += len(raw) + 1
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            seq = int(obj.get("seq") or 0)
+            if seq > self._read_seq:
+                self._read_seq = seq
+            if seq > after_seq:
+                out.append(obj)
+        self._read_offset = offset
+        return out
 
     # ---- 控制 ----
     def write_pause(self, command_id: str, reason: str, deadline: str) -> None:
@@ -127,6 +147,17 @@ class AttemptRun:
                        "job_id": self.spec.job_id, "attempt_id": self.spec.attempt_id,
                        "token": self.spec.token, "reason": reason, "deadline": deadline}
         _atomic_write(self.control_file, self._pause)
+
+    def write_permit(self) -> None:
+        """写入启动许可（设计第十三节）：调度器确认 STARTED/RUNNING 后授予，
+        worker 在许可确认前不进行业务副作用。"""
+        _atomic_write(self.run_dir / "permit.json", {
+            "action": "permit",
+            "job_id": self.spec.job_id,
+            "attempt_id": self.spec.attempt_id,
+            "token": self.spec.token,
+            "granted_at": now_iso(),
+        })
 
     @property
     def pause_command(self) -> dict | None:
@@ -140,7 +171,10 @@ class AttemptRun:
             pass
 
     def terminate(self, grace_sec: float) -> int | None:
-        """整棵进程树 SIGTERM → 等 grace → SIGKILL。返回退出码。"""
+        """整棵进程树 SIGTERM → 等 grace → SIGKILL → cgroup.kill 兜底（防 setsid 漏杀）。
+
+        仅用于停机/启动恢复等一次性路径；主循环内请用 begin_terminate/poll_terminate
+        非阻塞状态机——同步等待会冻结整个控制平面（快照/命令/心跳/准入）。"""
         self._terminating.set()
         try:
             os.killpg(self.pgid, signal.SIGTERM)
@@ -155,11 +189,61 @@ class AttemptRun:
             os.killpg(self.pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+        if self.cgrp.available:
+            try:
+                self.cgrp.kill_all()  # cgroup v2 无差别终止，覆盖自行 setsid 的后代
+            except OSError:
+                pass
+            for _ in range(4):
+                if not self.cgrp.procs():
+                    break
+                time.sleep(0.1)
         try:
             self.proc.wait(timeout=KILL_WAIT_SEC)
         except subprocess.TimeoutExpired:
             pass
         return self.proc.returncode
+
+    # ---- 非阻塞终止状态机（主循环内使用） ----
+    def begin_terminate(self, now_mono: float, grace_sec: float) -> bool:
+        """第一阶段：发 SIGTERM 并记录升级 KILL 的截止时刻，不等待。
+
+        幂等：重复调用不重发信号、不改动截止时刻。返回是否本次首次发出。"""
+        if self._kill_at_mono is not None:
+            return False
+        self._terminating.set()
+        self._kill_at_mono = now_mono + max(0.0, float(grace_sec))
+        try:
+            os.killpg(self.pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        return True
+
+    def poll_terminate(self, now_mono: float) -> str:
+        """按时刻推进终止状态机（不阻塞）：
+        - waiting：TERM 已发，等宽限到期或进程自行退出；
+        - killed：宽限已到，已升级 SIGKILL + cgroup.kill（含刚升级的这一次）；
+        - gone：KILL 后仍存活超过 KILL_WAIT_SEC（不可中断 D 态兜底），
+          调用方应按未知退出码直接收尾，不再等待。"""
+        if self._kill_at_mono is None:
+            return "waiting"
+        if now_mono < self._kill_at_mono:
+            return "waiting"
+        if not self._kill_sent:
+            self._kill_sent = True
+            try:
+                os.killpg(self.pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            if self.cgrp.available:
+                try:
+                    self.cgrp.kill_all()
+                except OSError:
+                    pass
+            return "killed"
+        if now_mono >= self._kill_at_mono + KILL_WAIT_SEC:
+            return "gone"
+        return "killed"
 
     def cleanup(self) -> None:
         self.cgrp.remove()
@@ -190,7 +274,16 @@ def _proc_start_time(pid: int) -> float:
         return 0.0
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid: int, start_time: float | None = None) -> bool:
+    """PID + 进程启动时间联合身份核实（防 PID 复用误判，设计文档第十三节）。"""
+    if not pid:
+        return False
+    try:
+        st = os.stat(f"/proc/{pid}")
+        if start_time and start_time != st.st_ctime:
+            return False
+    except OSError:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -200,8 +293,68 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def pid_alive_with_start(pid: int, start_time: float) -> bool:
+    """对外暴露的身份核实（重启接管/直连取消使用）。"""
+    return _pid_alive(pid, start_time)
+
+
+_ZOMBIE_STATES = frozenset("ZxX")
+
+
+def proc_never_runs_again(pid: int) -> bool:
+    """进程是否已不可能再执行代码（退出中/僵尸/不存在）。
+
+    整树退出核实用它过滤 cgroup.procs 里的残留 pid：僵尸进程不消耗 CPU、
+    不写任何资源、信号杀不掉，等待它被父进程/init 收割不应阻塞 finalize；
+    cgroup 不可用降级为静态文件时（写入即不再更新）同理。
+    """
+    try:
+        data = open(f"/proc/{pid}/stat", "rb").read()
+    except OSError:
+        return True
+    try:
+        # stat 第 3 字段是状态字符，位于最后一个 ')' 之后（进程名可含括号）
+        state = data.rsplit(b")", 1)[1].split()[0][:1]
+        return state in _ZOMBIE_STATES
+    except (IndexError, ValueError):
+        return False
+
+
+def terminate_external(pid: int, pgid: int, pid_start_time: float,
+                       grace_sec: float, cgroup: str = "") -> int | None:
+    """终止不由当前进程管理的执行进程树（重启恢复 / serve 不在时的直连取消）。
+
+    A1：setsid 的孙进程脱离进程组，killpg 杀不到；cgroup 可用时以其
+    cgroup.kill 无差别终止整树（覆盖漏网后代，设计第七节"确认整个执行
+    进程树退出"），不可用时回退 killpg。
+    """
+    if not pid_alive_with_start(pid, pid_start_time):
+        return None
+    try:
+        os.killpg(pgid or pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    deadline = time.monotonic() + max(0.5, grace_sec)
+    while time.monotonic() < deadline:
+        if not pid_alive_with_start(pid, pid_start_time):
+            return 0
+        time.sleep(0.1)
+    try:
+        os.killpg(pgid or pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    if cgroup:
+        try:
+            cg.Cgroup(cgroup).kill_all()
+        except Exception:
+            pass
+    time.sleep(0.3)
+    return 0 if not pid_alive_with_start(pid, pid_start_time) else -1
+
+
 def now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    """统一 UTC 时间戳（带 tz 后缀，可与任意本地时区时间正确比较）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def build_argv(task_root: Path, entry: config.EntrySpec, entry_args: list[str]) -> list[str]:
@@ -228,6 +381,7 @@ def build_env(spec: AttemptSpec, input_refs: list[str]) -> dict[str, str]:
         "SCHED_EVENT_FILE": str(config.run_dir(spec.attempt_id) / "events.jsonl"),
         "SCHED_CONTROL_FILE": str(config.run_dir(spec.attempt_id) / "control.json"),
         "SCHED_CHECKPOINT_FILE": str(config.run_dir(spec.attempt_id) / "checkpoint.json"),
+        "SCHED_PERMIT_FILE": str(config.run_dir(spec.attempt_id) / "permit.json"),
         "SCHED_WORKSPACE": str(spec.task_root),
         "SCHED_PROGRESS_SEMVER": spec.progress_semver,
     })
@@ -241,7 +395,13 @@ def launch(spec: AttemptSpec, input_refs: list[str] | None = None) -> AttemptRun
     run_dir = config.run_dir(spec.attempt_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     input_refs = input_refs or []
-    workdir = spec.task_root if spec.workdir in (".", "") else (spec.task_root / spec.workdir)
+    # 工作目录：task.json 的 entry.cwd 为基，就绪请求的 workdir 相对它解析
+    # （两者均默认 "."，与既有行为一致；路径合法性已在 parse_task/parse_ready 校验）
+    base = spec.task_root
+    entry_cwd = getattr(spec.executor_entry, "cwd", ".") or "."
+    if entry_cwd not in (".", ""):
+        base = spec.task_root / entry_cwd
+    workdir = base if spec.workdir in (".", "") else (base / spec.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
     cgrp = cg.new_cgroup(f"{spec.task_id}/{spec.attempt_id}")
@@ -253,8 +413,10 @@ def launch(spec: AttemptSpec, input_refs: list[str] | None = None) -> AttemptRun
         cwd=str(workdir),
         env=env,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # 设计第六节：原始标准输出/标准错误默认不自动归档，故不接 PIPE（无 drain 会写满
+        # 64KB 管道缓冲导致子进程永久阻塞）；业务需要保存输出时应自行重定向。
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
     )
@@ -277,17 +439,36 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool,
     """把进程退出 + 事件证据归因为作业状态。
 
     status_ctx: scheduler 发起 PAUSING（协作暂停）或 CANCELLED（显式取消）。
+    归因优先级：显式控制 > 退出 0 且有持久化完成记录 > 不足（仅退出码 75）>
+    退出 0 无完成记录（待核实）> 失败。
     """
-    from .config import JobStatus
+    from .config import JobStatus, EXIT_SHORTAGE
 
     if status_ctx == JobStatus.CANCELLED:
+        if had_completed:
+            # 取消请求到达时完成记录已持久化：完成证据优先于取消意图
+            # （设计第十二节：退出 0 + 持久化完成记录 → SUCCEEDED）
+            return AttemptOutcome(JobStatus.SUCCEEDED, exit_code,
+                                  "取消请求到达前已完成并持久化完成记录", completed=True)
         return AttemptOutcome(JobStatus.CANCELLED, exit_code, "显式取消")
     if status_ctx == JobStatus.PAUSING:
-        return AttemptOutcome(JobStatus.PAUSED, exit_code, "协作暂停，断点已保存")
-    if had_shortage:
-        return AttemptOutcome(JobStatus.BACKOFF, exit_code, "统一外部不足")
+        if exit_code == EXIT_SHORTAGE:
+            # 暂停请求中以外不足退出：断点未必已保存，语义是不足而非已暂停
+            return AttemptOutcome(JobStatus.BACKOFF, exit_code,
+                                  "统一外部不足（暂停请求中退出）")
+        if exit_code == 0:
+            return AttemptOutcome(JobStatus.PAUSED, exit_code, "协作暂停，断点已保存")
+        # 非 0/75 退出（崩溃/被杀）：断点可能未保存，保守按 PAUSED 重新排队核实，
+        # 不得冒充"断点已保存"（跨 attempt 恢复依赖该语义，设计第七节）
+        code = exit_code if exit_code is not None else "未知"
+        return AttemptOutcome(JobStatus.PAUSED, exit_code,
+                              f"暂停请求中退出（码 {code}），断点可能未保存，重新排队")
     if exit_code == 0 and had_completed:
         return AttemptOutcome(JobStatus.SUCCEEDED, exit_code, "完成", completed=True)
+    # 设计第六节：只有约定退出码 75 才是"统一外部不足"。had_shortage（运行期曾报过不足
+    # 事件）不得把其它非零退出扩大为外部争用——业务逻辑错误必须归为 FAILED。
+    if exit_code == EXIT_SHORTAGE:
+        return AttemptOutcome(JobStatus.BACKOFF, exit_code, "统一外部不足")
     if exit_code == 0 and not had_completed:
         return AttemptOutcome(JobStatus.RECOVERING, exit_code, "退出 0 但无完成记录，待核实")
     return AttemptOutcome(JobStatus.FAILED, exit_code, f"业务/未知失败（退出码 {exit_code}）")

@@ -1,6 +1,7 @@
-"""文件存储唯一入口：flock 排他锁 + 原子替换写（独立复刻，不依赖现有 scheduler）。
+"""文件存储唯一入口：flock 排他锁 + 原子替换写。
 
-所有对 settings.json / jobs.json / *.jsonl / 运行时快照的读写都必须走这里。
+所有对 config.json / task.json / snapshot.json / *.jsonl（事件、状态、控制命令）
+及运行时 JSON 的读写都必须走这里。v3 的持久化状态以 SQLite（exec.db）为主。
 """
 
 from __future__ import annotations
@@ -130,11 +131,6 @@ def _atomic_write_unlocked(path: Path, text: str) -> None:
         raise
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    with file_lock(path):
-        _atomic_write_unlocked(path, text)
-
-
 def remove_jsonl(path: Path, should_remove) -> int:
     """在单次排他锁内「读 → 过滤 → 原子重写」jsonl，避免与 append_jsonl 竞争丢新行。
 
@@ -161,12 +157,3 @@ def remove_jsonl(path: Path, should_remove) -> int:
                 kept_lines.append(line)
         _atomic_write_unlocked(path, "".join(kept_lines))
     return removed
-
-
-def read_text(path: Path, default: str = "") -> str:
-    if not path.exists():
-        return default
-    try:
-        return path.read_text("utf-8")
-    except (OSError, UnicodeDecodeError):
-        return default

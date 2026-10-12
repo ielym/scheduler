@@ -1,0 +1,419 @@
+"""第三轮审计修复的专项回归。
+
+覆盖本轮新语义的直接单测（不依赖真实子进程，端到端由 test_integration.py 覆盖）：
+- 磁盘完成核实（_disk_completed / _recover / _tick_recover）：worker 已写完成事件
+  但调度器未及入库时，重启恢复确认成功而非重放；
+- receiver task_id 不匹配分支补写 invalid 回执（回执闭环）；
+- 就绪 JSON workdir 包含校验 + task_id 格式校验（防越权）；
+- cmd_task enable/disable 容错与启用前校验；
+- EntrySpec interpreter 命令名校验；
+- HealthTracker 基线按 (task_id, stage, metric_semver) 分离；
+- OOM 让级候选不高于受害者优先级（退让只向下让）；
+- 遗留行（有 pid 无 pid_start_time）恢复安全化（cgroup 归属核实）；
+- skill 模板（atomic_write_json / wait_interruptible）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = str(Path(__file__).resolve().parent.parent)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+import pytest  # noqa: E402
+
+from sched import config, db as dbmod, receiver, scaling  # noqa: E402
+from sched import __main__ as cli  # noqa: E402
+from sched.config import JobStatus, ReadyError, TaskError  # noqa: E402
+from sched.scheduler import AttMeta, SchedulerService  # noqa: E402
+
+TEMPLATES_DIR = Path("/root/.trae-cn/skills/sched/assets/templates")
+
+
+def _write_task(home, task_id, priority=50, raw_extra=None):
+    td = home / "tasks" / task_id
+    td.mkdir(parents=True, exist_ok=True)
+    (td / "producer.py").write_text("")
+    (td / "run.py").write_text("")
+    raw = {
+        "schema_version": 1, "task_id": task_id, "enabled": True,
+        "priority": priority,
+        "producer_entry": {"file": "producer.py"},
+        "executor_entry": {"file": "run.py"},
+        "recovery": {"replay": "outbox", "retain": "测试保留", "replay_note": "测试重放"},
+    }
+    if raw_extra:
+        raw.update(raw_extra)
+    from sched import store
+    store.save_json(td / "task.json", raw)
+    return td
+
+
+def _svc(home):
+    (home / "runtime").mkdir(parents=True, exist_ok=True)
+    return SchedulerService()
+
+
+def _ready(job_id, task_id="t1"):
+    return config.parse_ready({
+        "schema_version": 1, "job_id": job_id, "task_id": task_id,
+        "entry_args": [], "env": {}, "idempotency_key": job_id,
+    })
+
+
+def _write_disk_completed(home, attempt_id, job_id, seq=1, line_attempt_id=None):
+    rd = home / "runtime" / "runs" / attempt_id
+    rd.mkdir(parents=True, exist_ok=True)
+    ev = {"seq": seq, "kind": "completed", "at": "2026-10-12T00:00:00+08:00",
+          "job_id": job_id, "attempt_id": line_attempt_id or attempt_id,
+          "result": {"ok": True}}
+    with (rd / "events.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(ev) + "\n")
+
+
+# ---------- 磁盘完成核实 ----------
+class TestDiskCompleted:
+    def test_missing_file_is_false(self, home):
+        svc = _svc(home)
+        assert svc._disk_completed("att-none") is False
+
+    def test_ingests_completed_and_dedups(self, home):
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        _write_disk_completed(home, "att-1", "j-1")
+        assert svc._disk_completed("att-1") is True
+        assert db.has_event_kind("att-1", "completed")
+        # 幂等：重复核实不重复入库
+        assert svc._disk_completed("att-1") is True
+        with db._lock:
+            n = db._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        assert n == 1
+
+    def test_ignores_mismatched_attempt_line(self, home):
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        _write_disk_completed(home, "att-1", "j-1", line_attempt_id="att-OTHER")
+        assert svc._disk_completed("att-1") is False
+        assert not db.has_event_kind("att-1", "completed")
+
+    def test_recover_confirms_disk_completed_not_requeue(self, home):
+        # worker 完成并落盘、调度器崩溃未入库 → 重启恢复确认成功（不重跑）
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        db.update_attempt("att-1", pid=999999999, pgid=999999999,
+                          pid_start_time=12345.0)
+        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
+        _write_disk_completed(home, "att-1", "j-1")
+        svc._recover()
+        assert db.get_job("j-1")["status"] == JobStatus.SUCCEEDED
+        assert db.get_attempt("att-1")["status"] == JobStatus.SUCCEEDED
+
+    def test_tick_recover_confirms_disk_completed(self, home):
+        # 协作退出宽限中旧 worker 落盘完成事件 → 确认成功而非按检查点重放
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        db.update_attempt("att-1", pid=999999999, pgid=999999999,
+                          pid_start_time=12345.0)
+        db.set_job_status("j-1", JobStatus.RECOVERING, "", "now")
+        att = db.get_attempt("att-1")
+        svc._recover_wait["att-1"] = (att, 0.0)  # 宽限已过
+        _write_disk_completed(home, "att-1", "j-1")
+        svc._tick_recover(10.0)
+        assert db.get_job("j-1")["status"] == JobStatus.SUCCEEDED
+        assert "att-1" not in svc._recover_wait
+
+    def test_recover_status_uses_disk_fallback(self, home):
+        # 运行期 RECOVERING（退出 0 无入库完成记录）经磁盘核实自动确认
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        db.set_job_status("j-1", JobStatus.RECOVERING, "", "now")
+        _write_disk_completed(home, "att-1", "j-1")
+        svc._tick_recover_status()
+        assert db.get_job("j-1")["status"] == JobStatus.SUCCEEDED
+
+
+# ---------- receiver：task_id 不匹配回执 ----------
+class TestMismatchTaskIdReceipt:
+    def test_mismatched_task_id_writes_invalid_receipt(self, home, tmp_path):
+        _write_task(home, "demo")
+        out = home / "tasks" / "demo" / "outbox"
+        out.mkdir(parents=True)
+        payload = {"schema_version": 1, "job_id": "demo-x", "task_id": "other",
+                   "entry_args": [], "env": {}, "idempotency_key": "k"}
+        (out / "demo-x.json").write_text(json.dumps(payload))
+        db = dbmod.DB(tmp_path / "e.db")
+        spec = config.load_task("demo")
+        summary = receiver.receive_outbox("demo", spec, db, "now")
+        assert summary["invalid"] == 1
+        # 回执闭环：错误投递的作业也有反馈，生产者可据此处理
+        rc = home / "tasks" / "demo" / "receipts" / "demo-x.json"
+        assert rc.exists()
+        doc = json.loads(rc.read_text())
+        assert doc["status"] == "invalid"
+        assert "other" in doc["reason"]
+        # 不入库、已隔离
+        assert db.get_job("demo-x") is None
+        assert (home / "runtime" / "isolation" / "demo" / "demo-x.json").exists()
+
+
+# ---------- 就绪 JSON workdir 包含校验 ----------
+class TestReadyWorkdir:
+    def _doc(self, **over):
+        d = {"schema_version": 1, "job_id": "j1", "task_id": "t",
+             "entry_args": [], "env": {}, "idempotency_key": "k"}
+        d.update(over)
+        return d
+
+    def test_rejects_escaping_workdir(self):
+        with pytest.raises(ReadyError):
+            config.parse_ready(self._doc(workdir="../escape"))
+
+    def test_rejects_absolute_workdir(self):
+        with pytest.raises(ReadyError):
+            config.parse_ready(self._doc(workdir="/etc"))
+
+    def test_rejects_dotdot_inside(self):
+        with pytest.raises(ReadyError):
+            config.parse_ready(self._doc(workdir="a/../../x"))
+
+    def test_rejects_bad_task_id_format(self):
+        with pytest.raises(ReadyError):
+            config.parse_ready(self._doc(task_id="a/b"))
+
+    def test_accepts_nested_relative(self):
+        doc = config.parse_ready(self._doc(workdir="config/dates"))
+        assert doc.workdir == "config/dates"
+
+    def test_receiver_isolates_escaping_workdir(self, home, tmp_path):
+        _write_task(home, "demo")
+        out = home / "tasks" / "demo" / "outbox"
+        out.mkdir(parents=True)
+        payload = self._doc(job_id="demo-esc", task_id="demo",
+                            workdir="../demo")
+        (out / "demo-esc.json").write_text(json.dumps(payload))
+        db = dbmod.DB(tmp_path / "e.db")
+        spec = config.load_task("demo")
+        summary = receiver.receive_outbox("demo", spec, db, "now")
+        assert summary["invalid"] == 1
+        assert (home / "runtime" / "isolation" / "demo" / "demo-esc.json").exists()
+        assert (home / "tasks" / "demo" / "receipts" / "demo-esc.json").exists()
+        assert db.get_job("demo-esc") is None
+
+
+# ---------- cmd_task enable/disable 容错与校验 ----------
+class TestEnableDisable:
+    def _run(self, action, task_id):
+        return cli.cmd_task(argparse.Namespace(action=action, task_id=task_id))
+
+    def test_enable_rejects_corrupt_json_untouched(self, home):
+        td = _write_task(home, "demo")
+        (td / "task.json").write_text("{not json", encoding="utf-8")
+        assert self._run("enable", "demo") == 2
+        assert (td / "task.json").read_text(encoding="utf-8") == "{not json"
+
+    def test_enable_rejects_non_dict(self, home):
+        td = _write_task(home, "demo")
+        (td / "task.json").write_text("[1, 2]", encoding="utf-8")
+        assert self._run("enable", "demo") == 2
+
+    def test_enable_rejects_invalid_spec_keeps_disabled(self, home):
+        # 入口文件缺失的清单：启用被拒绝，enabled 保持 false
+        _write_task(home, "demo", raw_extra={
+            "enabled": False,
+            "executor_entry": {"file": "missing.py", "interpreter": "python3"},
+        })
+        assert self._run("enable", "demo") == 2
+        raw = json.loads((home / "tasks" / "demo" / "task.json").read_text())
+        assert raw["enabled"] is False
+
+    def test_disable_allowed_on_invalid_spec(self, home):
+        # disable 是运维出口：清单不合规也允许禁用
+        _write_task(home, "demo", raw_extra={
+            "recovery": {"replay": "outbox", "retain": "", "replay_note": ""},
+        })
+        assert self._run("disable", "demo") == 0
+        raw = json.loads((home / "tasks" / "demo" / "task.json").read_text())
+        assert raw["enabled"] is False
+
+    def test_enable_disable_roundtrip(self, home):
+        _write_task(home, "demo")
+        assert self._run("disable", "demo") == 0
+        raw = json.loads((home / "tasks" / "demo" / "task.json").read_text())
+        assert raw["enabled"] is False
+        assert self._run("enable", "demo") == 0
+        raw = json.loads((home / "tasks" / "demo" / "task.json").read_text())
+        assert raw["enabled"] is True
+
+
+# ---------- interpreter 命令名校验 ----------
+class TestInterpreterValidation:
+    @pytest.mark.parametrize("bad", [
+        "/usr/bin/python3", "./venv/bin/python", "", "python/../python3",
+    ])
+    def test_rejects_path_like(self, home, bad):
+        _write_task(home, "demo", raw_extra={
+            "producer_entry": {"file": "producer.py", "interpreter": bad},
+        })
+        with pytest.raises(TaskError):
+            config.load_task("demo")
+
+    def test_accepts_command_name(self, home):
+        _write_task(home, "demo")
+        assert config.load_task("demo").producer_entry.interpreter == "python3"
+
+
+# ---------- HealthTracker semver 基线分离 ----------
+class TestSemverBaseline:
+    def test_different_semvers_are_separate_keys(self):
+        h = scaling.HealthTracker()
+        h.record_progress("t", 0.0, 1, True, "s", 1.0, 1.0, semver="1.0.0")
+        h.record_progress("t", 10.0, 5, True, "s", 1.0, 1.0, semver="2.0.0")
+        assert set(h._samples) == {("t", "s", "1.0.0"), ("t", "s", "2.0.0")}
+
+    def test_new_semver_baseline_not_polluted_by_old(self):
+        h = scaling.HealthTracker(slow_confidence_sec=5.0)
+        # 旧口径：速率下降 + 处理耗时上升的完整变慢证据链
+        t = 0.0
+        for i, (wu, act) in enumerate(zip(
+                [0.0, 40.0, 70.0, 90.0, 100.0, 105.0],
+                [1.0, 1.0, 2.0, 3.0, 4.0, 5.0])):
+            h.record_progress("t", t, i + 1, True, "s", act, 1.0,
+                              work_units=wu, semver="1.0.0")
+            t += 2.0
+        assert h._is_slow(h._samples[("t", "s", "1.0.0")]) is True
+        # 口径切换：新基线仅 1 个样本，不因旧序列被误判变慢
+        h.record_progress("t", t, 1, True, "s", 1.0, 1.0,
+                          work_units=50.0, semver="2.0.0")
+        dq_new = h._samples[("t", "s", "2.0.0")]
+        assert len(dq_new) == 1
+        assert h._is_slow(dq_new) is False
+
+    def test_stages_summary_includes_semver(self):
+        h = scaling.HealthTracker()
+        h.record_progress("t", 0.0, 1, True, "s", 1.0, 1.0, semver="1.0.0")
+        h.record_progress("t", 1.0, 1, True, "s", 1.0, 1.0, semver="2.0.0")
+        stages = h.stages_summary("t", 2.0)
+        assert {x["semver"] for x in stages} == {"1.0.0", "2.0.0"}
+
+
+# ---------- OOM 让级候选 ----------
+class TestOOMYieldCandidate:
+    def _meta(self, svc, aid, pri, status=JobStatus.RUNNING):
+        m = AttMeta(aid, f"job-{aid}", "t", pri, "tok")
+        m.status = status
+        svc.meta[aid] = m
+        return m
+
+    def test_only_strictly_lower_priority_chosen(self, home):
+        svc = _svc(home)
+        self._meta(svc, "att-victim", 10)
+        self._meta(svc, "att-low", 5)
+        self._meta(svc, "att-high", 20)
+        self._meta(svc, "att-equal", 10)
+        assert svc._choose_oom_yield_candidate("att-victim") == "att-low"
+
+    def test_no_lower_candidate_returns_none(self, home):
+        svc = _svc(home)
+        self._meta(svc, "att-victim", 5)
+        self._meta(svc, "att-high", 20)
+        self._meta(svc, "att-equal", 5)
+        # 受害者已是最低优先级 → 无候选（回退暂停受害者自身）
+        assert svc._choose_oom_yield_candidate("att-victim") is None
+
+    def test_unknown_victim_returns_none(self, home):
+        svc = _svc(home)
+        self._meta(svc, "att-low", 5)
+        assert svc._choose_oom_yield_candidate("att-unknown") is None
+
+    def test_only_live_status_considered(self, home):
+        svc = _svc(home)
+        self._meta(svc, "att-victim", 10)
+        self._meta(svc, "att-paused", 5, status=JobStatus.PAUSED)
+        assert svc._choose_oom_yield_candidate("att-victim") is None
+
+
+# ---------- 遗留行恢复安全化 ----------
+class TestLegacyRowRecovery:
+    def test_dead_pid_legacy_requeued(self, home):
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        db.update_attempt("att-1", pid=999999999, pgid=999999999)  # 无 pid_start_time
+        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
+        svc._recover()
+        assert db.get_job("j-1")["status"] == JobStatus.QUEUED
+
+    def test_alive_pid_without_identity_blocked(self, home):
+        # pid 存活但无启动时间身份、无 cgroup 归属 → 不盲目重放，人工核实
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        db.update_attempt("att-1", pid=os.getpid(), pgid=os.getpid())
+        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
+        svc._recover()
+        assert db.get_job("j-1")["status"] == JobStatus.RECOVERY_BLOCKED
+
+    def test_alive_pid_killed_via_cgroup_then_requeued(self, home, monkeypatch):
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        db.update_attempt("att-1", pid=os.getpid(), pgid=os.getpid(),
+                          cgroup="t/att-1")
+        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
+        from sched import cgroup as cg
+        killed: list[str] = []
+        monkeypatch.setattr(cg.Cgroup, "procs", lambda self: [4321])
+        monkeypatch.setattr(cg.Cgroup, "kill_all",
+                            lambda self: killed.append(self.name))
+        svc._recover()
+        assert killed == ["t/att-1"]
+        assert db.get_job("j-1")["status"] == JobStatus.QUEUED
+
+    def test_alive_pid_with_empty_cgroup_blocked(self, home):
+        # cgroup 记录存在但里面没有进程（pid 疑似被复用）→ 不能确认归属
+        svc = _svc(home)
+        db = svc.db
+        db.upsert_job(_ready("j-1"), "h1", "now", 50)
+        db.create_attempt("att-1", "j-1", 1, "tok", "now")
+        db.update_attempt("att-1", pid=os.getpid(), pgid=os.getpid(),
+                          cgroup="t/att-empty")
+        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
+        svc._recover()
+        assert db.get_job("j-1")["status"] == JobStatus.RECOVERY_BLOCKED
+
+
+# ---------- skill 模板 ----------
+class TestTemplates:
+    @pytest.mark.skipif(not TEMPLATES_DIR.is_dir(), reason="模板目录不存在")
+    def test_producer_templates_use_atomic_write(self):
+        for name in ("01_daily_producer/producer.py",
+                     "02_batch_backfill/producer.py"):
+            src = (TEMPLATES_DIR / name).read_text(encoding="utf-8")
+            compile(src, name, "exec")  # 语法有效
+            assert "atomic_write_json(" in src, name
+            assert "write_text(json.dumps" not in src, name
+
+    @pytest.mark.skipif(not TEMPLATES_DIR.is_dir(), reason="模板目录不存在")
+    def test_longtask_template_uses_interruptible_wait(self):
+        src = (TEMPLATES_DIR / "03_longtask" / "run.py").read_text(encoding="utf-8")
+        compile(src, "03_longtask/run.py", "exec")
+        assert "wait_interruptible(" in src
+        assert "time.sleep" not in src

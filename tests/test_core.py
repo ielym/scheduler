@@ -31,6 +31,7 @@ def _write_task(home, task_id, priority=50, enabled=True):
         "producer_entry": {"file": "producer.py", "interpreter": "python3", "args": [], "cwd": "."},
         "executor_entry": {"file": "run.py", "interpreter": "python3", "args": [], "cwd": "."},
         "workdir": ".", "progress_semver": "1.0.0",
+        "recovery": {"replay": "outbox", "retain": "测试保留", "replay_note": "测试重放"},
     }))
     return td
 
@@ -80,16 +81,6 @@ def test_db_attempt_unique_live(tmp_path):
     # 第二个存活 attempt 被唯一索引禁止
     with pytest.raises(Exception):
         d.create_attempt("a2", "j1", 2, "tok2", "now")
-
-
-def test_db_recover_inflight(tmp_path):
-    d = dbmod.DB(tmp_path / "e.db")
-    ready = config.parse_ready({"schema_version": 1, "job_id": "j1", "task_id": "t"})
-    d.upsert_job(ready, "hashA", "now", 50)
-    d.create_attempt("a1", "j1", 1, "tok", "now")
-    recovered = d.recover_inflight("now2")
-    assert recovered == ["j1"]
-    assert d.get_job("j1")["status"] == config.JobStatus.RECOVERING
 
 
 # ---------- receiver ----------

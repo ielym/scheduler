@@ -28,10 +28,10 @@ python3 -c "import sched; print(sched.__version__)"   # 3.0.0
 ```json
 {
   "schema_version": 1, "task_id": "hello", "enabled": true, "priority": 50,
-  "producer_entry": { "file": "producer.py", "interpreter": "python3", "args": [], "cwd": "." },
-  "executor_entry": { "file": "run.py", "interpreter": "python3", "args": [], "cwd": "." },
+  "producer_entry": { "file": "producer.py", "interpreter": "python3", "args": [] },
+  "executor_entry": { "file": "run.py", "interpreter": "python3", "args": [] },
   "workdir": ".", "progress_semver": "1.0.0",
-  "recovery": { "replay": "outbox", "retain": "", "replay_note": "" }
+  "recovery": { "replay": "outbox", "retain": "outbox 归档保留 30 天", "replay_note": "按 idempotency_key 核对归档识别遗漏" }
 }
 ```
 
@@ -87,6 +87,9 @@ SCHED_HOME/
 └── runtime/
     ├── exec.db                      # SQLite 执行库
     ├── scheduler.lock               # 单实例 flock
+    ├── snapshot.json                # serve 每轮写入的运行时快照（CLI status 优先读取）
+    ├── commands.jsonl               # CLI → serve 控制命令通道
+    ├── commands_ack.jsonl           # serve 对控制命令的回执
     ├── archive/  isolation/         # 归档 / 异常隔离
     ├── runs/<attempt_id>/           # events.jsonl / control.json / checkpoint.json
     ├── logs/<task_id>/              # 生产者日志
@@ -97,14 +100,15 @@ SCHED_HOME/
 
 ```bash
 sched serve                         # 常驻调度循环
-sched status                        # 全局状态（生产者/动态目标/存活 attempt/队列/退让）
+sched status                        # 全局状态（生产者/动态目标/存活 attempt/队列/退让）；serve 在线显示 serve=alive
 sched list                          # 已加载任务
 sched task validate|enable|disable <id>
 sched job list [task]               # 作业清单
 sched job show <job_id>             # 作业 + attempts
-sched job cancel <job_id>           # 显式取消
+sched job cancel <job_id> [--reason r]  # 显式取消（在线走命令通道+回执，离线直连撤进程树）
+sched job requeue <job_id> [--reason r] # 显式重排：关闭在途 attempt 并重新排队（运行中拒绝）
 sched attempt list [job]            # attempt 清单
-sched attempt cancel <id>           # 显式取消
+sched attempt cancel <id> [--reason r]  # 显式取消单个 attempt
 ```
 
 **没有 `run` 子命令** —— 正式执行只能由调度器扫描 outbox 触发。
