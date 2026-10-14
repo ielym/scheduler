@@ -153,7 +153,7 @@ def test_launch_copies_checkpoint_into_new_run_dir(home, monkeypatch):
     _write_cp("att-old", 7, 42, "2026-10-12T01:00:00+00:00")
 
     monkeypatch.setattr(runner, "launch", lambda aspec, refs: _FakeAttempt())
-    job = svc.db.queued_jobs(limit=10)[0]
+    job = svc.db.jobs_in_status(JobStatus.QUEUED, limit=10)[0]
     assert svc._launch(job, _spec("t")) is True
     new_att = svc.db.list_attempts(job_id="j1", limit=1)[0]["attempt_id"]
     assert new_att != "att-old"
@@ -200,8 +200,10 @@ def test_finalize_backoff_persists_scale(home):
     meta = AttMeta("a1", "j1", "t", 50, "tok")
     meta.status = JobStatus.RUNNING
     svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
-    st = svc.db.get_task_state("t")
-    assert st["run_target"] == 0 and st["mode"] == "explore"  # 收缩已持久化
+    st = next(s for s in svc.db.all_task_states() if s["task_id"] == "t")
+    # 审查修复后语义（设计第九节 L159"先撤销近期增加"）：每次收缩只撤销
+    # 一个名额（3→2），不再一步砍到 live-1；节流窗口内重复不足只计证据
+    assert st["run_target"] == 2 and st["mode"] == "explore"  # 收缩已持久化
 
 
 # ---------- P1-3 回执仅 received 才算 ack ----------
@@ -384,12 +386,12 @@ def test_shortage_cause_release_interval_normal(home):
 
 def test_decide_outcome_pausing_crash_is_conservative():
     from sched.runner import decide_outcome
-    o = decide_outcome(JobStatus.PAUSING, 1, False, False)
+    o = decide_outcome(JobStatus.PAUSING, 1, False)
     assert o.status == JobStatus.PAUSED
     assert "断点可能未保存" in o.reason
-    o0 = decide_outcome(JobStatus.PAUSING, 0, False, False)
+    o0 = decide_outcome(JobStatus.PAUSING, 0, False)
     assert o0.status == JobStatus.PAUSED and o0.reason == "协作暂停，断点已保存"
-    o75 = decide_outcome(JobStatus.PAUSING, 75, False, False)
+    o75 = decide_outcome(JobStatus.PAUSING, 75, False)
     assert o75.status == JobStatus.BACKOFF
 
 

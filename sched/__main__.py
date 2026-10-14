@@ -1,6 +1,8 @@
 """sched CLI（新协议 v3，全新命令，不兼容旧 v2 命令）。
 
   sched serve         常驻调度循环（前台）
+  sched web           Web 控制台（默认 http://127.0.0.1:8765，只读快照+数据库，
+                      控制操作走 commands.jsonl 通道；--token 可选鉴权）
   sched status        全局状态（读 serve 快照 + 数据库；serve 不在时为数据库视图）
   sched list          已加载任务（task.json）
   sched task validate <id>      校验任务清单
@@ -27,6 +29,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 from . import config, db as dbmod, runner, scheduler as schedmod, store
 from .config import JobStatus
@@ -65,6 +68,13 @@ def _serve_alive() -> bool:
 
 
 def _fresh_snapshot() -> dict | None:
+    """读取 serve 快照并校验新鲜度（双时钟，防重启后误报 serve=alive）。
+
+    单调时钟只在同一次开机内可比：系统重启后 monotonic 归零，旧快照的差值
+    为大负数、永不过阈值，`sched status` 会一直显示重启前的 serve=alive。
+    故同时校验墙钟 ts——serve 每 loop_tick 秒写快照，ts 超过 SNAPSHOT_FRESH_SEC
+    即为陈旧或来自上一次开机（设计第十四节：时钟跳变保守核实）。
+    """
     snap = store.load_json(config.snapshot_file(), default=None)
     if not isinstance(snap, dict):
         return None
@@ -72,6 +82,17 @@ def _fresh_snapshot() -> dict | None:
     if not isinstance(mono, (int, float)):
         return None
     if time.monotonic() - mono > SNAPSHOT_FRESH_SEC:
+        return None
+    ts = snap.get("ts")
+    if not isinstance(ts, str):
+        return None
+    try:
+        t = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.astimezone()
+    if datetime.now(timezone.utc) - t > timedelta(seconds=SNAPSHOT_FRESH_SEC):
         return None
     return snap
 
@@ -202,6 +223,12 @@ def cmd_serve(args) -> int:
         pass
     print("shutting down...", flush=True)
     svc.stop()
+    return 0
+
+
+def cmd_web(args) -> int:
+    from . import web
+    web.serve(host=args.host, port=args.port, token=args.token)
     return 0
 
 
@@ -376,6 +403,12 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("serve", help="常驻调度循环").set_defaults(func=cmd_serve)
+
+    p_web = sub.add_parser("web", help="Web 控制台")
+    p_web.add_argument("--host", default="127.0.0.1")
+    p_web.add_argument("--port", type=int, default=8765)
+    p_web.add_argument("--token", default=None, help="可选 Bearer 鉴权令牌")
+    p_web.set_defaults(func=cmd_web)
 
     p_status = sub.add_parser("status", help="全局状态")
     p_status.add_argument("--json", action="store_true")

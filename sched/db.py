@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, receive_seq ASC);
 CREATE INDEX IF NOT EXISTS idx_jobs_task_status_pri_seq ON jobs(task_id, status, priority DESC, receive_seq ASC);
+CREATE INDEX IF NOT EXISTS idx_jobs_queued_at ON jobs(queued_at);
 DROP INDEX IF EXISTS idx_jobs_task_pri_status;
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -90,6 +91,7 @@ class DB:
     def __init__(self, path: Path | None = None):
         self.path = path or config.db_file()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._warn_if_shared_fs()
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None
@@ -101,6 +103,34 @@ class DB:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._migrate()
+
+    # 共享挂载上的 SQLite WAL/文件锁语义未经验证（设计第二节 L31）
+    _SHARED_FS_TYPES = frozenset({
+        "nfs", "nfs4", "cifs", "9p", "fuse.sshfs", "glusterfs", "lustre", "ceph"})
+
+    def _warn_if_shared_fs(self) -> None:
+        """审查修复：数据库落在共享/网络文件系统时大声告警（不阻止——
+        留给运维决策，但"验证过语义的本机文件系统"不能只停留在注释）。"""
+        import logging
+        try:
+            best_mp, best_type = "", ""
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    mp, fstype = parts[1], parts[2]
+                    # \040 转义空格；最长前缀匹配即最具体的挂载点
+                    mp = mp.replace("\\040", " ")
+                    if str(self.path).startswith(mp) and len(mp) > len(best_mp):
+                        best_mp, best_type = mp, fstype
+            if best_type.lower() in self._SHARED_FS_TYPES:
+                logging.getLogger("sched.db").warning(
+                    "exec.db 位于共享文件系统 (%s, %s)：SQLite WAL/文件锁语义"
+                    "未经验证，违反设计第二节 L31，建议迁移到本机文件系统",
+                    best_type, best_mp)
+        except OSError:
+            pass
 
     def _migrate(self) -> None:
         """旧库平滑加列（幂等）。"""
@@ -219,8 +249,8 @@ class DB:
         with self._lock:
             if status in (JobStatus.STARTING, JobStatus.RUNNING) and ts:
                 self._conn.execute(
-                    "UPDATE jobs SET status=?, reason=?, started_at=?, status_seq=? "
-                    "WHERE job_id=?",
+                    "UPDATE jobs SET status=?, reason=?, started_at=?, "
+                    "finished_at='', status_seq=? WHERE job_id=?",
                     (status, reason, ts, seq, job_id))
             elif status in JobStatus.TERMINAL | JobStatus.RESUMPTABLE and ts:
                 self._conn.execute(
@@ -231,15 +261,6 @@ class DB:
                 self._conn.execute(
                     "UPDATE jobs SET status=?, reason=?, status_seq=? WHERE job_id=?",
                     (status, reason, seq, job_id))
-
-    def queued_jobs(self, limit: int | None = None) -> list[dict]:
-        with self._lock:
-            sql = ("SELECT * FROM jobs WHERE status=? "
-                   "ORDER BY priority DESC, receive_seq ASC")
-            if limit is not None:
-                sql += f" LIMIT {int(limit)}"
-            rows = self._conn.execute(sql, (JobStatus.QUEUED,)).fetchall()
-        return [dict(r) for r in rows]
 
     def queued_head_jobs(self, task_id: str, limit: int = 8) -> list[dict]:
         """任务内 FIFO 头部候选（作业优先级降序、接收顺序升序，索引直取）。
@@ -334,8 +355,8 @@ class DB:
                         f"UPDATE attempts SET {cols} WHERE attempt_id=?", vals)
                 if job_status in (JobStatus.STARTING, JobStatus.RUNNING) and ts:
                     self._conn.execute(
-                        "UPDATE jobs SET status=?, reason=?, started_at=?, status_seq=? "
-                        "WHERE job_id=?",
+                        "UPDATE jobs SET status=?, reason=?, started_at=?, "
+                        "finished_at='', status_seq=? WHERE job_id=?",
                         (job_status, reason, ts, seq, job_id))
                 elif job_status in JobStatus.TERMINAL | JobStatus.RESUMPTABLE and ts:
                     self._conn.execute(
@@ -361,17 +382,31 @@ class DB:
         v = row["p"] if row else None
         return None if v is None else int(v)
 
-    def jobs_received_since(self, cutoff_iso: str) -> list[tuple[str, str]]:
+    def jobs_received_since(self, cutoff_iso: str, limit: int = 500,
+                            offset: int = 0) -> list[tuple[str, str]]:
         """cutoff 之后接收（queued_at >= cutoff）的作业 (task_id, job_id)。
 
         C1 归档窗口对账用：窗口内作业逐一核对归档文件存在；旧归档已被 GC
         清理属正常，不在对账范围。
+        审查修复（对账时间片，设计第十五节 L257"接收与历史对账保留时间片"）：
+        走 idx_jobs_queued_at 索引 + LIMIT/OFFSET 分页，不再全表扫描一次性
+        fetchall——大规模积压（数十万作业）时对账按批推进，不阻塞主循环。
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT task_id, job_id FROM jobs WHERE queued_at >= ?",
-                (cutoff_iso,)).fetchall()
+                "SELECT task_id, job_id FROM jobs WHERE queued_at >= ? "
+                "ORDER BY queued_at, receive_seq LIMIT ? OFFSET ?",
+                (cutoff_iso, int(limit), max(0, int(offset)))).fetchall()
         return [(r["task_id"], r["job_id"]) for r in rows]
+
+    def max_event_seq(self, attempt_id: str) -> int:
+        """该 attempt 已入库的最大事件 seq（0=无）——接管存活 worker 时增量
+        续读事件的游标起点，避免整文件重放。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq),0) AS m FROM events WHERE attempt_id=?",
+                (attempt_id,)).fetchone()
+        return int(row["m"])
 
     def count_queued(self, task_id: str | None = None) -> int:
         with self._lock:
@@ -383,13 +418,6 @@ class DB:
                 row = self._conn.execute(
                     "SELECT COUNT(*) n FROM jobs WHERE status=?",
                     (JobStatus.QUEUED,)).fetchone()
-        return int(row["n"])
-
-    def count_jobs(self, task_id: str) -> int:
-        """该任务全部状态的作业总数（接收对账用：应与 archive 归档文件数一致）。"""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) n FROM jobs WHERE task_id=?", (task_id,)).fetchone()
         return int(row["n"])
 
     def live_jobs_for_job(self, job_id: str) -> bool:
@@ -534,14 +562,6 @@ class DB:
                 raise
 
     # ---------- task_state ----------
-
-    def get_task_state(self, task_id: str) -> dict:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM task_state WHERE task_id=?", (task_id,)).fetchone()
-        if row:
-            return dict(row)
-        return {"task_id": task_id, "run_target": 0, "mode": "explore"}
 
     def set_task_state(self, task_id: str, **fields) -> None:
         with self._lock:

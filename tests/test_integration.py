@@ -304,6 +304,11 @@ class TestEndToEnd:
             # 进程树退出
             wait_until(lambda: not runner.pid_alive_with_start(pid, a.start_time),
                        timeout=10, desc="process tree dead")
+            # attempt 行终态与 job 同一事务提交（进程退出早于下一轮 finalize 时
+            # 需等主循环提交，不能立即断言）
+            wait_until(lambda: (att := svc.db.list_attempts(job_id=jid)[0])
+                       ["status"] == JobStatus.CANCELLED,
+                       timeout=15, desc="attempt CANCELLED")
             att = svc.db.list_attempts(job_id=jid)[0]
             assert att["status"] == JobStatus.CANCELLED
         finally:
@@ -354,15 +359,14 @@ class TestEndToEnd:
             wait_until(lambda: producer_proc_count() == 1,
                        desc="single producer process")
 
-            # 旧 attempt 被协作退出，作业经 RECOVERING → QUEUED → 重放完成
+            # 审查修复后的接管语义（设计第十三节 L221）：存活的旧 worker 被
+            # 新实例接管继续跑完，不中断业务、不重放——同一 attempt 完成
             wait_until(lambda: svc2.db.get_job(jid)["status"] == JobStatus.SUCCEEDED,
-                       timeout=40, desc="job SUCCEEDED after restart recovery")
+                       timeout=40, desc="job SUCCEEDED after restart adoption")
             atts = svc2.db.list_attempts(job_id=jid)
-            assert len(atts) == 2
-            # seq DESC：atts[0]=重放后成功，atts[1]=旧 attempt 重启回收（PAUSED）
+            assert len(atts) == 1, "接管后不得新建 attempt（无重放）"
             assert atts[0]["status"] == JobStatus.SUCCEEDED
-            assert atts[1]["status"] == JobStatus.PAUSED
-            assert "重启" in atts[1]["reason"]
+            assert atts[0]["pid"] == old_pid, "完成的应是接管的旧 worker"
             # 业务幂等：单元恰好一次
             done = json.loads(worklog.read_text())
             assert done == list(range(6))

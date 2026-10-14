@@ -24,7 +24,6 @@ DEFAULT_HOME = Path(__file__).resolve().parent.parent
 
 # 协议版本
 TASK_SCHEMA_VERSION = 1
-READY_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 1
 
 TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
@@ -146,6 +145,7 @@ class ControlConfig(BaseModel):
     producer_restart_cap_sec: float = 30.0  # 生产者崩溃退避上限
     producer_crash_reset_after_sec: float = 300.0  # 崩溃退避连续无崩溃后的复位
     start_interval_sec: float = 1.0         # 全局启动间隔（错开启动，防突发）
+    exec_mem_cap_ratio: float = 0.80        # 资源水位 SHED 线：执行内存占机器 ≥ 此值即停新增+撤内存（单采样）
     grow_observe_sec: float = 30.0          # 扩容观察期初值
     pause_grace_base_sec: float = 10.0      # 暂停宽限节奏初值
     pause_grace_max_sec: float = 60.0
@@ -162,13 +162,19 @@ class ControlConfig(BaseModel):
     heartbeat_stale_multiplier: float = 6.0 # 心跳过期 = 承诺反馈间隔 × 该倍数（依据实际延迟推导）
     starting_timeout_sec: float = 60.0      # STARTING 无 started 事件超时
     resource_unhealthy_ratio: float = 0.9   # 持续超过判定不健康
-    resource_healthy_ratio: float = 0.8     # 持续低于判定恢复健康（滞回）
+    resource_healthy_ratio: float = 0.7     # 持续低于判定恢复健康（滞回）
     resource_stable_samples: int = 3        # 滞回连续样本数
     mem_growth_ratio: float = 0.05          # 单采样区间执行内存净增占容量比例，判"快速增长"
     observability_slow_factor: float = 3.0  # 观测不足时扩容观察期放大倍数
+    external_hold_window_sec: float = 180.0      # 外部压力滑动窗口
+    external_hold_trigger_events: int = 6        # 窗口内外部不足事件数阈值（密度）
+    external_hold_trigger_tasks: int = 2         # 窗口内报不足任务数阈值（广度）
+    external_hold_recover_events: int = 1        # 解除判定的窗口事件数上限
+    external_hold_recover_sec: float = 90.0      # 密度回落需持续的低电平时长
+    external_suspect_lookback_sec: float = 1800.0  # 稳定回看窗：其间首次活跃的任务为嫌疑
     recover_grace_sec: float = 30.0         # 重启后旧执行进程协作退出宽限
     cmd_ack_wait_sec: float = 6.0           # CLI 控制命令等待确认超时
-    heartbeat_resume_cooldown_sec: float = 60.0  # 心跳过期暂停的作业恢复排队前冷却，防卡死循环
+    heartbeat_resume_cooldown_sec: float = 60.0  # 心跳过期/OOM/内存增长退让等暂停的作业恢复排队前冷却，防紧密重启循环
     cleanup_terminal_after_sec: float = 604800.0  # 已完结作业（成功/取消）attempt 工件保留时长
 
     model_config = {"extra": "forbid"}
@@ -234,6 +240,11 @@ class TaskSpec(BaseModel):
     # 调度器据此推导心跳过期阈值与暂停宽限（未填用全局默认推导）。
     feedback_interval_sec: float | None = Field(None, gt=0)
     max_step_sec: float | None = Field(None, gt=0)
+    # 作业级优先级授权上限（审查修复，设计第四节 L61"任务授权范围内设置"）：
+    # 该任务作业级 priority 的最高允许值。缺省 = 任务优先级（全局硬规则：
+    # 作业不得越过任务优先级，避免执行程序自行改变全局优先级）；任务可
+    # 声明更窄的授权（更低的 cap），不可声明比任务优先级更高的 cap。
+    job_priority_cap: int | None = Field(None)
 
     model_config = {"extra": "forbid"}
 
@@ -281,6 +292,11 @@ def parse_task(raw: Any, task_id: str) -> TaskSpec:
         raise TaskError(str(e)) from e
     if doc.task_id != task_id:
         raise TaskError(f"task.json 内 task_id '{doc.task_id}' 与目录名 '{task_id}' 不一致")
+    # 作业级优先级授权只能收窄（不得越过任务优先级，设计第四节 L61）
+    if doc.job_priority_cap is not None and doc.job_priority_cap > doc.priority:
+        raise TaskError(
+            f"job_priority_cap ({doc.job_priority_cap}) 不得高于任务优先级 "
+            f"({doc.priority})：授权只能收窄，不能放宽")
     # B4（设计第三节 L51）：恢复方式必须可解释——数据源保留多久（retain）与
     # 如何识别遗漏（replay_note）缺失时任务清单不合规，拒绝加载。
     if not (str(doc.recovery.retain).strip()
@@ -321,16 +337,19 @@ def load_task(task_id: str) -> TaskSpec:
 
 # ---------- 就绪请求 outbox JSON ----------
 class ReadyJob(BaseModel):
-    schema_version: int = READY_SCHEMA_VERSION
+    # 协议版本与幂等键必填（审查修复，设计第四节 L63"每份就绪 JSON 包含协议
+    # 版本……幂等键"）：此前两者均可缺省（默认 1 / 空串），缺失版本号的
+    # JSON 被静默当 v1 解析、空幂等键让"幂等提交"协议基础全链路落空。
+    schema_version: int
     job_id: str
     task_id: str
     entry_args: list[str] = Field(default_factory=list)
     workdir: str = "."
     input_refs: list[str] = Field(default_factory=list)
-    idempotency_key: str = ""
+    idempotency_key: str = Field(min_length=1)
     progress_semver: str = "1.0.0"
     env: dict[str, str] = Field(default_factory=dict)
-    priority: int | None = None  # 作业级优先级：仅允许不高于任务优先级（接收时钳制）
+    priority: int | None = None  # 作业级优先级：仅允许不高于任务授权上限（接收时钳制）
 
     model_config = {"extra": "forbid"}
 
@@ -402,9 +421,3 @@ def load_config() -> SchedulerConfig:
         print(f"[sched] 全局配置 config.json 无效（{e}），使用默认控制参数",
               file=sys.stderr, flush=True)
         return SchedulerConfig()
-
-
-def save_config(c: SchedulerConfig) -> SchedulerConfig:
-    from . import store
-    store.save_json(config_file(), c.model_dump())
-    return c

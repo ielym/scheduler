@@ -63,7 +63,7 @@ def test_parse_ready(home):
 def test_db_upsert_dedup_conflict(tmp_path):
     d = dbmod.DB(tmp_path / "e.db")
     ready = config.parse_ready({"schema_version": 1, "job_id": "j1", "task_id": "t",
-                                "env": {}, "entry_args": []})
+                                "env": {}, "entry_args": [], "idempotency_key": "k"})
     st, created = d.upsert_job(ready, "hashA", "now", 50)
     assert st == "created" and created
     st, created = d.upsert_job(ready, "hashA", "now2", 50)
@@ -74,7 +74,7 @@ def test_db_upsert_dedup_conflict(tmp_path):
 
 def test_db_attempt_unique_live(tmp_path):
     d = dbmod.DB(tmp_path / "e.db")
-    ready = config.parse_ready({"schema_version": 1, "job_id": "j1", "task_id": "t"})
+    ready = config.parse_ready({"schema_version": 1, "job_id": "j1", "task_id": "t", "idempotency_key": "k"})
     d.upsert_job(ready, "hashA", "now", 50)
     d.create_attempt("a1", "j1", 1, "tok", "now")
     assert d.live_jobs_for_job("j1")
@@ -108,8 +108,8 @@ def test_receiver_conflict_isolation(home, tmp_path):
     out.mkdir(parents=True)
     d = dbmod.DB(tmp_path / "e.db")
     spec = config.load_task("demo")
-    p1 = {"schema_version": 1, "job_id": "demo-x", "task_id": "demo", "env": {}}
-    p2 = {"schema_version": 1, "job_id": "demo-x", "task_id": "demo", "env": {"a": "1"}}
+    p1 = {"schema_version": 1, "job_id": "demo-x", "task_id": "demo", "env": {}, "idempotency_key": "k"}
+    p2 = {"schema_version": 1, "job_id": "demo-x", "task_id": "demo", "env": {"a": "1"}, "idempotency_key": "k"}
     (out / "demo-x.json").write_text(json.dumps(p1))
     receiver.receive_outbox("demo", spec, d, "now")
     (out / "demo-x.json").write_text(json.dumps(p2))
@@ -143,8 +143,16 @@ def test_scaling_shortage_shrinks(tmp_path):
             grow_observe_sec = 30.0
     s = scaling.Scaling(Cfg())
     s.get("t").run_target = 4
+    # 偶发不足：撤销一个名额（streak=1 参与幅度）
     s.on_shortage("t", 0.0, live_count=3)
-    assert s.get("t").run_target == 2  # max(0, live_count-1)
+    assert s.get("t").run_target == 3
+    # 节流窗口内重复不足只计证据不重复收缩
+    s.on_shortage("t", 1.0, live_count=2)
+    assert s.get("t").run_target == 3
+    assert s.get("t").shortage_streak == 2
+    # 窗口过后按证据量加速收缩（streak=3 → -3）：风暴时快速收敛
+    s.on_shortage("t", 10.0, live_count=2)
+    assert s.get("t").run_target == 0
 
 
 def test_protect_yield_candidate():

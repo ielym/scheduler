@@ -91,7 +91,6 @@ class ExecutorTask:
         self._events = _events.writer()
         self._stop_evt = threading.Event()
         self._pause: _control.PauseCommand | None = None
-        self._completed = False
         self._ckpt_saved_this_attempt = False   # B3：本 attempt 是否已提交过检查点
         self._last_completed_units: int | None = None  # B5：进展单调校验基准
         self._heartbeat_thread: threading.Thread | None = None
@@ -122,6 +121,14 @@ class ExecutorTask:
         except PauseRequested:
             self._on_pause()
         except Shortage as e:
+            # 持续不足退出前提交检查点（审查修复，设计第六节 L101"持续不足时
+            # 提交检查点并以约定退出码退出"）：本 attempt 尚未提交过但存在业务
+            # 断点数据（本轮已保存或继承自上一 attempt）时，按本 attempt 身份
+            # 重提交一次，避免 75 退出回退到旧检查点丢失本轮进度。
+            try:
+                self._ensure_checkpoint_before_exit()
+            except Exception:
+                pass
             self._events.emit(EventKind.SHORTAGE, reason=e.reason)
             exit_code = EXIT_SHORTAGE
         except Exception:
@@ -139,8 +146,12 @@ class ExecutorTask:
         """A7 启动许可门：调度器确认 STARTED/RUNNING 后写 permit.json，
         worker 在此之前不得产生业务副作用。
 
-        未设置 SCHED_PERMIT_FILE（旧调度器/本地调试）时直接放行；
-        超时/中断按统一外部不足（exit 75）退让，等待调度器下次许可。
+        未设置 SCHED_PERMIT_FILE（旧调度器/本地调试）时直接放行。
+        审查修复（语义纠正）：等待期间收到暂停命令/TERM 属"调度器主动暂停"，
+        抛 PauseRequested 走协作暂停（退出 0 → PAUSED），不得伪装成统一外部
+        不足（exit 75 → BACKOFF 并收缩任务目标）——调度器主动暂停不计为
+        任务错误或不足证据（设计第六节 L103、第十二节 L211）。
+        仅"超时仍无许可"才是外部不足语义（调度器长时间不授予许可）。
         """
         path = os.environ.get("SCHED_PERMIT_FILE")
         if not path:
@@ -157,7 +168,7 @@ class ExecutorTask:
                     and str(obj.get("attempt_id") or "") == att:
                 return
             if self._stop_evt.is_set() or _control.current_pause() is not None:
-                raise Shortage("启动许可等待被中断")
+                raise PauseRequested()
             if time.monotonic() >= deadline:
                 raise Shortage("等待启动许可超时")
             time.sleep(0.2)
@@ -202,10 +213,13 @@ class ExecutorTask:
         if self._pause is None:
             self._pause = _control.current_pause()
         if self._pause is not None or self._stop_evt.is_set():
-            self._ensure_checkpoint_on_pause()
+            self._ensure_checkpoint_before_exit()
             raise PauseRequested()
 
-    def _ensure_checkpoint_on_pause(self) -> None:
+    def _ensure_checkpoint_before_exit(self) -> None:
+        """退出前（暂停确认 / 持续不足退出）的检查点兜底：本 attempt 尚未
+        提交过但持有断点数据（本轮已保存或继承自上一 attempt）时，按本
+        attempt 身份重提交一次（B3 机制，设计第六、七节）。"""
         if self._ckpt_saved_this_attempt:
             return
         prev = self._ckpt.last
@@ -236,10 +250,12 @@ class ExecutorTask:
         return (ck or {}).get("data") if isinstance(ck, dict) else None
 
     def _on_pause(self) -> None:
-        pause = self._pause or _control.PauseCommand(command_id="", action="pause")
+        # 审查修复：SIGTERM 可能先于控制文件读取到达——退出路径再读一次控制
+        # 文件，能拿到 command_id 就关联具体命令（纯 TERM 无命令时才置空）
+        pause = self._pause or _control.current_pause() or \
+            _control.PauseCommand(command_id="", action="pause")
         self._events.emit(EventKind.CONTROL_ACK, command_id=pause.command_id)
         # 断点已在 checkpoint() 或业务周期提交中持久化
-        self._completed = False
 
     # ---------- 进度 / 不足 ----------
     def report_progress(self, completed_units: int, has_unfinished_work: bool,
@@ -282,7 +298,6 @@ class ExecutorTask:
     def complete(self, record: dict | None = None) -> None:
         """标记完成并提交持久化完成记录（幂等）。"""
         self._events.emit(EventKind.COMPLETED, record=record or {})
-        self._completed = True
 
     # ---------- 心跳 ----------
     def _heartbeat_loop(self) -> None:
@@ -315,13 +330,25 @@ __all__ = [
 
 
 # ---- 模块级便捷 API（面向"裸脚本"但走事件通道） ----
+# 单调校验基准（模块级 API 与类版本同契约：completed_units 必须单调递增，
+# 设计第六节 L91；新进程从头计数合法）
+_module_last_cu: int | None = None
+
+
 def emit_event(kind: str, **payload) -> int:
     return _events.emit(kind, **payload)
 
 
 def report_progress(completed_units: int, has_unfinished_work: bool, stage: str,
                     **kw) -> None:
-    emit_event(EventKind.PROGRESS, completed_units=int(completed_units),
+    global _module_last_cu
+    cu = int(completed_units)
+    if _module_last_cu is not None and cu < _module_last_cu:
+        raise ValueError(
+            f"completed_units 回退：{cu} < 已报告的 {_module_last_cu}"
+            "（进展必须单调递增，设计第六节）")
+    _module_last_cu = cu
+    emit_event(EventKind.PROGRESS, completed_units=cu,
                has_unfinished=bool(has_unfinished_work), stage=str(stage),
                metric_semver=_env("SCHED_PROGRESS_SEMVER", "1.0.0"), **kw)
 

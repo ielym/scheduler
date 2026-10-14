@@ -39,6 +39,24 @@ class HealthTracker:
         self.window_sec = window_sec
         self.slow_confidence_sec = slow_confidence_sec
         self._samples: dict[tuple[str, str, str], deque[ProgressSample]] = {}
+        # 任务级反馈间隔（变慢观察期随实际反馈间隔缩放，设计第十一节 L193）
+        self._feedback_interval: dict[str, float] = {}
+        # 恢复早期豁免（设计第十一节 L191"恢复早期……排除在退化比较之外"）：
+        # 暂停/重放恢复的任务在豁免窗口内不参与变慢判定（缓存冷启动、断点
+        # 重放的速率天然低于稳态基线，属预期而非退化）
+        self._resume_exempt_until: dict[str, float] = {}
+
+    def set_task_feedback(self, task_id: str, interval_sec: float) -> None:
+        """登记任务承诺的反馈间隔（观察期参考实际反馈间隔，设计第十一节）。"""
+        if interval_sec and interval_sec > 0:
+            self._feedback_interval[task_id] = float(interval_sec)
+
+    def note_resumed(self, task_id: str, now_mono: float, exempt_sec: float) -> None:
+        """登记一次恢复事件（暂停恢复/重放启动）：豁免窗口内不判慢。"""
+        if exempt_sec > 0:
+            until = now_mono + float(exempt_sec)
+            prev = self._resume_exempt_until.get(task_id, 0.0)
+            self._resume_exempt_until[task_id] = max(prev, until)
 
     def record(self, task_id: str, stage: str, sample: ProgressSample,
                semver: str = "") -> None:
@@ -104,12 +122,12 @@ class HealthTracker:
             recent = now_mono - s_last.ts_mono <= self.window_sec
             out.append({
                 "stage": stage,
-                "semver": semver,
-                "samples": len(dq),
-                "completed_units": s_last.completed_units,
-                "rate_per_sec": round(rate, 4),
-                "slow": recent and self._is_slow(dq),
-            })
+            "semver": semver,
+            "samples": len(dq),
+            "completed_units": s_last.completed_units,
+            "rate_per_sec": round(rate, 4),
+            "slow": recent and self._is_slow(dq, tid),
+        })
         return out
 
     def slow(self, task_id: str, now_mono: float) -> bool:
@@ -117,24 +135,32 @@ class HealthTracker:
 
         只使用近期样本（窗口内）：陈旧样本不参与判定，避免暂停很久的任务凭
         停摆前的旧基线被误判为变慢（设计第十一节：近期健康基线）。
+        恢复早期豁免（设计第十一节 L191）：暂停/重放恢复后的豁免窗口内不判慢。
         """
+        if now_mono < self._resume_exempt_until.get(task_id, 0.0):
+            return False
         for key, dq in self._samples.items():
             if key[0] != task_id or not dq:
                 continue
             if now_mono - dq[-1].ts_mono > self.window_sec:
                 continue  # 最新样本已陈旧：本阶段近期无证据，不判慢
-            if self._is_slow(dq):
+            if self._is_slow(dq, task_id):
                 return True
         return False
 
-    def _is_slow(self, dq: deque) -> bool:
+    def _is_slow(self, dq: deque, task_id: str = "") -> bool:
         # 只在途工作的样本参与变慢判定；完成态/无在途样本不计入（设计第十一节）
         dq = deque(s for s in dq if s.has_unfinished)
         if len(dq) < 4:
             return False
-        # 要求最近样本覆盖至少 slow_confidence_sec
+        # 要求最近样本覆盖至少 slow_confidence_sec（观察期参考实际反馈间隔：
+        # 反馈慢的任务按 6×反馈间隔拉长跨度门槛，设计第十一节 L193）
+        min_span = self.slow_confidence_sec
+        fi = self._feedback_interval.get(task_id or "", 0.0)
+        if fi > 0:
+            min_span = max(min_span, fi * 6.0)
         span = dq[-1].ts_mono - dq[0].ts_mono
-        if span < self.slow_confidence_sec:
+        if span < min_span:
             return False
         # 近期样本有真实在途工作（完成单元数 > 0）
         if not all(s.completed_units > 0 for s in list(dq)[-3:]):
@@ -184,7 +210,7 @@ class TaskScale:
     run_target: int = 0
     mode: str = "explore"          # explore | steady
     last_grow_mono: float = 0.0
-    last_shrink_mono: float = 0.0
+    last_shrink_mono: float = -1.0   # -1=从未收缩（0.0 是合法单调时刻）
     grow_observe_sec: float = 30.0
     shortage_streak: int = 0
 
@@ -201,53 +227,188 @@ class ResourceTrend:
 
     # I/O 压力不健康阈值（psi full avg10 归一化；持续高于该值判不健康）
     IO_UNHEALTHY = 0.25
+    NORMAL = "normal"   # 正常：照常准入
+    HOLD = "hold"       # 停止新增准入（在途执行不受影响）
+    SHED = "shed"       # 停止新增 + 主动撤内存（暂停低优先级可释放者）
 
-    def __init__(self, unhealthy_ratio: float = 0.9, healthy_ratio: float = 0.8,
-                 stable_samples: int = 3):
+    def __init__(self, unhealthy_ratio: float = 0.9, healthy_ratio: float = 0.7,
+                 stable_samples: int = 3, shed_ratio: float = 0.8):
         self.unhealthy_ratio = float(unhealthy_ratio)
         self.healthy_ratio = float(healthy_ratio)
         self.stable_samples = max(1, int(stable_samples))
+        self.shed_ratio = float(shed_ratio)
         self.observed = True
-        self._unhealthy = False
-        self._high_streak = 0
-        self._low_streak = 0
+        self._state = self.NORMAL
+        self._hold_streak = 0
+        self._recover_streak = 0
+
+    @property
+    def state(self) -> str:
+        return self._state
 
     def sample(self, cpu_ratio: float, mem_ratio: float, observed: bool,
                io_pressure: float = 0.0) -> None:
+        """资源水位状态机（合并原滞回判定与内存硬顶，单一语义）：
+
+        - SHED 即时生效（单采样）：执行内存 ≥ shed_ratio（防爬坡穿透滞回窗）
+        - HOLD 需连续 stable_samples 采样：CPU ≥ unhealthy_ratio 或 IO 压力
+          ≥ IO_UNHEALTHY（CPU/IO 只停新增——撤内存对降 CPU 无保证）
+        - 恢复需连续 stable_samples 采样全指标 < healthy_ratio；SHED 不降级
+          为 HOLD（避免中间态抖动）
+        """
         self.observed = bool(observed)
-        m = max(float(cpu_ratio), float(mem_ratio))
-        io = float(io_pressure)
-        if m >= self.unhealthy_ratio or io >= self.IO_UNHEALTHY:
-            self._high_streak += 1
-            self._low_streak = 0
-        elif m < self.healthy_ratio and io < self.IO_UNHEALTHY:
-            self._low_streak += 1
-            self._high_streak = 0
-        else:  # 滞回中间带：维持原判定
-            self._high_streak = 0
-            self._low_streak = 0
-        if self._high_streak >= self.stable_samples:
-            self._unhealthy = True
-        if self._low_streak >= self.stable_samples:
-            self._unhealthy = False
+        cpu, mem, io = float(cpu_ratio), float(mem_ratio), float(io_pressure)
+        if mem >= self.shed_ratio:
+            self._hold_streak = self.stable_samples
+            self._recover_streak = 0
+            self._state = self.SHED
+            return
+        if cpu >= self.unhealthy_ratio or io >= self.IO_UNHEALTHY:
+            self._hold_streak += 1
+            self._recover_streak = 0
+        elif (cpu < self.healthy_ratio and mem < self.healthy_ratio
+              and io < self.IO_UNHEALTHY):
+            self._recover_streak += 1
+            self._hold_streak = 0
+        else:  # 滞回中间带：维持原状态
+            self._hold_streak = 0
+            self._recover_streak = 0
+        if (self._hold_streak >= self.stable_samples
+                and self._state == self.NORMAL):
+            self._state = self.HOLD
+        if self._recover_streak >= self.stable_samples:
+            self._state = self.NORMAL
 
     def mark_oom(self) -> None:
-        """OOM 证据直接判定不健康，需重新累计低占用样本才恢复。"""
-        self._unhealthy = True
-        self._high_streak = self.stable_samples
-        self._low_streak = 0
+        """OOM 证据：直接进入 SHED（停新增 + 撤内存），需重新累计低占用样本恢复。"""
+        self._state = self.SHED
+        self._hold_streak = self.stable_samples
+        self._recover_streak = 0
 
     def mark_memory_growth(self) -> None:
-        """执行内存快速增长（接近容量）证据：直接判定不健康，停止新增（设计第八节）。"""
-        self._unhealthy = True
-        self._high_streak = self.stable_samples
-        self._low_streak = 0
+        """执行内存快速增长（接近容量）证据：直接进入 SHED（设计第八节）。"""
+        self._state = self.SHED
+        self._hold_streak = self.stable_samples
+        self._recover_streak = 0
 
     def unhealthy(self) -> bool:
-        return self._unhealthy
+        return self._state != self.NORMAL
 
     def healthy_enough(self) -> bool:
-        return not self._unhealthy
+        return self._state == self.NORMAL
+
+    def shedding(self) -> bool:
+        return self._state == self.SHED
+
+
+class ExternalTrend:
+    """外部资源压力闸门（反馈式规避，设计文档第十四节）。
+
+    不建模具体外部资源：身份/配额/限制均未知且随时间变化，任务间是否
+    共用同一资源也是随机的——任何预设（并发槽、qps 令牌桶）都会误伤或
+    失配。"当前执行的作业有没有资源问题"是唯一事实来源（exit 75 事件流）。
+
+    - 单任务偶发不足：任务级动态目标自收缩（Scaling.on_shortage），
+      不触发全局闸门（保留任务间独立性）；
+    - 多任务同时不足（密度 × 广度同时越阈）：外部资源整体紧张的信号
+      → 全局限停新准入（HOLD 语义：在途执行不动，靠退避自然衰减）；
+    - 嫌疑优先原则：外部资源一般相对稳定，突然不足优先怀疑"稳定期
+      之后新加入的任务"。进入压力时自动标记嫌疑（首次活跃晚于回看
+      窗口的当前活跃任务）：准入压制至单并发探索、导出快照供排查、
+      恢复时最后回来（从头证明自己）；若压制嫌疑后压力仍不消退，
+      全局停准入兜底仍在。内存态首次活跃记录，重启后重新积累
+      （重启初期宽松判定优于误伤）。
+    - 恢复：不足密度回落至低位并保持观察期 → 解除（试探性，密度
+      再升可立即重入，滞回防抖）。
+    """
+
+    NORMAL = "normal"
+    HOLD = "external_hold"
+
+    def __init__(self, window_sec: float = 180.0,
+                 trigger_events: int = 6, trigger_tasks: int = 2,
+                 recover_events: int = 1, recover_sec: float = 90.0,
+                 suspect_lookback_sec: float = 1800.0):
+        self.window_sec = float(window_sec)
+        self.trigger_events = int(trigger_events)
+        self.trigger_tasks = int(trigger_tasks)
+        self.recover_events = int(recover_events)
+        self.recover_sec = float(recover_sec)
+        self.suspect_lookback_sec = float(suspect_lookback_sec)
+        self._shortages: deque[tuple[float, str]] = deque()
+        self._first_active: dict[str, float] = {}
+        self._state = self.NORMAL
+        self._low_since_mono = 0.0
+        self._hold_since_mono = 0.0
+        self._suspects: set[str] = set()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def holding(self) -> bool:
+        return self._state == self.HOLD
+
+    def suspects(self) -> set[str]:
+        return set(self._suspects)
+
+    def note_active(self, task_id: str, now_mono: float) -> None:
+        """任务出现活跃执行：登记首次活跃时刻（嫌疑判定基准）。"""
+        if task_id and task_id not in self._first_active:
+            self._first_active[task_id] = now_mono
+
+    def note_shortage(self, task_id: str, now_mono: float) -> None:
+        """一次外部不足事件（exit 75 收尾）进入滑动窗口。"""
+        self._shortages.append((now_mono, str(task_id)))
+        while self._shortages and now_mono - self._shortages[0][0] > self.window_sec:
+            self._shortages.popleft()
+
+    def _recent(self, now_mono: float) -> list[tuple[float, str]]:
+        return [e for e in self._shortages
+                if now_mono - e[0] <= self.window_sec]
+
+    def sample(self, now_mono: float, active_tasks: set[str] | None = None) -> None:
+        """状态迁移（主循环每 tick 调用）。
+
+        active_tasks：当前有活跃执行的 tasks（嫌疑计算用；None 时
+        用首次活跃记录推导）。进入 HOLD 时计算嫌疑集合并返回。
+        """
+        recent = self._recent(now_mono)
+        if self._state == self.NORMAL:
+            if (len(recent) >= self.trigger_events
+                    and len({t for _, t in recent}) >= self.trigger_tasks):
+                self._state = self.HOLD
+                self._hold_since_mono = now_mono
+                self._low_since_mono = 0.0
+                if active_tasks is None:
+                    active_tasks = {t for t, first in self._first_active.items()
+                                    if first <= now_mono}
+                cutoff = now_mono - self.suspect_lookback_sec
+                self._suspects = {t for t in active_tasks
+                                  if self._first_active.get(t, now_mono) >= cutoff}
+            return
+        # HOLD：密度回落至低位持续 recover_sec 才解除（滞回防抖）
+        if len(recent) <= self.recover_events:
+            if self._low_since_mono <= 0.0:
+                self._low_since_mono = now_mono
+            elif now_mono - self._low_since_mono >= self.recover_sec:
+                self._state = self.NORMAL
+                self._low_since_mono = 0.0
+                self._suspects = set()
+        else:
+            self._low_since_mono = 0.0
+
+    def snapshot(self, now_mono: float) -> dict:
+        """监控视图：状态 / 窗口内事件数与涉及任务 / 嫌疑名单。"""
+        recent = self._recent(now_mono)
+        return {
+            "state": self._state,
+            "recent_events": len(recent),
+            "recent_tasks": sorted({t for _, t in recent}),
+            "suspects": sorted(self._suspects),
+            "hold_since_mono": round(self._hold_since_mono, 1)
+            if self._state == self.HOLD else 0.0,
+        }
 
 
 class Scaling:
@@ -290,13 +451,43 @@ class Scaling:
         ts.last_grow_mono = now_mono
 
     def on_shortage(self, task_id: str, now_mono: float, live_count: int) -> None:
-        """不足/退化：撤销近期增加，降低动态目标。"""
+        """不足/退化：撤销近期增加，降低动态目标。
+
+        审查修复（设计第九节 L159"一次控制动作后等待确认和有效反馈，不在
+        同一轮因多个重复事件连续减半"）：
+        - 节流：一次收缩后至少间隔 SHRINK_MIN_GAP_SEC 才允许再收缩——同轮
+          多个 attempt 相继退 75 时只收缩一次，其余仅累计 streak（持续不足
+          证据仍在），窗口过后按效果继续收缩；
+        - 幅度：基础撤销一个名额（run_target - 1）；节流窗口内持续累积的
+          streak 参与幅度（max(1, streak)）——偶发不足温和 -1，风暴时
+          （窗口内多个作业相继报不足）窗口过后按证据量加速收缩，避免
+          高并发下目标收敛过慢（每次 -1 需数分钟才能压到位）。
+        """
         ts = self.get(task_id)
         ts.shortage_streak += 1
+        if (ts.last_shrink_mono >= 0
+                and now_mono - ts.last_shrink_mono < self.SHRINK_MIN_GAP_SEC):
+            return  # 上一次收缩尚在观察确认窗口内：只记证据，不重复收缩
         ts.last_shrink_mono = now_mono
         ts.mode = "explore"
-        # 撤销近期增加：至少减到当前存活数的保守值以下，给恢复留空间
-        ts.run_target = max(0, live_count - 1)
+        ts.run_target = max(0, ts.run_target - max(1, ts.shortage_streak))
+
+    # 收缩节流窗口：不小于两个资源采样间隔，保证一次控制动作后有确认机会
+    SHRINK_MIN_GAP_SEC = 5.0
+
+    def note_recovered_progress(self, task_id: str, now_mono: float) -> None:
+        """真实业务进展恢复：不足证据按观察期衰减清零（审查修复，设计第九节
+        L153"无持续不足"、L157 长期任务"减慢探索"而非"永久停止探索"）。
+
+        streak 此前仅在作业 SUCCEEDED 时清零——长期任务无完成事件，报一次
+        75 后即使恢复真实进展也永不扩容。现在：有新进展样本且距上次收缩已
+        超过一个扩容观察期（不足确已消退）时清零 streak 并恢复 steady 模式。
+        """
+        ts = self.get(task_id)
+        if ts.shortage_streak > 0 and \
+                now_mono - ts.last_shrink_mono >= ts.grow_observe_sec:
+            ts.shortage_streak = 0
+            ts.mode = "steady"
 
     def on_success(self, task_id: str, now_mono: float) -> None:
         ts = self.get(task_id)
@@ -347,7 +538,8 @@ class ProtectState:
     yielded_tasks: dict[str, int] = field(default_factory=dict)  # 本轮已退让任务 -> 优先级
     pending_resume: dict[str, int] = field(default_factory=dict) # 保护结束后待逐步放回的任务 -> 优先级
     next_release_mono: float = 0.0    # 下一次放回允许时刻（recovery_probe_sec 节奏）
-    released: dict[str, float] = field(default_factory=dict)      # 已放回任务 -> 放回时刻
+    released: dict[str, int] = field(default_factory=dict)      # 已放回任务 -> 优先级
+    released_at: dict[str, float] = field(default_factory=dict)  # 已放回任务 -> 放回时刻（恢复步幅推导）
     round_backoff_until: float = 0.0
     last_protected_priority: int = 0  # 上一轮保护对象优先级（失败轮退避用）
     failed_rounds: int = 0            # 连续失败保护轮次数（退避逐渐增加，设计第十节）
@@ -364,17 +556,25 @@ class Protect:
     def start_round(self, protected_task: str, priority: int, now_mono: float,
                     reason: str = "", cause: str = "",
                     feedback_interval_sec: float = 0.0,
-                    lower_tasks: int = 0) -> bool:
+                    lower_tasks: int = 0,
+                    cooldown_remain_sec: float = 0.0) -> bool:
         """启动/更新保护轮。
 
         防劫持规则（设计文档第十节）：
         - 保护进行中，仅当新对象优先级更高才立即切换保护对象；
         - 同级轮转：多个同优先级受阻时，当前轮过半后允许切换到另一同级对象；
         - 失败轮退避期间，仅当新对象优先级高于上一轮保护对象才允许立即重开。
+        审查修复：同对象且当前为慢起因时，明确不足将 cause 升级为 shortage
+        （快速节奏，设计第十一节 L195"一旦出现明确不足则转入快速保护"）——
+        由调用方在 start_round 前置检查中处理，这里同对象分支同样接受刷新。
+        cooldown_remain_sec：A 的不足退避冷却剩余时间，纳入窗口推导
+        （设计第十节 L181：窗口长度含"冷却剩余时间"，保证 A 在保护截止前
+        获得有效恢复观察机会）。
         返回是否生效。
         """
         st = self.st
-        window = self._round_window(feedback_interval_sec, lower_tasks)
+        window = self._round_window(feedback_interval_sec, lower_tasks,
+                                     cooldown_remain_sec)
         if st.protected_task:
             if protected_task == st.protected_task:
                 # 同对象再次受阻：仅刷新观察窗与原因，不重置轮次起点与截止时间。
@@ -401,6 +601,7 @@ class Protect:
             st.yielded = set()
             st.yielded_tasks = {}
             st.released = {}
+            st.released_at = {}
             st.next_release_mono = 0.0
             st.protected_task = protected_task
             st.protected_priority = priority
@@ -430,20 +631,27 @@ class Protect:
         st.yielded_tasks = {}
         return True
 
-    def _round_window(self, feedback_interval_sec: float, lower_tasks: int = 0) -> float:
+    def _round_window(self, feedback_interval_sec: float, lower_tasks: int = 0,
+                      cooldown_remain_sec: float = 0.0) -> float:
         """整轮保护窗口初值：按 A 的反馈周期与低优先级任务数推导。
 
         设计第十节：整轮保护截止"其长度根据低优先级数量、暂停耗时、A 的
         反馈周期和冷却剩余时间计算"——反馈周期长的 A 需要更长的观察窗才有
         机会体现改善；可退让的低优先级任务每个都需一次退让+观察间隔，
         窗口随之加长（暂停耗时由 note_yielded 按实际成本继续延长）；
-        总上限（窗口×2）约束退让延长不无限续期。
+        A 的不足冷却剩余时间也纳入（审查修复：冷却期长于窗口时 A 得不到
+        有效恢复观察机会，保护会在 A 下次探测前截止）；总上限约束退让
+        延长不无限续期。
         """
         w = float(self.cfg.control.protect_deadline_sec)
         if feedback_interval_sec > 0:
             w = max(w, feedback_interval_sec * 4.0)
         if lower_tasks > 0:
             w += min(lower_tasks, 20) * float(self.cfg.control.yield_observe_sec)
+        if cooldown_remain_sec > 0:
+            # 冷却剩余 + 两个反馈周期（冷却结束后 A 需要至少一次探测机会）
+            w = max(w, min(cooldown_remain_sec + feedback_interval_sec * 2.0,
+                           3600.0))
         return w
 
     def note_block(self, now_mono: float) -> None:
@@ -470,6 +678,7 @@ class Protect:
         st.pending_resume.update(st.yielded_tasks)
         st.next_release_mono = 0.0
         st.released = {}
+        st.released_at = {}
         st.protected_task = ""
         st.protected_priority = 0
         st.yielded = set()
@@ -522,6 +731,7 @@ class Protect:
         """保护结束后逐步放回：优先级高者先、每个 recovery_probe_sec 放回一个任务。
 
         变慢退让（cause=="slow"）证据置信度低于明确不足，放回间隔加倍、更谨慎。
+        放回时刻记入 released_at，供 resume_cap 推导恢复步幅。
         """
         st = self.st
         if not st.pending_resume or st.protected_task:
@@ -532,20 +742,43 @@ class Protect:
         pri = st.pending_resume[task_id]
         del st.pending_resume[task_id]
         st.released[task_id] = pri  # 记录优先级：A 再受阻时据此撤销放回
+        st.released_at[task_id] = now_mono
         interval = self.cfg.control.recovery_probe_sec
         if st.cause == "slow":
             interval *= 2
         st.next_release_mono = now_mono + interval
         return task_id
 
+    def resume_cap(self, task_id: str, now_mono: float,
+                   run_target: int) -> int | None:
+        """已放回任务的临时准入上限（审查修复，设计第十节 L177"每次只恢复
+        少量运行机会并观察 A"）。
+
+        此前退让只暂停进程不调低 run_target，保护结束后该任务未被暂停过的
+        QUEUED 作业按原目标一次性拉满，"逐步放回"对积压任务失效。现在已
+        放回任务受临时上限约束：放回初期只给 1 个运行机会，随观察期以
+        recovery_probe_sec 节奏逐步 +1，达到原目标后约束自然失效（毕业）。
+        返回 None 表示该任务不在放回观察中（无额外约束）。
+        """
+        released_at = self.st.released_at.get(task_id)
+        if released_at is None:
+            return None
+        if self.st.protected_task:
+            return 1  # A 仍在保护/受阻观察中：放回只给最小运行机会
+        steps = 1 + int((now_mono - released_at) /
+                        float(self.cfg.control.recovery_probe_sec))
+        return max(1, min(int(run_target), steps))
+
     def note_re_blocked(self, now_mono: float) -> dict[str, int]:
         """逐步放回期间保护对象再次受阻：暂停继续放回，并撤销近期已放回的任务。
 
         返回被撤销放回的任务 -> 优先级映射，供调度器重新暂停其存活执行
         （新一轮被失败轮退避拒绝时也必须撤回，不能任由已放回任务持续挤压 A）。
+        撤销的同时清除放回时刻（恢复步幅约束随撤销解除，重新放回时重建）。
         """
         st = self.st
         st.next_release_mono = now_mono + self.cfg.control.protect_round_backoff_sec
         revoked = dict(st.released)
         st.released = {}
+        st.released_at = {}
         return revoked

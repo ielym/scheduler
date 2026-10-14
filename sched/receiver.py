@@ -129,6 +129,30 @@ def _list_json_rels(out: Path, task_id: str) -> list[str]:
     return rels
 
 
+def force_full_rescan() -> None:
+    """周期性完整对账（审查修复，设计第五节 L81"周期性完整对账，确保所有
+    正式文件最终被发现"）：清空目录 mtime 缓存，下轮扫描重新全量列举各任务
+    outbox 目录树。_seen_files 去重记录保留——已处理的文件跳过（幂等），
+    任何因 mtime 缓存缺陷/第三方原地覆写而漏收的文件在此被兜底发现。
+    """
+    _dir_cache.clear()
+
+
+# 疑似凭证键名（值审计，设计第四节 L71"避免将外部地址、账号和凭证写入调度
+# 元数据"——键名命中只告警不拒绝，留给人工判断误报）
+_SECRET_KEY_RE = None
+
+
+def _looks_secret(k: str) -> bool:
+    global _SECRET_KEY_RE
+    if _SECRET_KEY_RE is None:
+        import re
+        _SECRET_KEY_RE = re.compile(
+            r"(?:password|passwd|secret|token|api[_-]?key|credential|"
+            r"private[_-]?key|auth[_-]?header|cookie)", re.IGNORECASE)
+    return bool(_SECRET_KEY_RE.search(str(k)))
+
+
 def receive_outbox(task_id: str, spec: config.TaskSpec, db, now: str,
                    batch_size: int | None = None) -> dict:
     """扫描一个任务的 outbox（含分目录，设计第二节 L23"可以按发布批次或
@@ -189,13 +213,23 @@ def receive_outbox(task_id: str, spec: config.TaskSpec, db, now: str,
                            "invalid", f"task_id 不匹配：{doc.task_id}")
             continue
         ch = _content_hash(raw)
-        # 作业级优先级：仅允许在任务授权范围内降低/保持，不得越过任务优先级
+        # 作业级优先级：仅允许在任务授权范围内（job_priority_cap，缺省=任务
+        # 优先级）降低/保持，不得越过任务优先级（设计第四节 L61）
         priority = spec.priority
+        cap = spec.job_priority_cap if spec.job_priority_cap is not None \
+            else spec.priority
         if doc.priority is not None:
-            if doc.priority > spec.priority:
-                log.warning("job %s priority %d exceeds task %s priority %d, clamped",
-                            doc.job_id, doc.priority, task_id, spec.priority)
-            priority = min(doc.priority, spec.priority)
+            if doc.priority > cap:
+                log.warning("job %s priority %d exceeds task %s cap %d, clamped",
+                            doc.job_id, doc.priority, task_id, cap)
+            priority = min(doc.priority, cap)
+        # 凭证审计（设计第四节 L71"尽量"级约定）：疑似凭证键名只告警不拒绝，
+        # 留给人工判断（H9 的结构性防线在生产者侧，此处是接收端观测）
+        for k in doc.env:
+            if _looks_secret(k):
+                log.warning("job %s env 含疑似凭证键名 %r（H9：外部账号/凭证"
+                            "不应写入调度元数据）", doc.job_id, k)
+                break
         status, created = db.upsert_job(doc, ch, now, priority)
         if status == "conflict":
             _isolate(task_id, p, "job_id 已存在但内容不同（不覆盖原作业）")

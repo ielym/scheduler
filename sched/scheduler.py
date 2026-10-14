@@ -83,9 +83,9 @@ class AttMeta:
         self.after_seq = 0
         self.status = JobStatus.STARTING
         self.had_completed = False
-        self.had_shortage = False
         self.shortage_at_mono = 0.0        # 最近一次显式不足时刻（排序信号，防布尔滞留）
         self.grown_at_mono = 0.0           # 本 attempt 启动（扩容）时刻
+        self.last_progress_cu: int | None = None  # 进展单调基准（回退样本拒绝入基线）
         self.pause_command: dict | None = None
         self.pause_deadline_mono = 0.0
         self.pause_requested_mono = 0.0    # 暂停请求发出时刻（暂停时长/检查点延迟统计）
@@ -111,7 +111,15 @@ class SchedulerService:
         self.trend = scaling.ResourceTrend(
             unhealthy_ratio=self.cfg.control.resource_unhealthy_ratio,
             healthy_ratio=self.cfg.control.resource_healthy_ratio,
-            stable_samples=self.cfg.control.resource_stable_samples)
+            stable_samples=self.cfg.control.resource_stable_samples,
+            shed_ratio=self.cfg.control.exec_mem_cap_ratio)
+        self.etrend = scaling.ExternalTrend(
+            window_sec=self.cfg.control.external_hold_window_sec,
+            trigger_events=self.cfg.control.external_hold_trigger_events,
+            trigger_tasks=self.cfg.control.external_hold_trigger_tasks,
+            recover_events=self.cfg.control.external_hold_recover_events,
+            recover_sec=self.cfg.control.external_hold_recover_sec,
+            suspect_lookback_sec=self.cfg.control.external_suspect_lookback_sec)
         self.specs: dict[str, config.TaskSpec] = {}
         self.attempts: dict[str, runner.AttemptRun] = {}
         self.meta: dict[str, AttMeta] = {}
@@ -124,11 +132,12 @@ class SchedulerService:
         self._healthy_since_mono = 0.0     # 资源趋势持续健康起点（启动间隔阶梯缩短用）
         self._admit_tokens = 0.0           # 启动份额（令牌制：间隔小于节拍时单轮可多次启动）
         self._last_admit_tick_mono = 0.0   # 上次准入评估时刻（份额累积用）
-        self._last_mem_yield_mono = 0.0    # 上次内存增长退让时刻（节流防重复）
+        self._last_mem_yield_mono = 0.0    # 上次内存退让时刻（增长退让/SHED 撤内存共用节流）
         self._last_sample_mono = 0.0
         self._sample_cpu = 0.0
         self._sample_mem_mb = 0
         self._sample_io = 0
+        self._sample_attempt: dict[str, dict] = {}   # 每 attempt 资源摘要（快照导出）
         self._last_oom: dict[str, int] = {}          # attempt_id -> 上次 oom_kill 计数
         self._last_cpu_usec: dict[str, int] = {}     # attempt_id -> 上次 cpu usage_usec（差分用）
         self._last_io_bytes: dict[str, int] = {}     # attempt_id -> 上次 io.stat bytes（差分用）
@@ -144,8 +153,11 @@ class SchedulerService:
         self._pause_dur: deque[float] = deque(maxlen=50)  # 暂停请求→实际退出
         self._ckpt_lat: deque[float] = deque(maxlen=50)   # 暂停请求→检查点落地
         self._next_retry_by_task: dict[str, str] = {}     # task -> 最早 next_retry_at（监控）
+        self._last_shortage_mono: dict[str, float] = {}   # task -> 最近不足时刻（退避上限推导）
         self._last_rblocked_check_mono = 0.0              # RECOVERY_BLOCKED 复核节流
         self._last_reconcile_mono = 0.0                   # 归档对账节流
+        self._reconcile_offset = 0                        # 归档对账分批游标（时间片）
+        self._last_full_rescan_mono = 0.0                 # outbox 全量重扫兜底节流
         self._last_archive_gc_mono = 0.0                  # 归档 GC 节流（C1）
         self._status_scan: dict[str, tuple[int, int]] = {} # 状态扫描滚动游标 status -> (offset, len)（C5）
         self._last_cleanup_mono = 0.0                     # 已完结作业清理节流（B13）
@@ -181,9 +193,28 @@ class SchedulerService:
             self._loop_thread.join(timeout=5)
         # 优雅停机：只撤执行进程树。生产者保持运行（设计第十三节：仅重启调度器默认保持
         # 生产者，显式整套服务关闭由外部生命周期管理）；生产者经任务级单实例锁由新实例接管。
+        # 并行协作收尾：先向全部执行进程同时发 TERM（worker 落检查点退出），宽限内
+        # 轮询退出并按需升级 KILL——串行逐个 terminate 会把停机拖到 N×grace。
+        runs = list(self.attempts.values())
+        now_mono = _now_mono()
+        for a in runs:
+            try:
+                a.begin_terminate(now_mono, self.cfg.control.pause_grace_base_sec)
+            except Exception:
+                pass
+        deadline = now_mono + self.cfg.control.pause_grace_base_sec + 15.0
+        while runs and _now_mono() < deadline:
+            for a in runs[:]:
+                try:
+                    if not a.is_alive() or a.poll_terminate(_now_mono()) == "gone":
+                        runs.remove(a)
+                except Exception:
+                    runs.remove(a)
+            if runs:
+                time.sleep(0.1)
         for a in list(self.attempts.values()):
             try:
-                a.terminate(self.cfg.control.pause_grace_base_sec)
+                a.cleanup()   # 删除 attempt 的 cgroup：优雅停机不得泄漏目录
             except Exception:
                 pass
         self.db.close()
@@ -279,6 +310,15 @@ class SchedulerService:
             pid = att.get("pid")
             pst = att.get("pid_start_time") or 0.0
             if pid and pst and runner.pid_alive_with_start(pid, pst):
+                # 审查修复（设计第十三节 L221"存活 worker 可以通过事件与控制
+                # 协议接管"）：身份核实仍存活的旧 worker 优先接管（重新挂接
+                # 事件/控制文件继续观测，业务不中断）；接管失败才回退到
+                # "协作退出 + 按检查点重放"的保守路径
+                if self._adopt_attempt(att):
+                    self._append_status({"ts": now, "kind": "attempt_adopted",
+                                         "attempt_id": attempt_id,
+                                         "job_id": job_id, "pid": pid})
+                    continue
                 # 旧执行进程仍存活：先协作 TERM（worker 落检查点退出），宽限后强杀重放
                 try:
                     os.killpg(att.get("pgid") or pid, 15)
@@ -333,9 +373,42 @@ class SchedulerService:
                      "finished_at": now},
                     job_id, JobStatus.QUEUED, "调度器重启：按检查点重放", now)
             else:
-                # attempt 意图已持久化但进程身份未知（启动窗口崩溃）→ 保持可见
-                self.db.set_job_status(job_id, JobStatus.RECOVERY_BLOCKED,
-                                       "attempt 意图已持久化但进程身份未知，需人工核实", now)
+                # attempt 意图已持久化但进程身份未知（启动窗口崩溃）。
+                # 审查修复（设计第十三节 L219"先核实握手和进程树，接管或清理
+                # 之后才能创建新 attempt"）：用 cgroup 归属（含 attempt_id，
+                # 唯一归属）自动核实并清理残留进程；清理确认后按检查点重放，
+                # 不再一律依赖人工 requeue。杀不净（不可中断 D 态）才保持
+                # RECOVERY_BLOCKED 待人工核实。
+                cg_name = str(att.get("cgroup") or "")
+                cleaned = True
+                if cg_name:
+                    try:
+                        from . import cgroup as _cg
+                        c = _cg.Cgroup(cg_name)
+                        if c.available and c.procs():
+                            c.kill_all()
+                            # 有界复查：KILL 后仍有可运行残留（D 态）→ 无法确认清理
+                            for _ in range(3):
+                                time.sleep(0.1)
+                                if not [p for p in c.procs()
+                                        if not runner.proc_never_runs_again(p)]:
+                                    break
+                            else:
+                                cleaned = False
+                    except Exception:
+                        cleaned = False
+                if cleaned:
+                    self.db.commit_transition(
+                        attempt_id,
+                        {"status": JobStatus.PAUSED, "reason":
+                         "调度器重启：启动窗口崩溃，已按 cgroup 归属清理",
+                         "finished_at": now},
+                        job_id, JobStatus.QUEUED,
+                        "调度器重启：启动窗口崩溃，清理后按检查点重放", now)
+                else:
+                    self.db.set_job_status(
+                        job_id, JobStatus.RECOVERY_BLOCKED,
+                        "启动窗口崩溃且 cgroup 残留进程无法清理，需人工核实", now)
         # 保护退让的重启节流恢复（设计第十节：结束保护后"节流恢复低优先级"）：
         # 上实例保护轮退让/撤销放回的 PAUSED 作业不一次性放回——按任务分组注入
         # 逐步放回队列，保持 recovery_probe_sec 节奏；保护轮本身不重建
@@ -368,17 +441,77 @@ class SchedulerService:
         except Exception:
             pass
 
+    def _adopt_attempt(self, att: dict) -> bool:
+        """接管存活的旧 worker（设计第十三节 L221）：以持久化执行身份重建
+        AttemptRun 句柄（非子进程，无退出码），重新挂接事件/控制文件继续
+        观测与控制。事件从库内已见最大 seq 续读（避免重放已入库事件产生
+        状态噪声）；permit 幂等补写（等待许可中的 STARTING worker 立即解锁）。
+        接管后退出码未知时由 decide_outcome 归入 RECOVERING 待核实。
+        任何构造失败返回 False（调用方回退到协作退出+重放路径）。
+        """
+        attempt_id = att["attempt_id"]
+        job_id = att["job_id"]
+        try:
+            job = self.db.get_job(job_id)
+            if job is None:
+                return False
+            task_id = job["task_id"]
+            spec = self.specs.get(task_id)
+            if spec is None or not spec.enabled:
+                return False  # 任务已移除/禁用：不接管，走回收路径
+            import json as _json
+            aspec = runner.AttemptSpec(
+                attempt_id=attempt_id, job_id=job_id, task_id=task_id,
+                token=str(att.get("token") or ""),
+                task_root=config.task_dir(task_id),
+                executor_entry=spec.executor_entry,
+                entry_args=_json.loads(job["entry_args_json"]),
+                workdir=job["workdir"],
+                env=_json.loads(job["env_json"]),
+                progress_semver=job["progress_semver"],
+            )
+            from . import cgroup as _cg
+            cg_name = str(att.get("cgroup") or "")
+            cgrp = _cg.Cgroup(cg_name) if cg_name else _cg.Cgroup(
+                f"{task_id}/{attempt_id}")
+            a = runner.AttemptRun.adopted(
+                aspec, config.run_dir(attempt_id), cgrp,
+                _json.loads(job["input_refs_json"]),
+                pid=int(att.get("pid") or 0),
+                pgid=int(att.get("pgid") or att.get("pid") or 0),
+                start_time=float(att.get("pid_start_time") or 0.0),
+                last_seq=self.db.max_event_seq(attempt_id))
+            meta = AttMeta(attempt_id, job_id, task_id, int(job["priority"]),
+                           aspec.token)
+            meta.status = str(att.get("status") or JobStatus.STARTING)
+            meta.feedback_interval = spec.feedback_interval_sec or 0.0
+            self.attempts[attempt_id] = a
+            self.meta[attempt_id] = meta
+            # permit 幂等补写：等待许可中的 worker 立即解锁（已授予的无影响）
+            try:
+                a.write_permit()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            log.exception("adopt attempt %s failed, fallback to recycle", attempt_id)
+            self.attempts.pop(attempt_id, None)
+            self.meta.pop(attempt_id, None)
+            return False
+
     def refresh_specs(self) -> dict[str, config.TaskSpec]:
         specs = load_all_specs()
         self.specs = specs
         # 控制节奏随任务反馈周期缩放（设计第十四节：观察时间随处理周期调整）：
-        # 扩容观察期不短于 4×反馈间隔，封顶 600s
+        # 扩容观察期不短于 4×反馈间隔，封顶 600s；变慢观察期同步登记反馈间隔
+        # （审查修复，设计第十一节 L193"观察期参考实际反馈间隔"）
         for tid, spec in specs.items():
             if spec.feedback_interval_sec:
                 ts = self.scaling.get(tid)
                 ts.grow_observe_sec = min(
                     600.0, max(self.cfg.control.grow_observe_sec,
                                spec.feedback_interval_sec * 4.0))
+            self.health.set_task_feedback(tid, spec.feedback_interval_sec or 0.0)
         return specs
 
     # ---------- 主循环 ----------
@@ -406,25 +539,40 @@ class SchedulerService:
                 self._tick_resource(now)
                 self._tick_control(now)
                 self._tick_backoff(now)
+                self._tick_external(now)
                 self._tick_admit(now)
                 self._write_snapshot()
             except Exception:
                 log.exception("scheduler loop iteration failed")
 
     def _tick_ensure_producers(self) -> None:
-        for task_id, spec in self.specs.items():
-            if spec.enabled:
-                newly_crashed = self.guard.ensure(task_id, spec)
-                if newly_crashed:
-                    # 反复崩溃持续报警（设计第三节），不退避存活生产者
-                    self._append_status({"ts": runner.now_iso(),
-                                         "kind": "producer_crash",
-                                         "task_id": task_id})
-            else:
-                # 禁用任务：停守护其生产者（既有请求不丢弃）
-                self.guard.stop_task(task_id)
+        # 审查修复（设计第三节 L35"任务间的生产者发现及守护独立进行"）：
+        # 单任务守护异常（拉起失败/日志目录不可写等）不得传播到整轮循环——
+        # 此前任一任务 launch 抛异常会跳过本轮全部后续步骤（接收/准入/监控）
+        for task_id, spec in list(self.specs.items()):
+            try:
+                if spec.enabled:
+                    newly_crashed = self.guard.ensure(task_id, spec)
+                    if newly_crashed:
+                        # 反复崩溃持续报警（设计第三节），不退避存活生产者
+                        self._append_status({"ts": runner.now_iso(),
+                                             "kind": "producer_crash",
+                                             "task_id": task_id})
+                else:
+                    # 禁用任务：停守护其生产者（既有请求不丢弃）
+                    self.guard.stop_task(task_id)
+            except Exception:
+                log.exception("producer guard failed for task %s", task_id)
 
     def _tick_receive(self, now: str) -> None:
+        # 周期性完整对账（审查修复，设计第五节 L81"周期性完整对账，确保所有
+        # 正式文件最终被发现"）：目录 mtime 增量缓存之外，定期强制全量重扫
+        # 各任务 outbox 目录树兜底（seen 去重保留，幂等）；缓解 mtime 精度
+        # 异常/第三方原地覆写导致的漏收无对账可发现
+        now_mono0 = _now_mono()
+        if now_mono0 - self._last_full_rescan_mono >= self.FULL_RESCAN_INTERVAL_SEC:
+            self._last_full_rescan_mono = now_mono0
+            receiver.force_full_rescan()
         order = self._scan_order()
         summaries = receiver.receive_all(
             self.db, now, {t: self.specs[t] for t in order}, order=order,
@@ -444,6 +592,8 @@ class SchedulerService:
 
     RECONCILE_INTERVAL_SEC = 600.0
     ARCHIVE_RECONCILE_WINDOW_SEC = 48 * 3600.0  # 窗口对账覆盖时长（GC 保留期以内）
+    FULL_RESCAN_INTERVAL_SEC = 3600.0            # outbox 全量重扫兜底周期
+    RECONCILE_BATCH = 500                        # 归档对账每批行数（时间片）
 
     def _reconcile_archive(self) -> None:
         """归档窗口对账（只告警不自动修复，设计文档第十五节：可观测、可发现）。
@@ -454,20 +604,34 @@ class SchedulerService:
         归档已被 GC 清理属正常，不在对账范围。单向检查（库→文件）成立：
         归档失败时文件留在 outbox 下轮重享幂等，不存在"库无而文件在"的
         遗漏证据形态。
+        审查修复（对账时间片，设计第十五节 L257"接收与历史对账保留时间片"）：
+        走 idx_jobs_queued_at 索引分批核对（每批 RECONCILE_BATCH 行），
+        批间由下轮对账周期继续推进（滚动游标），大规模积压时不再一次性
+        fetchall 全量载入阻塞主循环。
         """
         cutoff = (datetime.now(timezone.utc) - timedelta(
             seconds=self.ARCHIVE_RECONCILE_WINDOW_SEC)
         ).isoformat(timespec="seconds")
-        rows = self.db.jobs_received_since(cutoff)
-        for task_id, job_id in rows:
-            p = config.runtime_dir() / "archive" / task_id / f"{job_id}.json"
-            if not p.exists():
-                log.warning("archive reconciliation: job %s (task %s, received "
-                            "within %.0fh) missing archive file",
-                            job_id, task_id, self.ARCHIVE_RECONCILE_WINDOW_SEC / 3600)
-                self._append_status({"ts": runner.now_iso(),
-                                     "kind": "archive_missing",
-                                     "task_id": task_id, "job_id": job_id})
+        while True:
+            offset = self._reconcile_offset
+            rows = self.db.jobs_received_since(
+                cutoff, limit=self.RECONCILE_BATCH, offset=offset)
+            if not rows:
+                self._reconcile_offset = 0  # 窗口核对完毕：游标复位
+                return
+            for task_id, job_id in rows:
+                p = config.runtime_dir() / "archive" / task_id / f"{job_id}.json"
+                if not p.exists():
+                    log.warning("archive reconciliation: job %s (task %s, received "
+                                "within %.0fh) missing archive file",
+                                job_id, task_id, self.ARCHIVE_RECONCILE_WINDOW_SEC / 3600)
+                    self._append_status({"ts": runner.now_iso(),
+                                         "kind": "archive_missing",
+                                         "task_id": task_id, "job_id": job_id})
+            self._reconcile_offset = offset + len(rows)
+            if len(rows) < self.RECONCILE_BATCH:
+                self._reconcile_offset = 0
+                return
 
     # ---------- 归档 GC（C1：归档文件有界保留，防无限累积） ----------
     ARCHIVE_GC_INTERVAL_SEC = 12 * 3600.0
@@ -559,6 +723,15 @@ class SchedulerService:
         if kind == "cancel_attempt":
             ok = self.cancel_attempt(target, reason or "显式取消")
             return ok, "cancelled" if ok else "not found"
+        if kind == "pause_attempt":
+            # 任务级"停止全部执行"：协作暂停（检查点保留），作业经 PAUSED
+            # 自动回 QUEUED；任务禁用时被准入闸门挡住，重新启用后自动续跑
+            meta = self.meta.get(target)
+            if meta is None or meta.status not in (JobStatus.RUNNING,
+                                                   JobStatus.STARTING):
+                return False, "not running"
+            self._request_pause(target, reason or "任务级停止")
+            return True, "pausing"
         if kind == "requeue_job":
             ok = self.requeue_job(target, reason or "人工重排")
             return ok, "requeued" if ok else "not requeueable"
@@ -646,20 +819,9 @@ class SchedulerService:
                     meta.heartbeat_gap = now_m - meta.last_heartbeat_mono
                 meta.last_heartbeat_mono = now_m
             elif kind == EventKind.PROGRESS:
-                self.health.record_progress(
-                    meta.task_id, _now_mono(),
-                    int(ev.get("completed_units") or 0),
-                    bool(ev.get("has_unfinished")),
-                    str(ev.get("stage") or ""),
-                    ev.get("active_duration_sec"),
-                    ev.get("in_flight_duration_sec"),
-                    ev.get("work_units"),
-                    ev.get("waiting"),
-                    str(ev.get("metric_semver") or ""),
-                )
+                self._ingest_progress_event(meta, int(ev.get("completed_units") or 0), ev)
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
             elif kind == EventKind.SHORTAGE:
-                meta.had_shortage = True
                 meta.shortage_at_mono = _now_mono()
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
                 self._on_explicit_shortage(meta)
@@ -676,6 +838,27 @@ class SchedulerService:
             else:
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
 
+    def _ingest_progress_event(self, meta: AttMeta, cu: int, ev: dict) -> None:
+        """进展样本入健康基线（审查修复，设计第六节 L91"进展必须给出单调递增
+        的已完成单元数"）：回退样本拒绝入基线（防污染变慢判定的速率差分），
+        仅告警；新 attempt 从 0 重新计数合法（meta 级基准）。"""
+        if meta.last_progress_cu is not None and cu < meta.last_progress_cu:
+            log.warning("attempt %s progress regressed %d -> %d, "
+                        "sample ignored for baseline",
+                        meta.attempt_id, meta.last_progress_cu, cu)
+            return
+        meta.last_progress_cu = cu
+        self.health.record_progress(
+            meta.task_id, _now_mono(), cu,
+            bool(ev.get("has_unfinished")),
+            str(ev.get("stage") or ""),
+            ev.get("active_duration_sec"),
+            ev.get("in_flight_duration_sec"),
+            ev.get("work_units"),
+            ev.get("waiting"),
+            str(ev.get("metric_semver") or ""),
+        )
+
     def _transition(self, meta: AttMeta, status: str, reason: str = "") -> None:
         meta.status = status
         self.db.commit_transition(
@@ -688,6 +871,16 @@ class SchedulerService:
         # 不足证据破坏"稳定健康"：启动间隔阶梯立即回弹到配置初值（设计第九节）
         self._healthy_since_mono = 0.0
         if self.protect.st.protected_task == meta.task_id:
+            st = self.protect.st
+            if st.cause == "slow":
+                # 审查修复（设计第十一节 L195"一旦出现明确不足则转入快速保护"）：
+                # 慢保护轮中 A 恶化为明确不足 → cause 升级，退让/放回间隔不再
+                # 按慢信号加倍，恢复快速节奏疏通 A
+                st.cause = "shortage"
+                self._append_status({"ts": runner.now_iso(),
+                                     "kind": "protect_cause_upgraded",
+                                     "task_id": meta.task_id,
+                                     "from": "slow", "to": "shortage"})
             self.protect.note_block(now)
             return
         # A2：保护语义限于高优先级（设计第十节）——报不足对象不严格高于
@@ -705,9 +898,25 @@ class SchedulerService:
         ok = self.protect.start_round(meta.task_id, meta.priority, now,
                                       reason="统一外部不足", cause="shortage",
                                       feedback_interval_sec=fi,
-                                      lower_tasks=self._lower_task_count(meta.priority))
+                                      lower_tasks=self._lower_task_count(meta.priority),
+                                      cooldown_remain_sec=self._backoff_remain_sec(meta.task_id))
         if not ok and released_snapshot:
             self._revoke_released(meta, released_snapshot)
+
+    def _backoff_remain_sec(self, task_id: str) -> float:
+        """任务最早不足重试的剩余冷却秒数（保护窗口推导用，设计第十节 L181
+        "冷却剩余时间"参与窗口计算——冷却期长于窗口时 A 得不到有效恢复
+        观察机会）。"""
+        nr = self._next_retry_by_task.get(task_id) or ""
+        if not nr:
+            return 0.0
+        try:
+            dt = datetime.fromisoformat(nr)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()
+            return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+        except ValueError:
+            return 0.0
 
     def _protect_worthy(self, priority: int) -> bool:
         """A2：保护对象须严格高于当前存活执行/排队作业的最低优先级。
@@ -759,15 +968,19 @@ class SchedulerService:
         # 会脱离 cgroup 记账成为资源黑洞）；有界等待，不冻结控制平面。
         self._ensure_tree_gone(a)
         # 确认整棵进程树退出（D 态最多再等 1s；仍未退出按未知退出码收尾，不阻塞主循环）
-        try:
-            a.proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            pass
-        exit_code = a.proc.returncode
+        if a.proc is not None:
+            try:
+                a.proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            exit_code = a.proc.returncode
+        else:
+            # 接管句柄（非子进程）无法 wait：退出码未知 → decide_outcome 归入
+            # RECOVERING 待核实（设计第十二节"状态歧义为 RECOVERING"）
+            exit_code = None
         status_ctx = JobStatus.PAUSING if meta.status == JobStatus.PAUSING else \
             (JobStatus.CANCELLED if meta.status == JobStatus.CANCELLED else "")
-        outcome = runner.decide_outcome(status_ctx, exit_code, meta.had_completed,
-                                        meta.had_shortage)
+        outcome = runner.decide_outcome(status_ctx, exit_code, meta.had_completed)
         reason = reason_override or outcome.reason
         if not reason_override and outcome.status == JobStatus.PAUSED \
                 and meta.pause_command and meta.pause_command.get("reason"):
@@ -833,17 +1046,35 @@ class SchedulerService:
 
         B7（设计第十四节：恢复后逐步减少等待）：本 attempt 已有真实业务进展
         （检查点事件在启动后到达过）时按 1 计数，等待从起点重新增长。
+        审查修复（等待上限随"近期失败间隔"调整，设计第十四节 L239）：任务在
+        短时间内连续不足（失败间隔 < 300s）说明外部严重不可得，等待上限至少
+        提高到 600s——更长等待、更低频探测，避免重试风暴。
         """
         job = self.db.get_job(job_id) or {}
+        task_id = str(job.get("task_id") or "")
+        # 外部压力闸门输入：一次外部不足事件进入滑动窗口（密度×广度判定）
+        self.etrend.note_shortage(task_id, _now_mono())
         retry = 1 if had_evidence else int(job.get("retry_count") or 0) + 1
         base = self.cfg.control.shortage_retry_base_sec
         cap = self.cfg.control.shortage_retry_cap_sec
         # 等待上限随任务处理周期调整（设计第十四节：等待上限和观察时间随
         # 近期失败间隔与处理周期调整）：不低于 8×反馈间隔，封顶 3600s
-        spec = self.specs.get(str(job.get("task_id") or ""))
+        spec = self.specs.get(task_id)
         fi = (spec.feedback_interval_sec or 0.0) if spec is not None else 0.0
         if fi > 0:
             cap = min(3600.0, max(cap, fi * 8.0))
+        # 近期失败间隔：连续快速失败说明外部严重不可得 → 提高等待上限、
+        # 降低探测频率（审查修复，设计第十四节 L239"随近期失败间隔调整"）；
+        # 失败间隔 <60s（密集）上限至少 1800s，<300s 至少 900s
+        last_mono = self._last_shortage_mono.get(task_id)
+        now_mono = _now_mono()
+        if last_mono is not None:
+            gap = now_mono - last_mono
+            if gap < 60.0:
+                cap = min(3600.0, max(cap, 1800.0))
+            elif gap < 300.0:
+                cap = min(3600.0, max(cap, 900.0))
+        self._last_shortage_mono[task_id] = now_mono
         delay = min(cap, base * (2 ** (retry - 1)))
         delay *= 1.0 + random.uniform(0.0, 0.25)  # 随机抖动，避免重试风暴
         next_at = (datetime.now(timezone.utc) +
@@ -974,8 +1205,15 @@ class SchedulerService:
             completed = bool(attempts) and self._disk_completed(
                 attempts[0]["attempt_id"])
             if completed:
-                self.db.set_job_status(job_id, JobStatus.SUCCEEDED,
-                                       "恢复核实：完成记录已持久化", now)
+                # 核实成功：attempt 与 job 在同一事务中提交终态（审查修复：
+                # 此前只更新 job 行，attempt 行停留在 RECOVERING 最多 30s，
+                # 与"每次状态变更带执行身份在事务中提交"不一致）
+                self.db.commit_transition(
+                    attempts[0]["attempt_id"],
+                    {"status": JobStatus.SUCCEEDED, "finished_at": now,
+                     "reason": "恢复核实：完成记录已持久化"},
+                    job_id, JobStatus.SUCCEEDED,
+                    "恢复核实：完成记录已持久化", now)
             else:
                 self.db.set_job_status(job_id, JobStatus.RECOVERY_BLOCKED,
                                        "退出 0 但无完成记录，无法确认提交结果，需人工核实", now)
@@ -1067,6 +1305,20 @@ class SchedulerService:
                      gone, self.cfg.control.cleanup_terminal_after_sec)
 
     # ---------- 暂停恢复（PAUSED → QUEUED，逐步放回） ----------
+    # 恢复排队前需冷却的暂停来源（防紧密"重启→再暂停"循环，设计第八/十四节）：
+    # - 心跳过期：疑似卡死，冷却后再探（原有行为）；
+    # - OOM 证据 / 内存增长退让：内存超限任务立即重启会周期性再触发 OOM，
+    #   冷却把循环降到低频探测（与 BACKOFF 的"长期保持低频探测"一致）；
+    # - 保护自收缩：设计第十节"失败的 A 作业自行保存进度并冷却"。
+    _RESUME_COOLDOWN_MARKERS = ("心跳过期", "OOM", "内存增长退让", "无低优先级可退让")
+
+    def _resume_cooldown_sec(self, job: dict) -> float:
+        """该 PAUSED 作业恢复排队前的冷却秒数（0=立即恢复）。"""
+        reason = str(job.get("reason") or "")
+        if any(m in reason for m in self._RESUME_COOLDOWN_MARKERS):
+            return self.cfg.control.heartbeat_resume_cooldown_sec
+        return 0.0
+
     def _tick_release(self, now_mono: float) -> None:
         st = self.protect.st
         # 保护结束后逐步放回退让的任务（每次一个，recovery_probe_sec 节奏）
@@ -1087,8 +1339,9 @@ class SchedulerService:
                 continue  # 待逐步放回的任务保持节奏
             if prot_pri is not None and int(j["priority"]) < prot_pri:
                 continue  # 保护轮中低优先级作业不走直接恢复
-            if "心跳过期" in (j.get("reason") or ""):
-                # 心跳过期（疑似卡死）的作业需先冷却再恢复，否则每秒重启循环
+            if self._resume_cooldown_sec(j) > 0:
+                # 资源型/疑似卡死暂停：先冷却再恢复，否则形成每秒级重启循环；
+                # finished_at 缺失/不可解析时按已过冷却处理（不永久扣押）
                 paused_at = None
                 try:
                     paused_at = datetime.fromisoformat(j.get("finished_at") or "")
@@ -1118,20 +1371,30 @@ class SchedulerService:
         io = 0
         observed_any = False
         have_attempts = len(self.attempts) > 0
+        per_att_cpu: dict[str, float] = {}   # 本采样区间每 attempt CPU 增量（usec）
+        per_att_mem: dict[str, float] = {}   # 每 attempt 瞬时内存（字节）
         for attempt_id, a in self.attempts.items():
-            if a.cgrp.available:
-                observed_any = True
+            # 审查修复（观测不足口径，设计第八节 L133"指标不支持归属时标为
+            # 观测不足"）：观测可用性以"实际读到任一指标"为准，而非"cgroup
+            # 目录可写"——父级未向 sched 层委派控制器时目录可写但 cpu.stat/
+            # memory.current 全部缺失，此前会把资源门禁静默失效（恒判健康）。
             usec = a.cgrp.read_cpu_usage_usec()
-            if usec:
+            if usec is not None:
+                observed_any = True
                 prev = self._last_cpu_usec.get(attempt_id)
                 if prev is not None:
-                    cpu_delta += max(0, usec - prev)
+                    delta = max(0, usec - prev)
+                    cpu_delta += delta
+                    per_att_cpu[attempt_id] = delta
                 self._last_cpu_usec[attempt_id] = usec
             m = a.cgrp.read_current_mem()
-            if m:
+            if m is not None:
+                observed_any = True
                 mem += m
+                per_att_mem[attempt_id] = m
             io_b = a.cgrp.read_io_bytes()
             if io_b is not None:
+                observed_any = True
                 prev = self._last_io_bytes.get(attempt_id)
                 if prev is not None:
                     io += max(0, io_b - prev)
@@ -1175,14 +1438,32 @@ class SchedulerService:
         # 差分后按采样间隔归一化为瞬时 CPU 占用率（usage_usec 为累积值，除以核数与逝去时间）
         elapsed = (now - prev_mono) if prev_mono > 0 else self.cfg.control.sample_interval_sec
         cpu_ratio = (self._sample_cpu / 1_000_000.0) / max(1, total_cpu) / max(1e-6, elapsed)
+        # 每 attempt 资源摘要（监控视图导出，不参与任何控制决策）
+        self._sample_attempt = {
+            aid: {"cpu_pct": round(d / 1_000_000.0 / max(1, total_cpu)
+                                   / max(1e-6, elapsed) * 100, 1),
+                  "mem_mb": round(per_att_mem.get(aid, 0) / (1024 * 1024), 1)}
+            for aid, d in per_att_cpu.items()
+        }
         # 观测不足语义：/proc/meminfo 不可读（total_mem<=0）时内存占比未知，
         # 置 0 跳过内存门禁，而不是爆表停掉一切准入
         mem_ratio = (self._sample_mem_mb / total_mem) if total_mem > 0 else 0.0
         # B1：I/O 压力参与资源健康判定（psi io full avg10 归一化 0-1；
         # 无 psi 观测时为 0，不影响判定，设计第八节"执行范围的压力指标"）
         io_pressure = float(self._sample_pressure.get("io") or 0.0) / 100.0
+        prev_state = self.trend.state
         self.trend.sample(cpu_ratio, mem_ratio, observability_ok,
                           io_pressure=io_pressure)
+        # 状态迁移审计（NORMAL → HOLD → SHED，统一资源水位状态机）
+        if self.trend.state != prev_state:
+            self._append_status({"ts": runner.now_iso(),
+                                 "kind": "resource_state",
+                                 "from": prev_state, "to": self.trend.state,
+                                 "cpu_ratio": round(cpu_ratio, 3),
+                                 "mem_ratio": round(mem_ratio, 3)})
+            log.warning("resource gate %s -> %s (cpu %.1f%%, mem %.1f%%)",
+                        prev_state, self.trend.state,
+                        cpu_ratio * 100, mem_ratio * 100)
         # 执行内存快速增长并接近容量 → 立即停止新增，并优先暂停低优先级中
         # 实测可释放内存较多的进程（设计第八节）
         if (self._prev_mem_mb > 0 and self._sample_mem_mb > self._prev_mem_mb):
@@ -1209,6 +1490,22 @@ class SchedulerService:
                         self._request_pause(
                             target, reason="执行内存快速增长（内存增长退让）")
         self._prev_mem_mb = self._sample_mem_mb
+        # SHED（执行内存达上限）：除停新增外，按优先级自高向低为参照挑选
+        # 低优先级中实测可释放内存较多者暂停撤内存（与增长退让共用节流）；
+        # 水位降到恢复线以下由状态机自动回 NORMAL 重新放行。
+        if self.trend.shedding():
+            if now - self._last_mem_yield_mono >= max(
+                    3.0 * self.cfg.control.sample_interval_sec, 30.0):
+                top = max((m for m in self.meta.values()
+                           if m.status in (JobStatus.RUNNING,
+                                           JobStatus.STARTING)),
+                          key=lambda m: m.priority, default=None)
+                target = self._choose_oom_yield_candidate(
+                    top.attempt_id) if top is not None else None
+                if target is not None:
+                    self._last_mem_yield_mono = now
+                    self._request_pause(
+                        target, reason="资源水位 SHED：执行内存达上限（撤内存退让）")
 
     def _on_oom_evidence(self, attempt_id: str, delta: int) -> None:
         """OOM 证据：停止增长，优先暂停低优先级中可释放内存较多者（设计第八节）。"""
@@ -1287,7 +1584,8 @@ class SchedulerService:
                             task_id, pri, now,
                             reason="高优先级请求到达且执行侧接近饱和",
                             cause="demand", feedback_interval_sec=fi,
-                            lower_tasks=self._lower_task_count(pri)):
+                            lower_tasks=self._lower_task_count(pri),
+                            cooldown_remain_sec=self._backoff_remain_sec(task_id)):
                         self._append_status({"ts": runner.now_iso(),
                                              "kind": "protect_started",
                                              "task_id": task_id, "priority": pri,
@@ -1305,7 +1603,8 @@ class SchedulerService:
                     if self.protect.start_round(meta.task_id, meta.priority, now,
                                                 reason="无报错持续变慢", cause="slow",
                                                 feedback_interval_sec=fi,
-                                                lower_tasks=self._lower_task_count(meta.priority)):
+                                                lower_tasks=self._lower_task_count(meta.priority),
+                                                cooldown_remain_sec=self._backoff_remain_sec(meta.task_id)):
                         self._append_status({"ts": runner.now_iso(),
                                              "kind": "protect_started",
                                              "task_id": meta.task_id,
@@ -1321,6 +1620,11 @@ class SchedulerService:
             # 的陈旧样本判"有进展"会在恢复瞬间立即 +1（无真实进展支撑）
             has_progress = self.health.has_progress_since(
                 task_id, now - self.health.window_sec)
+            if has_progress:
+                # 审查修复（设计第九节 L153/L157）：真实业务进展恢复且距上次
+                # 收缩已过观察期 → 不足证据清零、恢复 steady。长期任务无完成
+                # 事件，此前 streak 只增不清会永久停止扩容（而非"减慢探索"）。
+                self.scaling.note_recovered_progress(task_id, now)
             if self.scaling.may_grow(task_id, now, live, has_progress,
                                      self.trend.healthy_enough(),
                                      observe_factor=obs_factor):
@@ -1531,6 +1835,39 @@ class SchedulerService:
             factor = 0.5
         return max(self.START_INTERVAL_FLOOR_SEC, base * factor)
 
+    def _tick_external(self, now: float) -> None:
+        """外部资源压力闸门（反馈式规避，设计第十四节）。
+
+        唯一事实来源是外部不足事件流（exit 75）——不建模资源身份/配额。
+        多任务同时不足（密度×广度越阈）→ 全局限停新准入（在途不动，靠
+        退避自然衰减）；密度回落持续观察期 → 解除。
+        嫌疑优先原则：外部资源相对稳定，突然不足优先怀疑稳定回看窗内
+        新加入的任务——进入压力时自动压制其动态目标至单并发探索并导出
+        嫌疑名单（状态事件 + 快照），供人工排查；解除后嫌疑最后恢复。
+        """
+        prev = self.etrend.state
+        active_tasks = {m.task_id for m in self.meta.values()}
+        self.etrend.sample(now, active_tasks)
+        if self.etrend.state == prev:
+            return
+        snap = self.etrend.snapshot(now)
+        if self.etrend.holding():
+            for tid in self.etrend.suspects():
+                ts = self.scaling.get(tid)
+                ts.run_target = min(ts.run_target, 1)
+                ts.mode = "explore"
+            self._stats["external_holds"] = self._stats.get("external_holds", 0) + 1
+            self._append_status({
+                "ts": runner.now_iso(), "kind": "external_state",
+                "state": scaling.ExternalTrend.HOLD,
+                "suspects": snap["suspects"],
+                "recent_tasks": snap["recent_tasks"],
+                "recent_events": snap["recent_events"]})
+        else:
+            self._append_status({
+                "ts": runner.now_iso(), "kind": "external_state",
+                "state": scaling.ExternalTrend.NORMAL})
+
     def _tick_admit(self, now: float) -> None:
         # B9（设计第八节：准入核执行资源反馈）：资源趋势持续不健康时暂停新增
         # 准入，在途执行不受影响；滞回恢复健康后自动继续。这不是隐藏上限——
@@ -1538,6 +1875,11 @@ class SchedulerService:
         # 任务动态目标不受影响，健康后立即按目标继续准入。
         if not self.trend.healthy_enough():
             self._healthy_since_mono = 0.0
+            return
+        # 外部压力闸门（反馈式）：多任务同时报外部不足 → 全局限停新准入。
+        # 与本地资源门禁同语义（HOLD：在途不受影响，靠退避自然衰减）；
+        # 不预设外部资源限制，密度回落并保持观察期后自动恢复。
+        if self.etrend.holding():
             return
         interval = self._effective_start_interval(now)
         # 令牌制（设计第九节 L155"不锁死为每秒最多两个进程；缩短时避免积累
@@ -1606,16 +1948,27 @@ class SchedulerService:
         live = self._live_count(task_id)
         scale = self.scaling.get(task_id)
         # 冷启动给 1，否则不超过动态目标
+        why = "扩容补位"
         if scale.run_target == 0 and live == 0:
             scale.run_target = 1
             self.scaling.grew_at(task_id, _now_mono())
             self._persist_scale(task_id)
-        if live >= max(1, scale.run_target):
+            why = "冷启动探索"
+        limit = max(1, scale.run_target)
+        # 审查修复（设计第十节 L177"每次只恢复少量运行机会并观察 A"）：
+        # 保护轮放回观察中的任务受临时准入上限约束，防止未被暂停过的
+        # QUEUED 积压在保护结束后按原目标一次性拉满
+        cap = self.protect.resume_cap(task_id, _now_mono(), scale.run_target)
+        if cap is not None:
+            limit = min(limit, cap)
+            why = f"保护后逐步放回（上限 {cap}）"
+        if live >= limit:
             return False
         spec = self.specs[task_id]
-        return self._launch(job, spec)
+        return self._launch(job, spec, why=why)
 
-    def _launch(self, job: dict, spec: config.TaskSpec) -> bool:
+    def _launch(self, job: dict, spec: config.TaskSpec,
+                why: str = "") -> bool:
         attempt_id = runner.new_id("att")
         token = runner.new_id("tok")
         seq = self.db.next_attempt_seq(job["job_id"])
@@ -1631,7 +1984,13 @@ class SchedulerService:
         # 跨 attempt 检查点继承（设计文档第七节）：新 run_dir 是空的，若不把旧检查点
         # 搬运过来，worker 的 resume_data() 将读到 None 而从零执行——重试/暂停恢复/
         # 重启重放全部失去断点。此处把该作业最近一次已提交检查点整体复制进新 run_dir。
-        self._restore_checkpoint(job["job_id"], attempt_id)
+        resumed = self._restore_checkpoint(job["job_id"], attempt_id)
+        if resumed:
+            # 恢复早期豁免（审查修复，设计第十一节 L191"恢复早期……排除在退化
+            # 比较之外"）：断点重放启动的速率天然低于稳态基线（缓存冷启动等），
+            # 在一个扩容观察期内不参与变慢判定
+            self.health.note_resumed(job["task_id"], _now_mono(),
+                                     self.scaling.get(job["task_id"]).grow_observe_sec)
         try:
             import json as _json
             aspec = runner.AttemptSpec(
@@ -1662,6 +2021,9 @@ class SchedulerService:
         meta.feedback_interval = spec.feedback_interval_sec or 0.0
         self.attempts[attempt_id] = a
         self.meta[attempt_id] = meta
+        # 外部压力嫌疑判定基准：登记任务首次活跃时刻（稳定回看窗内首次
+        # 活跃的任务在压力爆发时优先被怀疑——外部资源相对稳定原则）
+        self.etrend.note_active(str(job["task_id"]), _now_mono())
         self.db.update_attempt(attempt_id, pid=a.pid, pgid=a.pgid,
                                start_monotonic=a.start_time,
                                pid_start_time=a.start_time)
@@ -1674,7 +2036,8 @@ class SchedulerService:
             pass
         self._append_status({"ts": now, "kind": "attempt_launched", "attempt_id": attempt_id,
                              "job_id": job["job_id"], "task_id": job["task_id"],
-                             "pid": a.pid})
+                             "pid": a.pid, "why": why,
+                             "resumed": resumed})
         return True
 
     def _restore_checkpoint(self, job_id: str, new_attempt_id: str) -> bool:
@@ -1856,12 +2219,23 @@ class SchedulerService:
             "exec_pressure": self._sample_pressure,
             "observability_ok": self._observability_ok,
             "resource_unhealthy": self.trend.unhealthy(),
+            "resource_state": self.trend.state,
+            "external": self.etrend.snapshot(_now_mono()),
             "protected_task": self.protect.st.protected_task,
             "protect_reason": self.protect.st.reason,
             "yielded": sorted(self.protect.st.yielded),
             "pending_resume": sorted(self.protect.st.pending_resume),
+            # 每个被退让任务可查询的恢复机会（设计第十节 L181）：已放回任务
+            # 的临时准入上限 + 下一次放回允许时刻
+            "resume_state": {
+                "released": {t: self.protect.resume_cap(t, _now_mono(), 10**6)
+                             for t in self.protect.st.released},
+                "next_release_in_sec": round(max(
+                    0.0, self.protect.st.next_release_mono - _now_mono()), 1),
+            },
             "recovering": len(self._recover_wait),
             "scan_pending": dict(self._scan_pending),
+            "attempt_resources": self._sample_attempt,
             "scale": {tid: {"run_target": s.run_target, "mode": s.mode}
                       for tid, s in self.scaling.scale_items()},
             # 监控统计（设计第十五节）：事件计数 + 关键路径平均延迟（最近 50 次滑动窗口）

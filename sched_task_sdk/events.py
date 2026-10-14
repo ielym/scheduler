@@ -1,7 +1,7 @@
 """执行事件通道写侧（worker 用）。
 
 事件以 JSON 行追加到 SCHED_EVENT_FILE，字段：
-  {"seq": N, "kind": "...", "at": ISO, "job_id": "...", "attempt_id": "...", "...payload 平铺..."}
+  {"seq": N, "kind": "...", "at": ISO(UTC), "job_id": "...", "attempt_id": "...", "...payload 平铺..."}
 
 seq 单调递增，由本进程维护；调度器按 (attempt_id, seq) 去重。
 kind ∈ {started, heartbeat, progress, external_shortage, control_ack,
@@ -15,7 +15,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -74,11 +74,6 @@ class EventWriter:
                       file=sys.stderr, flush=True)
             return seq
 
-    @property
-    def seq(self) -> int:
-        with self._lock:
-            return self._seq
-
 
 _global_writer: EventWriter | None = None
 
@@ -95,7 +90,8 @@ def emit(kind: str, **payload: Any) -> int:
 
 
 def _now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    """统一 UTC 时间戳（设计第十四节：持久化恢复时间记录 UTC）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 __all__ = ["EventWriter", "writer", "emit", "event_file", "EventKind"]

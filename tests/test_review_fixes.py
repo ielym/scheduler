@@ -156,7 +156,7 @@ def test_admit_job_cold_start_bump_for_starved_task(home, monkeypatch):
 
     launched = []
     monkeypatch.setattr(svc, "_launch",
-                        lambda job, spec: launched.append(job["job_id"]) or True)
+                        lambda job, spec, why="": launched.append(job["job_id"]) or True)
     cands = svc._candidates()
     assert cands, "饥饿任务作业必须出现在候选中"
     assert svc._admit_job(cands[0]) is True
@@ -164,7 +164,8 @@ def test_admit_job_cold_start_bump_for_starved_task(home, monkeypatch):
     # 动态目标持久化为 1（重启不回退），模式进入 steady
     ts = svc.scaling.get("t_starved")
     assert ts.run_target == 1 and ts.mode == "steady"
-    assert svc.db.get_task_state("t_starved")["run_target"] == 1
+    assert next(s for s in svc.db.all_task_states()
+                if s["task_id"] == "t_starved")["run_target"] == 1
 
 
 # ---------- #1b 高优先级新需求探测脱离全局窗口 ----------
@@ -218,7 +219,7 @@ def test_receiver_incremental_scan_finds_new_files_and_subdirs(home):
     s3 = receiver.receive_outbox("t", spec, db, now, batch_size=None)
     assert s3["created"] == 2
     assert set(receiver._dir_cache["t"]) == {".", "batch1", "batch2", "batch2/b1"}
-    assert db.count_jobs("t") == 4
+    assert len(db.list_jobs("t", limit=1000)) == 4
 
     # 删除文件（模拟归档后 outbox 缩空）：列举集合收缩、缓存不再返回旧名
     for p in out.rglob("*.json"):

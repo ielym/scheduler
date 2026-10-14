@@ -127,8 +127,9 @@ class CheckpointStore:
 
 
 def _now_iso() -> str:
-    from datetime import datetime
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    """统一 UTC 时间戳（设计第十四节：持久化恢复时间记录 UTC）。"""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _env_str(k: str) -> str:

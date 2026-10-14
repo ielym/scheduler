@@ -130,7 +130,8 @@ class Producer:
 
     def advance(self, new_cursor: Any, jobs: list[dict]) -> None:
         """持久化游标与待发布记录（同一原子写）。jobs 每项含 event_id/business_version 与
-        正式的就绪 JSON 载荷字段。
+        正式的就绪 JSON 载荷字段；可选 subdir 指定 outbox 分目录（大规模任务，
+        设计第二节 L23"可以按发布批次或文件名散列分目录"）。
 
         先构造新状态并落盘，成功后才替换内存游标：持久化失败时内存与磁盘都停留在
         旧游标，下轮从旧位置重扫，事件不丢失（游标先推进会把未发布记录永久跳过）。
@@ -157,7 +158,11 @@ class Producer:
             "entry_args": list(spec.get("entry_args") or []),
             "workdir": spec.get("workdir") or ".",
             "input_refs": list(spec.get("input_refs") or []),
-            "idempotency_key": spec.get("idempotency_key") or "",
+            # 幂等键兜底（审查修复，设计第四节 L63"每份就绪 JSON 包含……幂等键"）：
+            # 业务未显式提供时以稳定事件标识兜底（同一事件重放得到同一键），
+            # 保证幂等键全链路非空——接收端对空幂等键的请求按无效载荷隔离。
+            "idempotency_key": str(spec.get("idempotency_key")
+                                   or spec.get("event_id") or job_id),
             "progress_semver": spec.get("progress_semver") or "1.0.0",
             "env": dict(spec.get("env") or {}),
         }
@@ -165,19 +170,39 @@ class Producer:
         pri = spec.get("priority")
         if pri is not None:
             payload["priority"] = int(pri)
+        # outbox 分目录（可选，协议外字段：不进入就绪 JSON 本体——接收端
+        # extra=forbid 会拒绝未定义字段；由 publish_all 发布时定位使用）
+        subdir = str(spec.get("subdir") or "").strip().strip("/")
+        if subdir and ".." not in Path(subdir).parts and not subdir.startswith("/"):
+            payload["__outbox_subdir__"] = subdir
         return payload
 
     # ---------- 发布 ----------
     def publish_all(self) -> list[str]:
-        """把未发布/未确认的作业写到 outbox（幂等，丢失可重发）。返回写入的 job_id 列表。"""
+        """把未发布/未确认的作业写到 outbox（幂等，丢失可重发）。返回写入的 job_id 列表。
+
+        审查修复：支持 outbox 分目录（payload 的 __outbox_subdir__ 协议外字段
+        指定相对子目录，发布时剥离该字段——正式 JSON 仍是纯协议载荷，接收端
+        递归扫描分目录，设计第二节 L23 / 第五节 L83）。
+        """
         published = []
         with self._lock:
             items = list(self._state["unacked"].items())
         out = _outbox_dir()
         for job_id, payload in items:
-            target = out / f"{job_id}.json"
+            # 协议外字段剥离在副本上进行（不修改 unacked 内存/磁盘记录），
+            # 重发时仍能定位同一分目录
+            subdir = ""
+            body = payload
+            if isinstance(payload, dict) and "__outbox_subdir__" in payload:
+                body = {k: v for k, v in payload.items()
+                        if k != "__outbox_subdir__"}
+                subdir = str(payload["__outbox_subdir__"] or "").strip("/")
+            target_dir = out / subdir if subdir else out
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{job_id}.json"
             # 幂等：内容一致就跳过；不一致（文件被破坏/半写）则重写
-            content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+            content = json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True)
             if target.exists():
                 try:
                     if target.read_text("utf-8") == content:
@@ -185,14 +210,15 @@ class Producer:
                         continue
                 except OSError:
                     pass
-            fd, tmp = tempfile.mkstemp(dir=str(out), prefix=job_id + ".", suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(dir=str(target_dir),
+                                       prefix=job_id + ".", suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(content)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, target)
-                _fsync_dir(out)
+                _fsync_dir(target_dir)
                 published.append(job_id)
             except BaseException:
                 try:

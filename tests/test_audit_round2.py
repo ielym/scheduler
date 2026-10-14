@@ -204,7 +204,7 @@ def test_launch_infra_failure_keeps_job_queued(home, monkeypatch):
         raise OSError("解释器不存在")
 
     monkeypatch.setattr(runner, "launch", boom)
-    job = svc.db.queued_jobs(limit=5)[0]
+    job = svc.db.jobs_in_status(JobStatus.QUEUED, limit=5)[0]
     assert svc._launch(job, config.load_task("t10")) is False
     # 作业保持 QUEUED（基础设施问题不得终态化 FAILED）
     assert svc.db.get_job("j10")["status"] == JobStatus.QUEUED

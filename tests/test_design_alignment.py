@@ -296,9 +296,9 @@ class TestOutboxSubdirectories:
         db = SchedulerService().db
         receiver.receive_outbox("t1", spec, db, "t0", batch_size=1)
         # 半数配额给新文件：只处理了一个，另一个下轮继续（相对路径区分）
-        assert db.count_jobs("t1") == 1
+        assert len(db.list_jobs("t1", limit=1000)) == 1
         receiver.receive_outbox("t1", spec, db, "t1")
-        assert db.count_jobs("t1") == 2
+        assert len(db.list_jobs("t1", limit=1000)) == 2
         # outbox 清空后再扫一轮：seen 记忆随本轮扫描结果清空（归档文件不滞留）
         receiver.receive_outbox("t1", spec, db, "t2")
         assert receiver._seen_files["t1"] == set()

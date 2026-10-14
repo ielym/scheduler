@@ -27,31 +27,31 @@ from sched.scheduler import SchedulerService
 # ---------- 1. decide_outcome ----------
 class TestDecideOutcome:
     def test_shortage_then_complete_is_success(self):
-        # 修复前：had_shortage 优先 → 误判 BACKOFF
-        o = runner.decide_outcome("", 0, had_completed=True, had_shortage=True)
+        # 退出 0 + 完成记录优先（运行期曾报不足事件不改变归因）
+        o = runner.decide_outcome("", 0, had_completed=True)
         assert o.status == JobStatus.SUCCEEDED
 
     def test_exit75_without_event_is_backoff(self):
-        o = runner.decide_outcome("", 75, had_completed=False, had_shortage=False)
+        o = runner.decide_outcome("", 75, had_completed=False)
         assert o.status == JobStatus.BACKOFF
 
     def test_exit0_no_completed_is_recovering(self):
-        o = runner.decide_outcome("", 0, had_completed=False, had_shortage=False)
+        o = runner.decide_outcome("", 0, had_completed=False)
         assert o.status == JobStatus.RECOVERING
 
     def test_pause_ctx_wins(self):
-        o = runner.decide_outcome(JobStatus.PAUSING, 0, True, False)
+        o = runner.decide_outcome(JobStatus.PAUSING, 0, True)
         assert o.status == JobStatus.PAUSED
 
     def test_cancel_ctx_wins(self):
         # 未完成时显式取消生效
-        o = runner.decide_outcome(JobStatus.CANCELLED, -15, False, False)
+        o = runner.decide_outcome(JobStatus.CANCELLED, -15, False)
         assert o.status == JobStatus.CANCELLED
 
     def test_cancel_but_completed_wins(self):
         # B1：取消请求到达前完成记录已持久化 → 完成证据优先于取消意图
-        o = runner.decide_outcome(JobStatus.CANCELLED, -15, True, False)
-        assert o.status == JobStatus.SUCCEEDED and o.completed
+        o = runner.decide_outcome(JobStatus.CANCELLED, -15, True)
+        assert o.status == JobStatus.SUCCEEDED
 
 
 # ---------- 2. Protect ----------
@@ -306,7 +306,8 @@ class TestDB:
 
 
 def _ready(job_id, task_id):
-    return config.ReadyJob(schema_version=1, job_id=job_id, task_id=task_id)
+    return config.ReadyJob(schema_version=1, job_id=job_id, task_id=task_id,
+                           idempotency_key=f"idem-{job_id}")
 
 
 # ---------- 6/7/8. SchedulerService 状态闭环（DB 层，不起进程） ----------

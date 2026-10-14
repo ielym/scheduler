@@ -39,7 +39,6 @@ class ProducerProc:
     proc: subprocess.Popen | None   # None = 接管的外部（上个调度器遗留）生产者
     pid: int
     start_time: float               # /proc 启动时间（身份核实）
-    started_monotonic: float
     backoff_sec: float = 0.0
     crash_count: int = 0
     last_crash_monotonic: float = 0.0
@@ -89,11 +88,21 @@ def _pid_alive(pid: int, expect_start_time: float) -> bool:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    # 僵尸态不算存活（父进程未 wait 时退出进程以僵尸态留在 /proc）
+    return not _proc_zombie(pid)
+
+
+def _proc_zombie(pid: int) -> bool:
+    try:
+        data = open(f"/proc/{pid}/stat", "rb").read()
+        state = data.rsplit(b")", 1)[1].split()[0][:1]
+        return state in ("Z", "x", "X")
+    except (OSError, IndexError, ValueError):
+        return False
 
 
 def _producer_lock_path(task_id: str) -> Path:
@@ -156,14 +165,17 @@ class ProducerGuard:
                 with self._lock:
                     self._procs[task_id] = ProducerProc(
                         task_id=task_id, proc=None, pid=holder[0],
-                        start_time=holder[1], started_monotonic=time.monotonic(),
-                        external=True)
+                        start_time=holder[1], external=True)
                 return False
         task_root = config.task_dir(task_id)
         argv = _build_argv(task_root, spec.producer_entry)
         env = _build_env(task_id, task_root)
         log_dir = self._logs / task_id
-        log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.warning("create log dir for producer %s failed: %s", task_id, e)
+            raise
         # 生产者日志 16MB 轮转（.1 覆盖旧档），防常驻进程日志无限增长
         for name in ("producer.stdout.log", "producer.stderr.log"):
             lp = log_dir / name
@@ -172,16 +184,35 @@ class ProducerGuard:
                     os.replace(lp, lp.with_name(name + ".1"))
             except OSError:
                 pass
-        stdout = open(log_dir / "producer.stdout.log", "ab")
-        stderr = open(log_dir / "producer.stderr.log", "ab")
-        proc = subprocess.Popen(
-            argv, cwd=str(task_root), env=env,
-            stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-            start_new_session=True, close_fds=True,
-        )
+        stdout = stderr = None
+        try:
+            stdout = open(log_dir / "producer.stdout.log", "ab")
+            stderr = open(log_dir / "producer.stderr.log", "ab")
+            proc = subprocess.Popen(
+                argv, cwd=str(task_root), env=env,
+                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                start_new_session=True, close_fds=True,
+            )
+        except Exception:
+            # 拉起失败：关掉已打开的日志句柄再上抛（由 _tick_ensure_producers
+            # 按任务隔离记录，不拖垮整轮循环，设计第三节 L35）
+            for f in (stdout, stderr):
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+            raise
+        finally:
+            # 子进程已继承 fd：父侧句柄立即关闭（否则每任务泄漏 2 个 fd）
+            for f in (stdout, stderr):
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
         pp = ProducerProc(task_id=task_id, proc=proc, pid=proc.pid,
-                          start_time=_proc_start_time(proc.pid),
-                          started_monotonic=time.monotonic())
+                          start_time=_proc_start_time(proc.pid))
         with self._lock:
             self._procs[task_id] = pp
         return True
@@ -281,7 +312,13 @@ class ProducerGuard:
         if pp is None:
             return
         try:
-            os.killpg(pp.pid, 15)  # SIGTERM（生产者以 start_new_session 启动，pgid==pid）
+            if pp.proc is not None:
+                # 自己拉起的生产者以 start_new_session 启动，pgid==pid 成立
+                os.killpg(pp.pid, 15)  # SIGTERM
+            else:
+                # 接管的外部生产者：pgid 可能含无关进程（由外部服务管理器启动），
+                # 只对生产者进程本身发 TERM（审查修复），其子进程归外部管理器
+                os.kill(pp.pid, 15)
         except (ProcessLookupError, PermissionError, OSError):
             pass
         if pp.proc is not None:

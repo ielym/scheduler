@@ -44,12 +44,18 @@ class Cgroup:
             except OSError:
                 self.available = False
 
+    # 向下委派的控制器（设计第八节 L127：I/O 计数也是准入门禁的观测输入）
+    _DELEGATE_CONTROLLERS = ("cpu", "memory", "io")
+
     def _delegate_to_nested_path(self) -> None:
-        """沿 name 的每一级中间目录，自上而下向其 subtree_control 写 +cpu +memory。
+        """沿 name 的每一级中间目录，自上而下向其 subtree_control 写 +cpu +memory +io。
 
         cgroup v2 规则：父 cgroup 的 subtree_control 决定其子代可用哪些控制器；
         且父 cgroup 内不能直接驻留进程（no internal process）。sched/<job>/ 层
         从不直接放进程（run 都在叶子），故可以安全委派。失败静默降级。
+        审查修复（io 委派缺失）：此前只委派 cpu+memory，io 控制器从未到位，
+        叶子 cgroup 的 io.stat 永远不存在、I/O 计数观测恒为空。现委派 io；
+        宿主根未启用 io 控制器时按其 cgroup.controllers 过滤，避免无效写。
         """
         parts = [p for p in self.name.split("/") if p and p != "."]
         # 需要委派的所有层：sched 根层 + 每个中间层（不含叶子 rid 层）。
@@ -58,12 +64,19 @@ class Cgroup:
         for part in parts[:-1]:
             levels.append(levels[-1] / part)
         for ancestor in levels:
+            # 只委派该层实际启用的控制器（写未启用的控制器会失败被静默吞掉）
+            try:
+                avail = set((ancestor / "cgroup.controllers")
+                            .read_text().split())
+            except OSError:
+                avail = set()
+            todo = [c for c in self._DELEGATE_CONTROLLERS if c in avail]
             sc = ancestor / "cgroup.subtree_control"
-            if not sc.exists():
+            if not sc.exists() or not todo:
                 continue
             try:
                 cur = sc.read_text().strip()
-                val = "".join(f" +{c}" for c in ("cpu", "memory") if f"+{c}" not in cur)
+                val = "".join(f" +{c}" for c in todo if f"+{c}" not in cur)
                 if val:
                     sc.write_text(val.strip())
             except OSError:
@@ -122,14 +135,30 @@ class Cgroup:
         return [int(x) for x in txt.split()]
 
     def remove(self) -> None:
+        """删除本 cgroup（先整组终止，再有界等待 rmdir）。
+
+        一次性 rmdir 在进程树收尾稍慢（僵尸/收尾中）时必然失败且被静默
+        吞掉——每次执行泄漏一个目录，kernfs inode 随时间累积。此处有界
+        重试（2s）：仅在 cgroup 内仍有存活 pid（D 态等）时继续等待，
+        pid 已消失仍 rmdir 失败（子 cgroup/非 cgroupfs 目录）则立即放弃，
+        交给启动期 reap_orphans 的空目录清理兜底。
+        """
         if not self.path or not self.path.exists():
             return
         try:
             self.kill_all()
-            time.sleep(0.05)
-            self.path.rmdir()
         except OSError:
             pass
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                self.path.rmdir()
+                return
+            except OSError:
+                pass
+            if not _procs_alive(self.procs()):
+                break
+            time.sleep(0.05)
 
     # ---- 内部 ----
     def _write(self, fname: str, value: str) -> None:
@@ -200,11 +229,44 @@ def reap_orphans(exclude: set[str] | None = None) -> int:
             (d / "cgroup.kill").write_text("1")
         except OSError:
             pass
+    _prune_empty_dirs()
     return total
+
+
+def _prune_empty_dirs() -> None:
+    """自底向上删除 sched 子树中的空 cgroup 目录。
+
+    历史上 remove() 一次性 rmdir 失败被静默吞掉、优雅停机不清理，导致空
+    目录持续累积（实测 1472 个目录 vs 76 个存活 attempt）。进程已清空的
+    目录在此处回收；仍有进程/子目录的 rmdir 自然失败、原样保留。
+    """
+    try:
+        dirs = sorted((p for p in FALLBACK_ROOT.rglob("*") if p.is_dir()),
+                      key=lambda p: len(p.parts), reverse=True)
+    except OSError:
+        return
+    for d in dirs:
+        try:
+            d.rmdir()
+        except OSError:
+            continue
 
 
 def new_cgroup(name: str) -> Cgroup:
     return Cgroup(name)
+
+
+def _procs_alive(procs: list[int]) -> bool:
+    """cgroup 内是否仍有存活 pid（信号 0 探测；僵尸/已消亡的不算）。"""
+    for pid in procs:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            return True
+    return False
 
 
 def read_subtree_pressure() -> dict:

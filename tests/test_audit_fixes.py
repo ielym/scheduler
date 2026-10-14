@@ -328,7 +328,7 @@ def test_producer_backoff_counts_crash_once(home, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(guard, "launch", lambda tid, spec: calls.append(tid))
     pp = prod.ProducerProc(task_id="t", proc=None, pid=999_999_999,
-                           start_time=0.0, started_monotonic=time.monotonic())
+                           start_time=0.0)
     guard._procs["t"] = pp
     spec = _spec("t")
     guard.ensure("t", spec)  # 首次观测死亡：计一次崩溃，排定退避
@@ -373,9 +373,9 @@ def test_sdk_payload_priority(home, monkeypatch):
 
 # ---------- #15 PAUSING 中以 75 退出 → BACKOFF ----------
 def test_pausing_with_shortage_exit_is_backoff():
-    out = runner.decide_outcome(JobStatus.PAUSING, 75, False, True)
+    out = runner.decide_outcome(JobStatus.PAUSING, 75, False)
     assert out.status == JobStatus.BACKOFF
-    out2 = runner.decide_outcome(JobStatus.PAUSING, 0, False, False)
+    out2 = runner.decide_outcome(JobStatus.PAUSING, 0, False)
     assert out2.status == JobStatus.PAUSED
 
 
@@ -402,7 +402,7 @@ def test_launch_create_attempt_failure_keeps_queued(home, monkeypatch):
     svc = _svc(home)
     _mk_job(svc.db, "jX", task_id="t")
     svc.specs["t"] = _spec("t")
-    job = svc.db.queued_jobs(limit=10)[0]
+    job = svc.db.jobs_in_status(JobStatus.QUEUED, limit=10)[0]
     assert job["job_id"] == "jX"
 
     def boom(*a, **k):
