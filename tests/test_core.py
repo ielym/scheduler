@@ -137,22 +137,63 @@ def test_scaling_growth(tmp_path):
     assert not s.may_grow("t", 50.0, live_count=1, has_progress=True, healthy_resource=True)
 
 
-def test_scaling_shortage_shrinks(tmp_path):
+def test_scaling_shortage_marks_evidence(tmp_path):
+    """on_shortage 只记证据不收缩动态目标：资源退避由 TaskBackoff 承担
+    （步降暂停同任务在途执行、逐步验证、全退避探测、逐个放回），
+    恢复后按既有目标逐个拉回，无需重新学习。"""
     class Cfg:
         class control:
             grow_observe_sec = 30.0
     s = scaling.Scaling(Cfg())
     s.get("t").run_target = 4
-    # 偶发不足：撤销一个名额（streak=1 参与幅度）
+    # 不足证据：streak 累计 + 切回 explore（阻止扩容探索），目标不变
     s.on_shortage("t", 0.0, live_count=3)
-    assert s.get("t").run_target == 3
-    # 节流窗口内重复不足只计证据不重复收缩
+    assert s.get("t").run_target == 4
+    assert s.get("t").shortage_streak == 1
+    assert s.get("t").mode == "explore"
     s.on_shortage("t", 1.0, live_count=2)
-    assert s.get("t").run_target == 3
+    assert s.get("t").run_target == 4
     assert s.get("t").shortage_streak == 2
-    # 窗口过后按证据量加速收缩（streak=3 → -3）：风暴时快速收敛
-    s.on_shortage("t", 10.0, live_count=2)
-    assert s.get("t").run_target == 0
+
+
+def test_task_backoff_state_machine():
+    """TaskBackoff：同任务作业必共用资源 → 报错步降自己任务内的执行；
+    跨任务独立；逐个拉取一步验证；全退避按递增间隔探测。"""
+    tb = scaling.TaskBackoff(probe_base_sec=30.0, probe_cap_sec=600.0)
+    # NORMAL：允许准入；新执行未完成首步 → 阻止放下一个（逐个拉取）
+    assert tb.admission_allowed("t", 0.0) == (True, "")
+    tb.note_started("t", "att-1")
+    assert tb.admission_allowed("t", 1.0) == (False, "step_pending")
+    # 正确一步 → 解除占位，恢复放行
+    tb.note_progress("t", "att-1", 2.0)
+    assert tb.admission_allowed("t", 3.0) == (True, "")
+    # VERIFY（步降后等剩余执行验证）：阻止新准入；正确一步 → NORMAL
+    tb.set_state("t", tb.VERIFY)
+    ok, why = tb.admission_allowed("t", 4.0)
+    assert not ok and why == "verify"
+    tb.note_progress("t", "att-1", 5.0)
+    assert tb.state_of("t") == tb.NORMAL
+    assert tb.admission_allowed("t", 6.0) == (True, "")
+    # EMPTY（全退避）：探测间隔内阻止，到期放行；探测失败级别递增
+    tb.set_state("t", tb.EMPTY, now_mono=100.0)
+    ok, why = tb.admission_allowed("t", 110.0)
+    assert not ok and why == "probe_wait"
+    ok, why = tb.admission_allowed("t", 131.0)
+    assert ok and why == ""            # 间隔到期：放一个探测执行
+    tb.note_started("t", "att-2")      # 探测执行拉起
+    tb.clear_attempt("t", "att-2")     # 它退出了且未产生正确一步
+    tb.note_empty_probe_failed("t", 131.0)   # 探测失败：级别+1 → 间隔翻倍
+    assert tb.probe_level_of("t") == 1
+    ok, _ = tb.admission_allowed("t", 161.0)  # 30s 级别0间隔已过但级别1需60s
+    assert not ok
+    ok, _ = tb.admission_allowed("t", 192.0)  # 100+60+1 边界后放行
+    assert ok
+    # 探测执行成功一步 → NORMAL，级别清零
+    tb.note_progress("t", "att-3", 193.0)
+    assert tb.state_of("t") == tb.NORMAL
+    assert tb.probe_level_of("t") == 0
+    # 任务间完全独立：t 的退避不影响 u
+    assert tb.admission_allowed("u", 194.0) == (True, "")
 
 
 def test_protect_yield_candidate():

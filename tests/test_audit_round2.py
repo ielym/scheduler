@@ -60,17 +60,19 @@ def _svc(home):
 # ---------- A5 reason 纯净化 ----------
 
 class TestCleanReason:
-    def test_strips_url_status_and_exception(self):
+    def test_keeps_error_type_and_resource_id(self):
+        """R4：错误类型（异常类名/HTTP 状态码）与资源标识（URL/主机）随
+        reason 保留上浮，供调度器与运维归因；仅清理不可见字符/空白并截断。"""
         raw = ("ConnectionError: HTTP 503 at https://api.example.com/x?y=1 "
                "TimeoutError 后重试")
         out = _clean_reason(raw)
-        assert "http" not in out.lower() and "503" not in out
-        assert "Connection" not in out and "Timeout" not in out
-        assert len(out) <= 200
+        assert "ConnectionError" in out and "503" in out
+        assert "https://api.example.com/x?y=1" in out
+        assert len(out) <= 300
 
-    def test_shortage_reason_sanitized(self):
+    def test_shortage_reason_keeps_fingerprint(self):
         s = Shortage("download failed HTTPStatusError https://arxiv.org/pdf/1 404")
-        assert "arxiv" not in s.reason and "404" not in s.reason
+        assert "arxiv" in s.reason and "404" in s.reason
 
 
 # ---------- A7 启动许可门 ----------

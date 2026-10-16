@@ -56,7 +56,10 @@ def _mk_job(db, job_id, task_id="t", priority=50):
         "schema_version": 1, "job_id": job_id, "task_id": task_id,
         "entry_args": [], "env": {}, "idempotency_key": job_id,
     })
-    db.upsert_job(ready, f"hash-{job_id}", "2026-10-12T00:00:00+00:00", priority)
+    # queued_at 用当前时刻：对账窗口类测试（48h 归档对账）随日历推移不失效
+    db.upsert_job(ready, f"hash-{job_id}",
+                  datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                  priority)
     return job_id
 
 
@@ -185,7 +188,8 @@ def test_on_success_restores_steady_after_shortage(home):
     ts.run_target = 3
     ts.mode = "steady"
     sc.on_shortage("t", 1.0, 3)
-    assert ts.mode == "explore" and ts.run_target == 2 and ts.shortage_streak == 1
+    # on_shortage 只记证据（不收缩目标——退避由 TaskBackoff 承担）
+    assert ts.mode == "explore" and ts.run_target == 3 and ts.shortage_streak == 1
     # 恢复唯一入口不再是冷启动分支：一次真实成功即恢复 steady
     sc.on_success("t", 2.0)
     assert ts.mode == "steady" and ts.shortage_streak == 0
@@ -201,9 +205,65 @@ def test_finalize_backoff_persists_scale(home):
     meta.status = JobStatus.RUNNING
     svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
     st = next(s for s in svc.db.all_task_states() if s["task_id"] == "t")
-    # 审查修复后语义（设计第九节 L159"先撤销近期增加"）：每次收缩只撤销
-    # 一个名额（3→2），不再一步砍到 live-1；节流窗口内重复不足只计证据
-    assert st["run_target"] == 2 and st["mode"] == "explore"  # 收缩已持久化
+    # on_shortage 不再收缩目标（退避由 TaskBackoff 承担）：目标保持 3，
+    # 但 explore（退避期不扩容）仍持久化，重启不回退
+    assert st["run_target"] == 3 and st["mode"] == "explore"
+
+
+# ---------- TaskBackoff VERIFY 死区（步降暂停最后一个执行→自锁） ----------
+
+def test_verify_drained_transitions_to_empty(home):
+    """死锁修复：VERIFY 态的唯一在途执行以 PAUSED 终态退出时，
+    任务必须转 EMPTY 探测——否则 VERIFY 无出口（无人可上报进展/
+    不可能再报 75）且封锁准入，状态机自锁、任务永久停摆。"""
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.PAUSING   # 被步降暂停的执行
+    svc.tbackoff.set_state("t", svc.tbackoff.VERIFY)
+    svc._finalize(_FakeAttempt(returncode=0), meta, runner.now_iso())
+    # 零在途 + VERIFY → EMPTY（任务级退避，按间隔探测放行）
+    assert svc.tbackoff.state_of("t") == svc.tbackoff.EMPTY
+    # EMPTY 后探测间隔到期即允许准入（不再被 verify 永久封锁）
+    ok, why = svc.tbackoff.admission_allowed("t", _now_mono_far())
+    assert ok and why == ""
+
+
+def test_verify_kept_when_live_remains(home):
+    """负向：VERIFY 但任务仍有其他在途执行时保持 VERIFY——
+    步降验证语义不变（等剩余执行完成正确一步）。"""
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    _mk_job(svc.db, "j2")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    svc.db.create_attempt("a2", "j2", 2, "tok", "t0")
+    other = AttMeta("a2", "j2", "t", 50, "tok")
+    other.status = JobStatus.RUNNING
+    svc.meta["a2"] = other   # 剩余未退避的执行仍在途
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.PAUSING
+    svc.tbackoff.set_state("t", svc.tbackoff.VERIFY)
+    svc._finalize(_FakeAttempt(returncode=0), meta, runner.now_iso())
+    assert svc.tbackoff.state_of("t") == svc.tbackoff.VERIFY
+
+
+def test_reconcile_noop_in_normal(home):
+    """幂等：任务处 NORMAL 时执行退出不触发任何迁移。"""
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.PAUSING
+    svc._finalize(_FakeAttempt(returncode=0), meta, runner.now_iso())
+    assert svc.tbackoff.state_of("t") == svc.tbackoff.NORMAL
+
+
+def _now_mono_far() -> float:
+    """EMPTY 探测到期时刻（base 间隔 + 余量；tbackoff 用 time.monotonic 基准）。"""
+    import time as _t
+    from sched import config as _cfg
+    return _t.monotonic() + _cfg.SchedulerConfig().control.task_backoff_probe_base_sec + 5.0
 
 
 # ---------- P1-3 回执仅 received 才算 ack ----------

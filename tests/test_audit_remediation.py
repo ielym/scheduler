@@ -88,6 +88,9 @@ def test_job_priority_cap_clamps_at_cap(home, tmp_path):
 # ---------- on_shortage 节流 + 撤销幅度 ----------
 
 def test_on_shortage_throttle_and_step(tmp_path):
+    """on_shortage 只记证据（streak 累计 + explore），不收缩动态目标：
+    资源退避由 TaskBackoff 状态机承担（步降/验证/探测/逐个放回），
+    恢复后按既有目标逐个拉回。"""
     class Cfg:
         class control:
             grow_observe_sec = 30.0
@@ -95,13 +98,13 @@ def test_on_shortage_throttle_and_step(tmp_path):
     ts = s.get("t")
     ts.run_target = 5
     s.on_shortage("t", 100.0, live_count=4)
-    assert ts.run_target == 4           # 偶发不足：撤销一个名额
+    assert ts.run_target == 5           # 目标不变（不收缩）
+    assert ts.shortage_streak == 1 and ts.mode == "explore"
     s.on_shortage("t", 101.0, live_count=3)
-    assert ts.run_target == 4           # 节流窗口内不重复收缩
-    assert ts.shortage_streak == 2      # 证据仍累计
+    assert ts.run_target == 5
+    assert ts.shortage_streak == 2      # 证据持续累计
     s.on_shortage("t", 200.0, live_count=3)
-    # 窗口过后按证据量加速收缩（streak=3 → -3）：风暴时目标快速收敛
-    assert ts.run_target == 1
+    assert ts.run_target == 5 and ts.shortage_streak == 3
 
 
 def test_shortage_streak_recovers_with_progress(tmp_path):

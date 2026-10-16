@@ -50,6 +50,8 @@ def _fast_config(home):
     c.starting_timeout_sec = 30.0
     c.shortage_retry_base_sec = 0.5
     c.shortage_retry_cap_sec = 2.0
+    c.task_backoff_probe_base_sec = 0.5
+    c.task_backoff_probe_cap_sec = 2.0
     c.pause_grace_base_sec = 2.0
     c.pause_grace_max_sec = 4.0
     c.protect_deadline_sec = 6.0

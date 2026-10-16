@@ -166,12 +166,8 @@ class ControlConfig(BaseModel):
     resource_stable_samples: int = 3        # 滞回连续样本数
     mem_growth_ratio: float = 0.05          # 单采样区间执行内存净增占容量比例，判"快速增长"
     observability_slow_factor: float = 3.0  # 观测不足时扩容观察期放大倍数
-    external_hold_window_sec: float = 180.0      # 外部压力滑动窗口
-    external_hold_trigger_events: int = 6        # 窗口内外部不足事件数阈值（密度）
-    external_hold_trigger_tasks: int = 2         # 窗口内报不足任务数阈值（广度）
-    external_hold_recover_events: int = 1        # 解除判定的窗口事件数上限
-    external_hold_recover_sec: float = 90.0      # 密度回落需持续的低电平时长
-    external_suspect_lookback_sec: float = 1800.0  # 稳定回看窗：其间首次活跃的任务为嫌疑
+    task_backoff_probe_base_sec: float = 30.0   # 任务全退避后的首次探测间隔
+    task_backoff_probe_cap_sec: float = 600.0   # 探测间隔上限（按级别翻倍递增）
     recover_grace_sec: float = 30.0         # 重启后旧执行进程协作退出宽限
     cmd_ack_wait_sec: float = 6.0           # CLI 控制命令等待确认超时
     heartbeat_resume_cooldown_sec: float = 60.0  # 心跳过期/OOM/内存增长退让等暂停的作业恢复排队前冷却，防紧密重启循环

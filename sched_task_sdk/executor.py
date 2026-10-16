@@ -29,30 +29,22 @@ from .checkpoint import CheckpointStore
 from .errors import EXIT_OK, EXIT_SHORTAGE, EventKind
 
 
-# A5：reason 纯净化——外部对象（URL/HTTP 状态码/异常类名）不得泄漏进调度事件
-_URL_RE = re.compile(r"https?://\S+|www\.\S+")
-_STATUS_RE = re.compile(
-    r"\b(?:HTTP[\s/_-]*\d{3}|status[\s_-]*(?:code)?[\s:=]*\d{3})\b", re.IGNORECASE)
-# 独立的 4xx/5xx 三位数（含代理 517 等）大概率是 HTTP 状态码残留
-_BARE_CODE_RE = re.compile(r"\b[45]\d{2}\b")
-_EXC_RE = re.compile(
-    r"\b(?:Connection\w*Error|Timeout\w*|SSL\w*Error|HTTP\w*Error|URL\w*Error|"
-    r"Request\w*|JSONDecode\w*|OS\w*|IO\w*|Socket\w*|\w*Interrupted\w*)\b")
+# reason 整理：保留错误类型与资源标识（R4——上浮信息完整是调度侧归因
+# 与运维排查的依据），仅做不可见字符清理、空白压缩与长度截断。
+# 凭证/账号类敏感信息由任务侧保证不写入（H9 约束凭证，不约束错误指纹）。
+_MAX_REASON_LEN = 300
 
 
 def _clean_reason(reason: str) -> str:
-    """净化退出/不足原因：剥离 URL、HTTP 状态码、异常类型名，压缩空白并截断。
+    """整理不足原因：去不可打印字符、压缩空白、截断长度。
 
-    只留人类可读的状态描述，防止外部资源指纹进入调度事件/日志（设计第六节 + H9）。
+    错误类型（异常类名/HTTP 状态码）与资源标识（URL/主机）保留在
+    reason 中，随 external_shortage 事件上浮供调度器与运维归因。
     """
     s = str(reason or "")
-    s = _URL_RE.sub(" ", s)
-    s = _STATUS_RE.sub(" ", s)
-    s = _EXC_RE.sub(" ", s)
-    s = _BARE_CODE_RE.sub(" ", s)
     s = "".join(ch for ch in s if ch.isprintable())
     s = re.sub(r"\s+", " ", s).strip()
-    return s[:200]
+    return s[:_MAX_REASON_LEN]
 
 
 class Shortage(Exception):

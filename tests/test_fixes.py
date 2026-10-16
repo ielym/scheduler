@@ -165,7 +165,9 @@ class TestReceiver:
         return td, spec
 
     def _put(self, td, job_id, pri=None, task_id="t1"):
-        obj = {"schema_version": 1, "job_id": job_id, "task_id": task_id}
+        obj = {"schema_version": 1, "job_id": job_id, "task_id": task_id,
+               # 幂等键必填（审查修复后协议基础）：缺失的文件被接收器拒绝
+               "idempotency_key": f"idem-{job_id}"}
         if pri is not None:
             obj["priority"] = pri
         (td / "outbox" / f"{job_id}.json").write_text(json.dumps(obj))
@@ -428,14 +430,19 @@ class TestStateClosures:
         assert d.get_attempt("att-1")["status"] == JobStatus.SUCCEEDED
 
     def test_recover_classify_no_pid_blocked(self, home):
-        # attempt 意图已持久化但 pid 未知 → RECOVERY_BLOCKED（可见，不重复启动）
+        # attempt 意图已持久化但 pid 未知：审计修复后（设计第十三节 L219）
+        # 不再一律 RECOVERY_BLOCKED——无进程身份即无残留，自动确认清理后
+        # 按检查点重放（QUEUED）；仅清理不净（不可中断 D 态）才保持
+        # RECOVERY_BLOCKED 待人工核实
         svc = self._svc(home)
         d = svc.db
         d.upsert_job(_ready("j-1", "t1"), "h1", "now", 50)
-        d.create_attempt("att-1", "j-1", 1, "tok", "now")  # 无 pid
+        d.create_attempt("att-1", "j-1", 1, "tok", "now")  # 无 pid、无 cgroup
         d.set_job_status("j-1", JobStatus.STARTING, "", "now")
         svc._recover()
-        assert d.get_job("j-1")["status"] == JobStatus.RECOVERY_BLOCKED
+        job = d.get_job("j-1")
+        assert job["status"] == JobStatus.QUEUED
+        assert "按检查点重放" in job["reason"]
 
 
 def _spec(task_id, priority):

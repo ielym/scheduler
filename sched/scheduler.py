@@ -113,13 +113,9 @@ class SchedulerService:
             healthy_ratio=self.cfg.control.resource_healthy_ratio,
             stable_samples=self.cfg.control.resource_stable_samples,
             shed_ratio=self.cfg.control.exec_mem_cap_ratio)
-        self.etrend = scaling.ExternalTrend(
-            window_sec=self.cfg.control.external_hold_window_sec,
-            trigger_events=self.cfg.control.external_hold_trigger_events,
-            trigger_tasks=self.cfg.control.external_hold_trigger_tasks,
-            recover_events=self.cfg.control.external_hold_recover_events,
-            recover_sec=self.cfg.control.external_hold_recover_sec,
-            suspect_lookback_sec=self.cfg.control.external_suspect_lookback_sec)
+        self.tbackoff = scaling.TaskBackoff(
+            probe_base_sec=self.cfg.control.task_backoff_probe_base_sec,
+            probe_cap_sec=self.cfg.control.task_backoff_probe_cap_sec)
         self.specs: dict[str, config.TaskSpec] = {}
         self.attempts: dict[str, runner.AttemptRun] = {}
         self.meta: dict[str, AttMeta] = {}
@@ -539,7 +535,6 @@ class SchedulerService:
                 self._tick_resource(now)
                 self._tick_control(now)
                 self._tick_backoff(now)
-                self._tick_external(now)
                 self._tick_admit(now)
                 self._write_snapshot()
             except Exception:
@@ -820,6 +815,9 @@ class SchedulerService:
                 meta.last_heartbeat_mono = now_m
             elif kind == EventKind.PROGRESS:
                 self._ingest_progress_event(meta, int(ev.get("completed_units") or 0), ev)
+                # 一次正确执行的步骤：解除"逐个拉取"的首步验证位 /
+                # 任务退避（VERIFY/EMPTY）恢复正常（TaskBackoff）
+                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, _now_mono())
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
             elif kind == EventKind.SHORTAGE:
                 meta.shortage_at_mono = _now_mono()
@@ -829,11 +827,15 @@ class SchedulerService:
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
             elif kind == EventKind.CHECKPOINT:
                 meta.last_ckpt_mono = _now_mono()
+                # 检查点落地 = 一次正确执行的步骤（TaskBackoff 首步验证/恢复）
+                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, _now_mono())
                 self.db.record_checkpoint(meta.attempt_id, int(ev.get("commit_seq") or 0),
                                           str(ev.get("input_ref") or ""), runner.now_iso())
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
             elif kind == EventKind.COMPLETED:
                 meta.had_completed = True
+                # 成功也是"正确一步"：任务退避立即恢复正常（TaskBackoff）
+                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, _now_mono())
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
             else:
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
@@ -997,6 +999,12 @@ class SchedulerService:
         self.attempts.pop(meta.attempt_id, None)
         self.meta.pop(meta.attempt_id, None)
         self._last_oom.pop(meta.attempt_id, None)
+        # 该执行已结束：若它正占用任务退避的"未完成首步"验证位则解除
+        # （TaskBackoff 逐个拉取：占位解除后任务才能放下一个执行）
+        self.tbackoff.clear_attempt(meta.task_id, meta.attempt_id)
+        # VERIFY 死区核查：该任务已无任何在途执行且仍卡 VERIFY → 转 EMPTY
+        # 探测（被步降暂停的最后一个执行退出后，VERIFY 不再有任何出口）
+        self._task_backoff_reconcile(meta.task_id, _now_mono())
 
         # 暂停闭环统计：暂停请求 → 实际退出耗时；暂停请求 → 检查点落地延迟
         if (outcome.status in (JobStatus.PAUSED, JobStatus.BACKOFF,
@@ -1014,9 +1022,10 @@ class SchedulerService:
             # B7（设计第十四节）：成功后不足退避计数复位，下次从起点重新探测
             self.db.reset_job_retry(meta.job_id)
         elif outcome.status == JobStatus.BACKOFF:
-            # 统一外部不足才收缩动态目标（exp: 资源不足=不足信号）
+            # 统一外部不足：记录任务级不足证据（阻止退避期间的扩容探索）；
+            # 动态目标不收缩——恢复后按既有目标逐个（一步验证）拉回
             self.scaling.on_shortage(stid, _now_mono(), self._live_count(stid))
-            self._persist_scale(stid)  # 收缩后立即持久化，重启不回到旧目标
+            self._persist_scale(stid)
             # 不足证据破坏"稳定健康"：启动间隔阶梯立即回弹（设计第九节）
             self._healthy_since_mono = 0.0
             # B7：本 attempt 已有真实业务进展（启动后收到过检查点）时，
@@ -1024,6 +1033,9 @@ class SchedulerService:
             self._schedule_backoff_retry(
                 meta.job_id,
                 had_evidence=meta.last_ckpt_mono > meta.started_mono)
+            # 每任务独立资源退避（TaskBackoff）：同任务作业必共用资源 →
+            # 步降同任务内最新启动的在途执行；无在途可退 → 任务级退避
+            self._task_backoff_step_down(stid, _now_mono())
         elif outcome.status == JobStatus.PAUSED:
             # 主动退让不计为任务错误；记录真实暂停耗时（含检查点落地）到
             # 任务级暂停成本 EMA（设计第十节：退让候选综合暂停成本排序）
@@ -1052,8 +1064,6 @@ class SchedulerService:
         """
         job = self.db.get_job(job_id) or {}
         task_id = str(job.get("task_id") or "")
-        # 外部压力闸门输入：一次外部不足事件进入滑动窗口（密度×广度判定）
-        self.etrend.note_shortage(task_id, _now_mono())
         retry = 1 if had_evidence else int(job.get("retry_count") or 0) + 1
         base = self.cfg.control.shortage_retry_base_sec
         cap = self.cfg.control.shortage_retry_cap_sec
@@ -1081,6 +1091,59 @@ class SchedulerService:
                    timedelta(seconds=delay)).isoformat(timespec="milliseconds")
         self.db.set_job_backoff(job_id, retry, next_at)
         self._backoff_until[job_id] = _now_mono() + delay
+
+    def _task_backoff_step_down(self, task_id: str, now_mono: float) -> None:
+        """任务资源退避步降（TaskBackoff，用户设计）。
+
+        该任务的一个作业报资源错误（exit 75）→ 退避同任务内一个在途执行
+        （最新启动优先——"后执行的先退避"），任务置 VERIFY：等剩余未退避
+        执行"正确一步"验证决定继续退避或恢复。无在途执行可退 → EMPTY：
+        任务级退避，按递增间隔探测（该任务一执行就撞资源，符合预期）。
+        跨任务不做任何协调（是否共用资源未知，各任务独立退避）。
+        """
+        tb = self.tbackoff
+        cands = [(aid, m) for aid, m in self.meta.items()
+                 if m.task_id == task_id and
+                 m.status in (JobStatus.STARTING, JobStatus.RUNNING)]
+        if cands:
+            cands.sort(key=lambda x: x[1].started_mono, reverse=True)
+            aid = cands[0][0]
+            tb.set_state(task_id, tb.VERIFY)
+            self._request_pause(aid, reason="任务资源退避：步降")
+            self._append_status({"ts": runner.now_iso(),
+                                 "kind": "task_backoff_step",
+                                 "task_id": task_id, "attempt_id": aid,
+                                 "remain_live": len(cands) - 1})
+        elif tb.state_of(task_id) == tb.EMPTY:
+            # EMPTY 探测失败：级别 +1，下次探测间隔翻倍（任务级退避）
+            tb.note_empty_probe_failed(task_id, now_mono)
+            self._append_status({"ts": runner.now_iso(),
+                                 "kind": "task_backoff_probe_failed",
+                                 "task_id": task_id,
+                                 "probe_level": tb.probe_level_of(task_id)})
+        else:
+            # 首次全部退避（VERIFY → 无在途）：任务级退避起点
+            tb.set_state(task_id, tb.EMPTY, now_mono)
+            self._append_status({"ts": runner.now_iso(),
+                                 "kind": "task_backoff_empty",
+                                 "task_id": task_id})
+
+    def _task_backoff_reconcile(self, task_id: str, now_mono: float) -> None:
+        """VERIFY 死区核查：任务处于 VERIFY 且已无任何在途执行 → 转 EMPTY。
+
+        VERIFY 的两个出口（剩余执行完成正确一步 note_progress / 下一次
+        exit 75 再步降）都需要活的执行。当被步降暂停的执行本身就是任务
+        最后一个在途者、且以 PAUSED 等非 BACKOFF 终态退出时，任务既无人
+        能上报进展、也不可能再报 75，而 VERIFY 又封锁准入——状态机自锁。
+        按设计"任务一个作业都没有了也符合预期"：转 EMPTY 进入任务级
+        退避探测（幂等：非 VERIFY 或仍有在途时不动作）。
+        """
+        tb = self.tbackoff
+        if tb.state_of(task_id) == tb.VERIFY and self._live_count(task_id) == 0:
+            tb.set_state(task_id, tb.EMPTY, now_mono)
+            self._append_status({"ts": runner.now_iso(),
+                                 "kind": "task_backoff_empty",
+                                 "task_id": task_id, "via": "verify_drained"})
 
     def _ensure_tree_gone(self, a: runner.AttemptRun) -> None:
         """B6：finalize 提交终态前确认整棵执行进程树退出（有界 2s）。
@@ -1835,51 +1898,15 @@ class SchedulerService:
             factor = 0.5
         return max(self.START_INTERVAL_FLOOR_SEC, base * factor)
 
-    def _tick_external(self, now: float) -> None:
-        """外部资源压力闸门（反馈式规避，设计第十四节）。
-
-        唯一事实来源是外部不足事件流（exit 75）——不建模资源身份/配额。
-        多任务同时不足（密度×广度越阈）→ 全局限停新准入（在途不动，靠
-        退避自然衰减）；密度回落持续观察期 → 解除。
-        嫌疑优先原则：外部资源相对稳定，突然不足优先怀疑稳定回看窗内
-        新加入的任务——进入压力时自动压制其动态目标至单并发探索并导出
-        嫌疑名单（状态事件 + 快照），供人工排查；解除后嫌疑最后恢复。
-        """
-        prev = self.etrend.state
-        active_tasks = {m.task_id for m in self.meta.values()}
-        self.etrend.sample(now, active_tasks)
-        if self.etrend.state == prev:
-            return
-        snap = self.etrend.snapshot(now)
-        if self.etrend.holding():
-            for tid in self.etrend.suspects():
-                ts = self.scaling.get(tid)
-                ts.run_target = min(ts.run_target, 1)
-                ts.mode = "explore"
-            self._stats["external_holds"] = self._stats.get("external_holds", 0) + 1
-            self._append_status({
-                "ts": runner.now_iso(), "kind": "external_state",
-                "state": scaling.ExternalTrend.HOLD,
-                "suspects": snap["suspects"],
-                "recent_tasks": snap["recent_tasks"],
-                "recent_events": snap["recent_events"]})
-        else:
-            self._append_status({
-                "ts": runner.now_iso(), "kind": "external_state",
-                "state": scaling.ExternalTrend.NORMAL})
-
     def _tick_admit(self, now: float) -> None:
         # B9（设计第八节：准入核执行资源反馈）：资源趋势持续不健康时暂停新增
         # 准入，在途执行不受影响；滞回恢复健康后自动继续。这不是隐藏上限——
         # 门禁仅依赖实测资源趋势（CPU/内存采样 + OOM/快速增长证据），
         # 任务动态目标不受影响，健康后立即按目标继续准入。
+        # 外部资源不足的规避不再走全局闸门，由 TaskBackoff 按任务独立退避：
+        # 报资源错误的任务步降自己的在途执行并暂停拉新，其余任务不受牵连。
         if not self.trend.healthy_enough():
             self._healthy_since_mono = 0.0
-            return
-        # 外部压力闸门（反馈式）：多任务同时报外部不足 → 全局限停新准入。
-        # 与本地资源门禁同语义（HOLD：在途不受影响，靠退避自然衰减）；
-        # 不预设外部资源限制，密度回落并保持观察期后自动恢复。
-        if self.etrend.holding():
             return
         interval = self._effective_start_interval(now)
         # 令牌制（设计第九节 L155"不锁死为每秒最多两个进程；缩短时避免积累
@@ -1945,6 +1972,12 @@ class SchedulerService:
 
     def _admit_job(self, job: dict) -> bool:
         task_id = job["task_id"]
+        # 每任务逐个拉取纪律（TaskBackoff）：上一个新执行尚未正确完成一步 /
+        # 步降验证中 / 全退避探测间隔未到时，该任务不再放新执行——
+        # 新执行正确一步之后才尝试拉取下一个
+        ok, _blocked = self.tbackoff.admission_allowed(task_id, _now_mono())
+        if not ok:
+            return False
         live = self._live_count(task_id)
         scale = self.scaling.get(task_id)
         # 冷启动给 1，否则不超过动态目标
@@ -2021,9 +2054,9 @@ class SchedulerService:
         meta.feedback_interval = spec.feedback_interval_sec or 0.0
         self.attempts[attempt_id] = a
         self.meta[attempt_id] = meta
-        # 外部压力嫌疑判定基准：登记任务首次活跃时刻（稳定回看窗内首次
-        # 活跃的任务在压力爆发时优先被怀疑——外部资源相对稳定原则）
-        self.etrend.note_active(str(job["task_id"]), _now_mono())
+        # 任务退避"逐个拉取"：新执行登记为未完成首步验证，其正确完成一步前
+        # 该任务不再放下一个执行（TaskBackoff）
+        self.tbackoff.note_started(str(job["task_id"]), attempt_id)
         self.db.update_attempt(attempt_id, pid=a.pid, pgid=a.pgid,
                                start_monotonic=a.start_time,
                                pid_start_time=a.start_time)
@@ -2202,6 +2235,8 @@ class SchedulerService:
             {"status": JobStatus.CANCELLED, "reason": "显式取消", "finished_at": now},
             meta.job_id, JobStatus.CANCELLED, "显式取消", now)
         self.meta.pop(meta.attempt_id, None)
+        self.tbackoff.clear_attempt(meta.task_id, meta.attempt_id)
+        self._task_backoff_reconcile(meta.task_id, _now_mono())
         self._append_status({"ts": now, "kind": "job_cancelled",
                              "job_id": meta.job_id, "attempt_id": meta.attempt_id})
 
@@ -2220,7 +2255,7 @@ class SchedulerService:
             "observability_ok": self._observability_ok,
             "resource_unhealthy": self.trend.unhealthy(),
             "resource_state": self.trend.state,
-            "external": self.etrend.snapshot(_now_mono()),
+            "task_backoff": self.tbackoff.snapshot(_now_mono()),
             "protected_task": self.protect.st.protected_task,
             "protect_reason": self.protect.st.reason,
             "yielded": sorted(self.protect.st.yielded),

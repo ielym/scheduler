@@ -266,6 +266,13 @@ def cmd_status(args) -> int:
         print("\n--- scale ---")
         for tid, s in sorted(snap.get("scale", {}).items()):
             print(f"  {tid:<28} run_target={s['run_target']} mode={s['mode']}")
+        tb = snap.get("task_backoff") or {}
+        if tb:
+            print("\n--- task backoff ---")
+            for tid, s in sorted(tb.items()):
+                wait = f" wait={s['probe_wait']}s" if s.get("probe_wait") else ""
+                unv = f" unverified={s['unverified'][:12]}" if s.get("unverified") else ""
+                print(f"  {tid:<28} state={s['state']} probe_level={s['probe_level']}{wait}{unv}")
         pend = snap.get("scan_pending") or {}
         if pend:
             print(f"\n--- scan pending ---\n  {pend}")

@@ -210,7 +210,7 @@ class TaskScale:
     run_target: int = 0
     mode: str = "explore"          # explore | steady
     last_grow_mono: float = 0.0
-    last_shrink_mono: float = -1.0   # -1=从未收缩（0.0 是合法单调时刻）
+    last_shortage_mono: float = -1.0  # 最近一次不足时刻（证据衰减观察期锚点）
     grow_observe_sec: float = 30.0
     shortage_streak: int = 0
 
@@ -301,114 +301,116 @@ class ResourceTrend:
         return self._state == self.SHED
 
 
-class ExternalTrend:
-    """外部资源压力闸门（反馈式规避，设计文档第十四节）。
+class TaskBackoff:
+    """每任务独立的资源退避状态机（用户设计）。
 
-    不建模具体外部资源：身份/配额/限制均未知且随时间变化，任务间是否
-    共用同一资源也是随机的——任何预设（并发槽、qps 令牌桶）都会误伤或
-    失配。"当前执行的作业有没有资源问题"是唯一事实来源（exit 75 事件流）。
+    前提：同一任务内的多个作业必然共用同一外部资源；跨任务是否共用未知。
+    因此资源错误（exit 75）的退避按任务独立进行，互不牵连：
 
-    - 单任务偶发不足：任务级动态目标自收缩（Scaling.on_shortage），
-      不触发全局闸门（保留任务间独立性）；
-    - 多任务同时不足（密度 × 广度同时越阈）：外部资源整体紧张的信号
-      → 全局限停新准入（HOLD 语义：在途执行不动，靠退避自然衰减）；
-    - 嫌疑优先原则：外部资源一般相对稳定，突然不足优先怀疑"稳定期
-      之后新加入的任务"。进入压力时自动标记嫌疑（首次活跃晚于回看
-      窗口的当前活跃任务）：准入压制至单并发探索、导出快照供排查、
-      恢复时最后回来（从头证明自己）；若压制嫌疑后压力仍不消退，
-      全局停准入兜底仍在。内存态首次活跃记录，重启后重新积累
-      （重启初期宽松判定优于误伤）。
-    - 恢复：不足密度回落至低位并保持观察期 → 解除（试探性，密度
-      再升可立即重入，滞回防抖）。
+    - 步降（step-down）：任务 T 的一个作业报资源错误 → 暂停 T 内
+      "后执行"（最新启动）的在途执行一个；等待 T 内"未退避"的剩余执行
+      正确完成一步：
+        * 一步成功 → 资源恢复 → NORMAL，开始逐个放回；
+        * 再次资源错误 → 再步降一个（仍是最新者优先）；
+        * 全部退避（无在途执行）→ EMPTY：任务级退避，符合预期——
+          说明该任务一执行就撞资源问题，按递增间隔探测。
+    - 步升 / 准入（step-up）：每任务一次只放一个新执行（新拉起或放回），
+      该执行正确完成一步后才允许放下一个（"逐个拉取"）。
+    - 探测（EMPTY）：距上次资源错误按 probe_base × 2^level 间隔放一个
+      执行；成功一步 → NORMAL（level 清零）；失败 → level+1，间隔翻倍。
+
+    全局不做任何跨任务协调（不知道是否共用资源，各自独立退避）。
     """
 
-    NORMAL = "normal"
-    HOLD = "external_hold"
+    NORMAL = "normal"    # 资源正常（或尚未观测到错误）：正常准入节奏
+    VERIFY = "verify"    # 已步降，等剩余在途执行完成一步验证
+    EMPTY = "empty"      # 任务全部退避（无在途执行）：按递增间隔探测
 
-    def __init__(self, window_sec: float = 180.0,
-                 trigger_events: int = 6, trigger_tasks: int = 2,
-                 recover_events: int = 1, recover_sec: float = 90.0,
-                 suspect_lookback_sec: float = 1800.0):
-        self.window_sec = float(window_sec)
-        self.trigger_events = int(trigger_events)
-        self.trigger_tasks = int(trigger_tasks)
-        self.recover_events = int(recover_events)
-        self.recover_sec = float(recover_sec)
-        self.suspect_lookback_sec = float(suspect_lookback_sec)
-        self._shortages: deque[tuple[float, str]] = deque()
-        self._first_active: dict[str, float] = {}
-        self._state = self.NORMAL
-        self._low_since_mono = 0.0
-        self._hold_since_mono = 0.0
-        self._suspects: set[str] = set()
+    def __init__(self, probe_base_sec: float = 30.0, probe_cap_sec: float = 600.0):
+        self.probe_base_sec = float(probe_base_sec)
+        self.probe_cap_sec = float(probe_cap_sec)
+        self._state: dict[str, str] = {}
+        self._last_shortage: dict[str, float] = {}
+        self._level: dict[str, int] = {}     # EMPTY 探测级别（间隔递增）
+        self._unverified: dict[str, str] = {}  # task -> 未完成首步的在途执行
 
-    @property
-    def state(self) -> str:
-        return self._state
+    # ---- 状态查询 ----
+    def state_of(self, task_id: str) -> str:
+        return self._state.get(task_id, self.NORMAL)
 
-    def holding(self) -> bool:
-        return self._state == self.HOLD
+    def probe_wait_remain(self, task_id: str, now_mono: float) -> float:
+        """EMPTY 状态下距下次探测的剩余秒数（非 EMPTY 为 0）。"""
+        if self.state_of(task_id) != self.EMPTY:
+            return 0.0
+        interval = min(self.probe_cap_sec,
+                       self.probe_base_sec * (2 ** self._level.get(task_id, 0)))
+        return max(0.0, interval - (now_mono - self._last_shortage.get(task_id, 0.0)))
 
-    def suspects(self) -> set[str]:
-        return set(self._suspects)
+    def probe_level_of(self, task_id: str) -> int:
+        return self._level.get(task_id, 0)
 
-    def note_active(self, task_id: str, now_mono: float) -> None:
-        """任务出现活跃执行：登记首次活跃时刻（嫌疑判定基准）。"""
-        if task_id and task_id not in self._first_active:
-            self._first_active[task_id] = now_mono
+    # ---- 状态迁移 ----
+    def set_state(self, task_id: str, state: str, now_mono: float = 0.0) -> None:
+        prev = self.state_of(task_id)
+        self._state[task_id] = state
+        if state == self.EMPTY:
+            self._last_shortage[task_id] = now_mono
+            if prev != self.EMPTY:
+                self._level[task_id] = 0
+        elif state == self.NORMAL:
+            self._level.pop(task_id, None)
 
-    def note_shortage(self, task_id: str, now_mono: float) -> None:
-        """一次外部不足事件（exit 75 收尾）进入滑动窗口。"""
-        self._shortages.append((now_mono, str(task_id)))
-        while self._shortages and now_mono - self._shortages[0][0] > self.window_sec:
-            self._shortages.popleft()
+    def note_empty_probe_failed(self, task_id: str, now_mono: float) -> None:
+        """EMPTY 中的探测失败（又报资源错误且无在途可退避）：级别 +1。"""
+        self._level[task_id] = self._level.get(task_id, 0) + 1
+        self._last_shortage[task_id] = now_mono
 
-    def _recent(self, now_mono: float) -> list[tuple[float, str]]:
-        return [e for e in self._shortages
-                if now_mono - e[0] <= self.window_sec]
+    def note_started(self, task_id: str, attempt_id: str) -> None:
+        """新执行拉起（新作业或放回续跑）：登记"未完成首步"。"""
+        self._unverified[task_id] = attempt_id
 
-    def sample(self, now_mono: float, active_tasks: set[str] | None = None) -> None:
-        """状态迁移（主循环每 tick 调用）。
+    def clear_attempt(self, task_id: str, attempt_id: str) -> None:
+        """执行结束（任意结局）：若是该任务的未验证执行则解除占位。"""
+        if self._unverified.get(task_id) == attempt_id:
+            del self._unverified[task_id]
 
-        active_tasks：当前有活跃执行的 tasks（嫌疑计算用；None 时
-        用首次活跃记录推导）。进入 HOLD 时计算嫌疑集合并返回。
+    def note_progress(self, task_id: str, attempt_id: str, now_mono: float) -> None:
+        """一次正确执行的步骤（progress/checkpoint/成功）：
+        ① 该执行通过首步验证（解除"未完成首步"占位，允许放下一个）；
+        ② 任务处于 VERIFY/EMPTY → 资源对该任务恢复 → NORMAL，级别清零。
         """
-        recent = self._recent(now_mono)
-        if self._state == self.NORMAL:
-            if (len(recent) >= self.trigger_events
-                    and len({t for _, t in recent}) >= self.trigger_tasks):
-                self._state = self.HOLD
-                self._hold_since_mono = now_mono
-                self._low_since_mono = 0.0
-                if active_tasks is None:
-                    active_tasks = {t for t, first in self._first_active.items()
-                                    if first <= now_mono}
-                cutoff = now_mono - self.suspect_lookback_sec
-                self._suspects = {t for t in active_tasks
-                                  if self._first_active.get(t, now_mono) >= cutoff}
-            return
-        # HOLD：密度回落至低位持续 recover_sec 才解除（滞回防抖）
-        if len(recent) <= self.recover_events:
-            if self._low_since_mono <= 0.0:
-                self._low_since_mono = now_mono
-            elif now_mono - self._low_since_mono >= self.recover_sec:
-                self._state = self.NORMAL
-                self._low_since_mono = 0.0
-                self._suspects = set()
-        else:
-            self._low_since_mono = 0.0
+        if self._unverified.get(task_id) == attempt_id:
+            del self._unverified[task_id]
+        if self.state_of(task_id) != self.NORMAL:
+            self._state[task_id] = self.NORMAL
+            self._level.pop(task_id, None)
+
+    def admission_allowed(self, task_id: str, now_mono: float) -> tuple[bool, str]:
+        """该任务此刻是否允许再放一个新执行（逐个拉取纪律）。
+
+        返回 (允许, 原因)；原因非空表示阻止原因（观测用）。
+        """
+        if self._unverified.get(task_id):
+            return False, "step_pending"   # 上一个新执行尚未完成一步
+        st = self.state_of(task_id)
+        if st == self.VERIFY:
+            return False, "verify"         # 步降后等剩余执行的一步验证
+        if st == self.EMPTY and self.probe_wait_remain(task_id, now_mono) > 0:
+            return False, "probe_wait"     # 全退避探测间隔未到
+        return True, ""
 
     def snapshot(self, now_mono: float) -> dict:
-        """监控视图：状态 / 窗口内事件数与涉及任务 / 嫌疑名单。"""
-        recent = self._recent(now_mono)
-        return {
-            "state": self._state,
-            "recent_events": len(recent),
-            "recent_tasks": sorted({t for _, t in recent}),
-            "suspects": sorted(self._suspects),
-            "hold_since_mono": round(self._hold_since_mono, 1)
-            if self._state == self.HOLD else 0.0,
-        }
+        """监控视图：各任务退避状态/探测级别/未验证执行。"""
+        out: dict[str, dict] = {}
+        for tid in sorted(set(self._state) | set(self._unverified)):
+            st = self.state_of(tid)
+            out[tid] = {
+                "state": st,
+                "probe_level": self._level.get(tid, 0),
+                "probe_wait": round(self.probe_wait_remain(tid, now_mono), 1),
+                "unverified": self._unverified.get(tid, "")[:16],
+            }
+        return out
 
 
 class Scaling:
@@ -451,41 +453,28 @@ class Scaling:
         ts.last_grow_mono = now_mono
 
     def on_shortage(self, task_id: str, now_mono: float, live_count: int) -> None:
-        """不足/退化：撤销近期增加，降低动态目标。
+        """记录任务级不足证据（shortage_streak），阻止退避期间的扩容探索。
 
-        审查修复（设计第九节 L159"一次控制动作后等待确认和有效反馈，不在
-        同一轮因多个重复事件连续减半"）：
-        - 节流：一次收缩后至少间隔 SHRINK_MIN_GAP_SEC 才允许再收缩——同轮
-          多个 attempt 相继退 75 时只收缩一次，其余仅累计 streak（持续不足
-          证据仍在），窗口过后按效果继续收缩；
-        - 幅度：基础撤销一个名额（run_target - 1）；节流窗口内持续累积的
-          streak 参与幅度（max(1, streak)）——偶发不足温和 -1，风暴时
-          （窗口内多个作业相继报不足）窗口过后按证据量加速收缩，避免
-          高并发下目标收敛过慢（每次 -1 需数分钟才能压到位）。
+        资源退避本体由 TaskBackoff 状态机承担（步降暂停同任务在途执行、
+        逐步验证、全退避探测、逐个放回）——动态目标不再因不足收缩：
+        恢复后按既有目标逐个（一步验证）拉回，无需重新学习。
         """
         ts = self.get(task_id)
         ts.shortage_streak += 1
-        if (ts.last_shrink_mono >= 0
-                and now_mono - ts.last_shrink_mono < self.SHRINK_MIN_GAP_SEC):
-            return  # 上一次收缩尚在观察确认窗口内：只记证据，不重复收缩
-        ts.last_shrink_mono = now_mono
+        ts.last_shortage_mono = now_mono
         ts.mode = "explore"
-        ts.run_target = max(0, ts.run_target - max(1, ts.shortage_streak))
-
-    # 收缩节流窗口：不小于两个资源采样间隔，保证一次控制动作后有确认机会
-    SHRINK_MIN_GAP_SEC = 5.0
 
     def note_recovered_progress(self, task_id: str, now_mono: float) -> None:
         """真实业务进展恢复：不足证据按观察期衰减清零（审查修复，设计第九节
         L153"无持续不足"、L157 长期任务"减慢探索"而非"永久停止探索"）。
 
         streak 此前仅在作业 SUCCEEDED 时清零——长期任务无完成事件，报一次
-        75 后即使恢复真实进展也永不扩容。现在：有新进展样本且距上次收缩已
-        超过一个扩容观察期（不足确已消退）时清零 streak 并恢复 steady 模式。
+        75 后即使恢复真实进展也永不扩容。现在：有新进展样本且距最近一次
+        不足已超过一个扩容观察期（不足确已消退）时清零 streak 并恢复 steady。
         """
         ts = self.get(task_id)
         if ts.shortage_streak > 0 and \
-                now_mono - ts.last_shrink_mono >= ts.grow_observe_sec:
+                now_mono - ts.last_shortage_mono >= ts.grow_observe_sec:
             ts.shortage_streak = 0
             ts.mode = "steady"
 

@@ -148,13 +148,19 @@ class TestStartIntervalLadder:
         assert svc._healthy_since_mono == 0.0
 
     def test_token_admission_multiple_starts_per_tick(self, home, monkeypatch):
+        """令牌制（跨任务并行）+ 每任务逐个拉取（TaskBackoff）：
+        份额充足时多个任务可同轮各启动一个；同一任务在首步验证
+        （progress/checkpoint/成功）完成前不放下一个。"""
         svc = _svc(home)
-        _write_task(home, "t")
+        _write_task(home, "ta")
+        _write_task(home, "tb")
         svc.refresh_specs()
-        svc.scaling.get("t").run_target = 10
-        svc.scaling.get("t").mode = "steady"
-        for i in range(8):
-            svc.db.upsert_job(_ready(f"j-{i}", "t"), f"h{i}", "now", 50)
+        for tid in ("ta", "tb"):
+            svc.scaling.get(tid).run_target = 10
+            svc.scaling.get(tid).mode = "steady"
+        for i in range(4):
+            svc.db.upsert_job(_ready(f"ja-{i}", "ta"), f"ha{i}", "now", 50)
+            svc.db.upsert_job(_ready(f"jb-{i}", "tb"), f"hb{i}", "now", 50)
 
         class _Launch:
             pid = 1
@@ -168,7 +174,19 @@ class TestStartIntervalLadder:
         svc._last_admit_tick_mono = t0 - 1.0
         svc._admit_tokens = 0.0
         svc._tick_admit(t0)
-        assert len(svc.attempts) == 8  # 单轮补齐一个节拍内的 8 个份额
+        # 逐个拉取：每任务只拉 1 个（首步验证占位），跨任务并行不受影响
+        launched = {m.task_id for m in svc.meta.values()}
+        assert launched == {"ta", "tb"} and len(svc.attempts) == 2
+        # 同任务第二个作业：首步完成前被阻止（step_pending）
+        assert svc.tbackoff.admission_allowed("ta", t0 + 0.1) == (False, "step_pending")
+        # 首步正确完成 → 占位解除，下一轮允许再拉一个
+        aid_ta = next(a for a, m in svc.meta.items() if m.task_id == "ta")
+        svc.tbackoff.note_progress("ta", aid_ta, t0 + 0.1)
+        svc._admit_tokens = 1.0  # 份额充足，隔离令牌因素
+        svc._tick_admit(t0 + 0.2)
+        assert sum(1 for m in svc.meta.values() if m.task_id == "ta") == 2
+        # tb 未验证：仍只有 1 个
+        assert sum(1 for m in svc.meta.values() if m.task_id == "tb") == 1
 
     def test_token_admission_single_start_at_base(self, home, monkeypatch):
         svc = _svc(home)
