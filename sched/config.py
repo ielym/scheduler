@@ -50,20 +50,18 @@ class JobStatus:
     RESUMPTABLE = {PAUSED, BACKOFF}
 
 
-# 执行事件种类（设计文档第六节）
+# 执行事件种类（统一 5 种：通信格式统一，type 只区分语义）
 class EventKind:
     STARTED = "started"
-    HEARTBEAT = "heartbeat"
     PROGRESS = "progress"
-    SHORTAGE = "external_shortage"   # 统一外部不足
-    CONTROL_ACK = "control_ack"
-    CHECKPOINT = "checkpoint"
-    COMPLETED = "completed"
+    ERROR = "error"
+    DONE = "done"
+    ACK = "ack"
 
 
 # 退出码（与 sched_task_sdk/errors.py 镜像）
 EXIT_OK = 0
-EXIT_SHORTAGE = 75   # 统一外部不足
+EXIT_SHORTAGE = 75   # 资源不足（资源类错误，可恢复退让）
 
 
 def home() -> Path:
@@ -230,12 +228,7 @@ class TaskSpec(BaseModel):
     producer_entry: EntrySpec      # 生产者入口（常驻）
     executor_entry: EntrySpec      # 执行入口
     workdir: str = "."
-    progress_semver: str = "1.0.0"
     recovery: RecoverySpec = Field(default_factory=RecoverySpec)
-    # 反馈间隔契约（设计第六节）：执行者承诺的心跳/进展反馈间隔与单步最长耗时，
-    # 调度器据此推导心跳过期阈值与暂停宽限（未填用全局默认推导）。
-    feedback_interval_sec: float | None = Field(None, gt=0)
-    max_step_sec: float | None = Field(None, gt=0)
     # 作业级优先级授权上限（审查修复，设计第四节 L61"任务授权范围内设置"）：
     # 该任务作业级 priority 的最高允许值。缺省 = 任务优先级（全局硬规则：
     # 作业不得越过任务优先级，避免执行程序自行改变全局优先级）；任务可
@@ -343,7 +336,6 @@ class ReadyJob(BaseModel):
     workdir: str = "."
     input_refs: list[str] = Field(default_factory=list)
     idempotency_key: str = Field(min_length=1)
-    progress_semver: str = "1.0.0"
     env: dict[str, str] = Field(default_factory=dict)
     priority: int | None = None  # 作业级优先级：仅允许不高于任务授权上限（接收时钳制）
 

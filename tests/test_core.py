@@ -30,7 +30,7 @@ def _write_task(home, task_id, priority=50, enabled=True):
         "schema_version": 1, "task_id": task_id, "enabled": enabled, "priority": priority,
         "producer_entry": {"file": "producer.py", "interpreter": "python3", "args": [], "cwd": "."},
         "executor_entry": {"file": "run.py", "interpreter": "python3", "args": [], "cwd": "."},
-        "workdir": ".", "progress_semver": "1.0.0",
+        "workdir": ".",
         "recovery": {"replay": "outbox", "retain": "测试保留", "replay_note": "测试重放"},
     }))
     return td

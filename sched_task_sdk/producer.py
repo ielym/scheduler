@@ -163,7 +163,6 @@ class Producer:
             # 保证幂等键全链路非空——接收端对空幂等键的请求按无效载荷隔离。
             "idempotency_key": str(spec.get("idempotency_key")
                                    or spec.get("event_id") or job_id),
-            "progress_semver": spec.get("progress_semver") or "1.0.0",
             "env": dict(spec.get("env") or {}),
         }
         # 作业级优先级（可选，覆盖任务默认值）

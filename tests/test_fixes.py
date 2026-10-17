@@ -423,7 +423,7 @@ class TestStateClosures:
         d.upsert_job(_ready("j-1", "t1"), "h1", "now", 50)
         d.create_attempt("att-1", "j-1", 1, "tok", "now")
         d.update_attempt("att-1", pid=999999999, pgid=999999999)
-        d.append_event("att-1", 1, "completed", {"ok": True}, "now")
+        d.append_event("att-1", 1, "done", {"ok": True}, "now")
         d.set_job_status("j-1", JobStatus.RUNNING, "", "now")
         svc._recover()
         assert d.get_job("j-1")["status"] == JobStatus.SUCCEEDED

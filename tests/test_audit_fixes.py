@@ -100,21 +100,20 @@ def test_reap_orphans_excludes_protected(home, monkeypatch):
 
 
 # ---------- #2 _is_slow 速率差分 ----------
-def _sample(ts, cum, inflight):
-    return scaling.ProgressSample(ts_mono=ts, completed_units=int(cum),
-                                  work_units=float(cum), stage="s",
-                                  active_duration_sec=1.0,
-                                  in_flight_duration_sec=inflight)
+def _sample(ts, cum):
+    return scaling.ProgressSample(ts_mono=ts, completed_units=int(cum), stage="s")
 
 
 def test_is_slow_uses_rate_differential(home):
-    h = scaling.HealthTracker(slow_confidence_sec=5.0)
+    # 反馈间隔 EMA 初值调小，避免 6×反馈间隔的观察窗门槛把短跨度样本提前判为非慢
+    h = scaling.HealthTracker(slow_confidence_sec=5.0,
+                              timing=scaling.TaskTiming(default_interval_sec=0.5))
     # 恒速但样本为累计值：差分速率恒定 → 不判慢（旧实现按样本求和会误判）
-    dq = deque(_sample(float(i), float(i * 10), 5.0) for i in range(12))
+    dq = deque(_sample(float(i), float(i * 10)) for i in range(12))
     assert not h._is_slow(dq)
-    # 真变慢：后半速率降为 1/5 且在途耗时翻倍 → 判慢
-    dq2 = deque([_sample(float(i), float(i * 10), 5.0) for i in range(6)]
-                + [_sample(float(i), float(60 + (i - 6) * 2), 12.0) for i in range(6, 12)])
+    # 真变慢：后半速率降为 1/5 → 判慢
+    dq2 = deque([_sample(float(i), float(i * 10)) for i in range(6)]
+                + [_sample(float(i), float(60 + (i - 6) * 2)) for i in range(6, 12)])
     assert h._is_slow(dq2)
 
 
@@ -159,8 +158,8 @@ def test_recovery_blocked_recheck_unblocks_on_late_completion(home):
     # 第一次复核：无 completed → 维持阻塞
     svc._tick_recover_status(31.0)
     assert d.get_job("j-late")["status"] == JobStatus.RECOVERY_BLOCKED
-    # 迟到的 completed 事件到达 → 自动确认成功
-    d.append_event("a1", 5, EventKind.COMPLETED, {"record": {"ok": True}}, "now")
+    # 迟到的 done 事件到达 → 自动确认成功
+    d.append_event("a1", 5, EventKind.DONE, {"record": {"ok": True}}, "now")
     svc._tick_recover_status(100.0)
     assert d.get_job("j-late")["status"] == JobStatus.SUCCEEDED
     assert d.list_attempts(job_id="j-late")[0]["status"] == JobStatus.SUCCEEDED
@@ -196,7 +195,7 @@ def test_admission_round_robin(home):
     assert seq1 != seq2  # 同优先级多任务轮转，两次评估起始任务不同
 
 
-# ---------- #6 反馈间隔契约 ----------
+# ---------- #6 反馈间隔契约（调度器自统计 EMA） ----------
 def test_started_event_sets_feedback_interval(home):
     svc = _svc(home)
     _mk_job(svc.db, "j-fb")
@@ -205,11 +204,11 @@ def test_started_event_sets_feedback_interval(home):
 
     class FakeRun:
         def read_events(self, after_seq):
-            return [{"seq": 1, "kind": EventKind.STARTED, "name": "t",
-                     "feedback_interval_sec": 7.5}]
+            return [{"seq": 1, "kind": EventKind.STARTED, "name": "t"}]
 
     svc._ingest_events(FakeRun(), meta)
-    assert meta.feedback_interval == 7.5
+    # 事件到达即喂入调度器反馈间隔 EMA（任务不再声明间隔）
+    assert svc.timing._last_event_mono.get("t") is not None
     assert meta.status == JobStatus.RUNNING
 
 
@@ -219,16 +218,19 @@ def test_feedback_interval_derives_thresholds(home):
     c.heartbeat_stale_sec = 10.0
     c.heartbeat_stale_multiplier = 3.0
     meta = AttMeta("a", "j", "t", 50, "tok")
-    # 未申报 → 用全局心跳间隔
+    # 未观测到事件 → 用全局心跳间隔默认值
     assert svc._heartbeat_stale_threshold(meta) == pytest.approx(15.0)
-    # STARTED 申报 2s → 阈值回落到配置下限
-    meta.feedback_interval = 2.0
+    # 观测到 2s 反馈间隔 → 阈值回落到配置下限
+    svc.timing.note_event("t", 0.0)
+    svc.timing.note_event("t", 2.0)
+    assert svc.timing.feedback_interval("t") == pytest.approx(2.0)
     assert svc._heartbeat_stale_threshold(meta) == pytest.approx(10.0)
-    # 暂停宽限：无单步申报 → 基值
-    svc.specs["t"] = _spec("t")
+    # 暂停宽限：无观测 → 基值
     assert svc._pause_grace_sec(meta) == pytest.approx(c.pause_grace_base_sec)
-    # 单步 100s → 宽限抬升并封顶
-    svc.specs["t"] = _spec("t", max_step_sec=100)
+    # 观测到 100s 反馈间隔 → 宽限抬升并封顶
+    svc.timing = scaling.TaskTiming(default_interval_sec=c.heartbeat_interval_sec)
+    svc.timing.note_event("t", 0.0)
+    svc.timing.note_event("t", 100.0)
     assert svc._pause_grace_sec(meta) == pytest.approx(c.pause_grace_max_sec)
 
 
@@ -382,7 +384,7 @@ def test_pausing_with_shortage_exit_is_backoff():
 # ---------- #17 has_progress_since ----------
 def test_has_progress_since():
     h = scaling.HealthTracker()
-    h.record_progress("t", 100.0, 5, True, "s", None, None)
+    h.record_progress("t", 100.0, 5, "s")
     assert h.has_progress_since("t", 99.0) is True
     assert h.has_progress_since("t", 101.0) is False
     assert h.has_progress_since("other", 0.0) is False

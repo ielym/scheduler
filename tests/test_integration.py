@@ -106,9 +106,9 @@ from sched_task_sdk import ExecutorTask, run_task
 
 class T(ExecutorTask):
     def __init__(self):
-        super().__init__("t", heartbeat_interval_sec=1)
+        super().__init__("t")
     def execute(self):
-        self.report_progress(0, True, "work")
+        self.report_progress(0, "work")
         self.complete({"ok": True})
 
 sys.exit(run_task(T()))
@@ -122,13 +122,13 @@ MARK = os.environ["MARKER"]
 
 class T(ExecutorTask):
     def __init__(self):
-        super().__init__("t", heartbeat_interval_sec=1)
+        super().__init__("t")
     def execute(self):
         if not os.path.exists(MARK):
             open(MARK, "w").write("1")
-            self.report_progress(0, True, "waiting")
+            self.report_progress(0, "waiting")
             self.report_shortage("外部不足演练")
-        self.report_progress(0, False, "done")
+        self.report_progress(0, "done")
         self.complete({"ok": True})
 
 sys.exit(run_task(T()))
@@ -143,7 +143,7 @@ TOTAL = int(os.environ.get("TOTAL", "10"))
 
 class T(ExecutorTask):
     def __init__(self):
-        super().__init__("t", heartbeat_interval_sec=1)
+        super().__init__("t")
     def execute(self):
         done = set()
         if os.path.exists(LOG):
@@ -158,7 +158,7 @@ class T(ExecutorTask):
                 done.add(i)
                 with open(LOG, "w") as f:
                     f.write(json.dumps(sorted(done)))
-            self.report_progress(len(done), i < TOTAL - 1, "units")
+            self.report_progress(len(done), "units")
         self.complete({"units": sorted(done)})
 
 sys.exit(run_task(T()))
@@ -179,9 +179,9 @@ from sched_task_sdk import ExecutorTask, run_task
 
 class T(ExecutorTask):
     def __init__(self):
-        super().__init__("t", heartbeat_interval_sec=1)
+        super().__init__("t")
     def execute(self):
-        self.report_progress(0, False, "done")
+        self.report_progress(0, "done")
         self.complete({"ok": True})
 
 sys.exit(run_task(T()))

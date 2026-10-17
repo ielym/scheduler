@@ -387,10 +387,10 @@ def test_event_writer_includes_job_and_attempt(monkeypatch, tmp_path):
     monkeypatch.setenv("SCHED_ATTEMPT_ID", "att-7")
     from sched_task_sdk.events import EventWriter, EventKind
     w = EventWriter()
-    w.emit(EventKind.HEARTBEAT)
+    w.emit(EventKind.PROGRESS, completed_units=1)
     obj = json.loads((tmp_path / "ev.jsonl").read_text("utf-8").splitlines()[0])
     assert obj["job_id"] == "job-7" and obj["attempt_id"] == "att-7"
-    assert obj["kind"] == EventKind.HEARTBEAT
+    assert obj["kind"] == EventKind.PROGRESS
 
 
 # ---------- P2-8 归档对账 ----------

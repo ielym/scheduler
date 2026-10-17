@@ -316,8 +316,7 @@ def test_task_monitor_rich_fields(home, monkeypatch):
     svc.specs["t1"] = _spec("t1")
     now = time.monotonic()
     for i in range(3):  # 阶段 s1：恒定速率 10 units/s
-        svc.health.record_progress("t1", now - 30 + i * 10, i * 100, True,
-                                    "s1", 1.0, 5.0, work_units=float(i * 100))
+        svc.health.record_progress("t1", now - 30 + i * 10, i * 100, "s1")
     _mk_job(svc.db, "j_b", task_id="t1", priority=50)
     svc.db.set_job_status("j_b", JobStatus.BACKOFF,
                           "测试不足：外部依赖不可用", runner.now_iso())
@@ -421,13 +420,13 @@ def test_report_progress_monotonic(tmp_path, monkeypatch):
             pass
 
     t = T()
-    t.report_progress(5, True, "s1")
-    t.report_progress(7, True, "s1")
+    t.report_progress(5, "s1")
+    t.report_progress(7, "s1")
     with pytest.raises(ValueError, match="单调递增"):
-        t.report_progress(6, True, "s1")       # 回退 → 立即抛错
-    t.report_progress(7, True, "s1")           # 相等允许（重复上报同值）
+        t.report_progress(6, "s1")       # 回退 → 立即抛错
+    t.report_progress(7, "s1")           # 相等允许（重复上报同值）
     t2 = T()
-    t2.report_progress(0, True, "s1")          # 新实例（新 attempt）从 0 合法
+    t2.report_progress(0, "s1")          # 新实例（新 attempt）从 0 合法
 
 
 # ---------- C1：回执一次性消费 + 归档 GC + 窗口对账 ----------

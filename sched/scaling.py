@@ -19,73 +19,70 @@ from typing import Any
 class ProgressSample:
     ts_mono: float
     completed_units: int
-    work_units: float
     stage: str
-    active_duration_sec: float
-    in_flight_duration_sec: float
-    has_unfinished: bool = True
-    waiting: float | None = None   # B14：在途等待计数（业务透传，观测用）
+
+
+class TaskTiming:
+    """任务级实测 timing EMA（替代任务自申报的反馈间隔/单步耗时）。
+
+    反馈间隔 = 同任务两次业务事件（started/progress/done/error）到达间隔的
+    EMA。初始值用全局默认，随后随实测事件动态更新；任务不声明、不预估。
+    """
+
+    def __init__(self, default_interval_sec: float = 5.0, alpha: float = 0.2):
+        self.default_interval_sec = float(default_interval_sec)
+        self.alpha = float(alpha)
+        self._feedback_interval: dict[str, float] = {}
+        self._last_event_mono: dict[str, float] = {}
+
+    def note_event(self, task_id: str, now_mono: float) -> None:
+        prev = self._last_event_mono.get(task_id)
+        if prev is not None and now_mono > prev:
+            gap = now_mono - prev
+            cur = self._feedback_interval.get(task_id)
+            self._feedback_interval[task_id] = gap if cur is None \
+                else cur * (1.0 - self.alpha) + gap * self.alpha
+        self._last_event_mono[task_id] = now_mono
+
+    def feedback_interval(self, task_id: str) -> float:
+        return self._feedback_interval.get(task_id, self.default_interval_sec)
 
 
 class HealthTracker:
-    """按任务+业务阶段维护近期进展基线，识别无报错变慢（设计第十一节）。
+    """按任务+业务阶段维护近期进展基线，识别无报错变慢。
 
-    基线键为 (task_id, stage, metric_semver)：进展口径随业务版本变更
-    （progress_semver 升级意味着"单元定义/统计口径"可能改变），新旧口径
-    的速率/耗时不可互相比较，混在同一序列会把口径切换误判为变慢。
+    基线键为 (task_id, stage)；速率 = completed_units 差分 / 时间。
+    耗时与资源消耗由调度器实测（cgroup/墙钟），任务不预估、样本不携带。
     """
 
-    def __init__(self, window_sec: float = 300.0, slow_confidence_sec: float = 120.0):
+    def __init__(self, window_sec: float = 300.0, slow_confidence_sec: float = 120.0,
+                 timing: TaskTiming | None = None):
         self.window_sec = window_sec
         self.slow_confidence_sec = slow_confidence_sec
-        self._samples: dict[tuple[str, str, str], deque[ProgressSample]] = {}
-        # 任务级反馈间隔（变慢观察期随实际反馈间隔缩放，设计第十一节 L193）
-        self._feedback_interval: dict[str, float] = {}
-        # 恢复早期豁免（设计第十一节 L191"恢复早期……排除在退化比较之外"）：
-        # 暂停/重放恢复的任务在豁免窗口内不参与变慢判定（缓存冷启动、断点
-        # 重放的速率天然低于稳态基线，属预期而非退化）
+        self.timing = timing or TaskTiming()
+        self._samples: dict[tuple[str, str], deque[ProgressSample]] = {}
+        # 恢复早期豁免：暂停/重放恢复的任务在豁免窗口内不参与变慢判定
         self._resume_exempt_until: dict[str, float] = {}
 
-    def set_task_feedback(self, task_id: str, interval_sec: float) -> None:
-        """登记任务承诺的反馈间隔（观察期参考实际反馈间隔，设计第十一节）。"""
-        if interval_sec and interval_sec > 0:
-            self._feedback_interval[task_id] = float(interval_sec)
-
     def note_resumed(self, task_id: str, now_mono: float, exempt_sec: float) -> None:
-        """登记一次恢复事件（暂停恢复/重放启动）：豁免窗口内不判慢。"""
         if exempt_sec > 0:
             until = now_mono + float(exempt_sec)
             prev = self._resume_exempt_until.get(task_id, 0.0)
             self._resume_exempt_until[task_id] = max(prev, until)
 
-    def record(self, task_id: str, stage: str, sample: ProgressSample,
-               semver: str = "") -> None:
-        key = (task_id, stage, semver)
+    def record(self, task_id: str, stage: str, sample: ProgressSample) -> None:
+        key = (task_id, str(stage))
         dq = self._samples.setdefault(key, deque())
         dq.append(sample)
         while dq and sample.ts_mono - dq[0].ts_mono > self.window_sec:
             dq.popleft()
 
     def record_progress(self, task_id: str, now_mono: float, completed_units: int,
-                        has_unfinished: bool, stage: str,
-                        active_duration_sec: float | None,
-                        in_flight_duration_sec: float | None,
-                        work_units: float | None = None,
-                        waiting: float | None = None,
-                        semver: str = "") -> None:
-        # 完成态（无在途工作）也作为"真实进展证据"进入样本，支撑短任务批量完成的扩容学习
-        # （设计第九、十四节）；变慢判定只取 has_unfinished 样本（见 _is_slow），
-        # 故完成态不会被误判为变慢（设计第十一节）。
+                        stage: str = "") -> None:
         self.record(task_id, str(stage), ProgressSample(
             ts_mono=now_mono,
             completed_units=int(completed_units),
-            work_units=float(work_units or 0.0),
-            stage=str(stage),
-            active_duration_sec=float(active_duration_sec or 0.0),
-            in_flight_duration_sec=float(in_flight_duration_sec or 0.0),
-            has_unfinished=bool(has_unfinished),
-            waiting=(float(waiting) if waiting is not None else None),
-        ), semver=str(semver or ""))
+            stage=str(stage)))
 
     def has_samples(self, task_id: str) -> bool:
         return any(k[0] == task_id for k in self._samples)
@@ -101,42 +98,28 @@ class HealthTracker:
         return False
 
     def stages_summary(self, task_id: str, now_mono: float) -> list[dict]:
-        """该任务各业务阶段的近期健康摘要（监控视图，设计第十四节）。
-
-        每阶段取窗口内最近样本：样本数、累计完成单元、窗口速率（累计工作量
-        差分 / 时间跨度）、是否满足变慢判定。只读不改判定状态。
-        """
+        """该任务各业务阶段的近期健康摘要（监控视图）。"""
         out: list[dict] = []
-        for (tid, stage, semver), dq in self._samples.items():
+        for (tid, stage), dq in self._samples.items():
             if tid != task_id or not dq:
                 continue
             s_first, s_last = dq[0], dq[-1]
-
-            def cum(s: ProgressSample) -> float:
-                return s.work_units if s.work_units > 0 else float(s.completed_units)
-
             span = s_last.ts_mono - s_first.ts_mono
             rate = 0.0
-            if span > 0 and cum(s_last) > cum(s_first):
-                rate = (cum(s_last) - cum(s_first)) / span
+            if span > 0 and s_last.completed_units > s_first.completed_units:
+                rate = (s_last.completed_units - s_first.completed_units) / span
             recent = now_mono - s_last.ts_mono <= self.window_sec
             out.append({
                 "stage": stage,
-            "semver": semver,
-            "samples": len(dq),
-            "completed_units": s_last.completed_units,
-            "rate_per_sec": round(rate, 4),
-            "slow": recent and self._is_slow(dq, tid),
-        })
+                "samples": len(dq),
+                "completed_units": s_last.completed_units,
+                "rate_per_sec": round(rate, 4),
+                "slow": recent and self._is_slow(dq, tid),
+            })
         return out
 
     def slow(self, task_id: str, now_mono: float) -> bool:
-        """任一业务阶段出现"连续证据下速率持续下降 + 处理/在途耗时持续上升"即判慢。
-
-        只使用近期样本（窗口内）：陈旧样本不参与判定，避免暂停很久的任务凭
-        停摆前的旧基线被误判为变慢（设计第十一节：近期健康基线）。
-        恢复早期豁免（设计第十一节 L191）：暂停/重放恢复后的豁免窗口内不判慢。
-        """
+        """任一业务阶段近期速率持续下降即判慢（陈旧样本不参与，恢复早期豁免）。"""
         if now_mono < self._resume_exempt_until.get(task_id, 0.0):
             return False
         for key, dq in self._samples.items():
@@ -149,14 +132,11 @@ class HealthTracker:
         return False
 
     def _is_slow(self, dq: deque, task_id: str = "") -> bool:
-        # 只在途工作的样本参与变慢判定；完成态/无在途样本不计入（设计第十一节）
-        dq = deque(s for s in dq if s.has_unfinished)
         if len(dq) < 4:
             return False
-        # 要求最近样本覆盖至少 slow_confidence_sec（观察期参考实际反馈间隔：
-        # 反馈慢的任务按 6×反馈间隔拉长跨度门槛，设计第十一节 L193）
+        # 要求最近样本覆盖至少 slow_confidence_sec（观察期参考实测反馈间隔）
         min_span = self.slow_confidence_sec
-        fi = self._feedback_interval.get(task_id or "", 0.0)
+        fi = self.timing.feedback_interval(task_id)
         if fi > 0:
             min_span = max(min_span, fi * 6.0)
         span = dq[-1].ts_mono - dq[0].ts_mono
@@ -169,40 +149,19 @@ class HealthTracker:
         front = samples[: max(1, len(samples) // 2)]
         back = samples[len(samples) // 2:]
 
-        def cum(s: ProgressSample) -> float:
-            # work_units 为累计工作量计数（缺省退化用 completed_units 累计值）
-            return s.work_units if s.work_units > 0 else float(s.completed_units)
-
-        def rate(seq: list[ProgressSample]) -> float:
-            # 速率 = 累计工作量的差分 / 时间跨度（样本本身是累计值，直接求和会算错）
+        def rate(seq):
+            # 速率 = completed_units 差分 / 时间跨度（样本本身是累计值）
             if len(seq) < 2:
                 return 0.0
-            d = cum(seq[-1]) - cum(seq[0])
+            d = seq[-1].completed_units - seq[0].completed_units
             if d <= 0:
                 return 0.0
             sec = seq[-1].ts_mono - seq[0].ts_mono
             if sec <= 0:
                 return 0.0
             return d / sec
-
-        def in_flight(seq):
-            return sum(s.in_flight_duration_sec for s in seq) / max(1, len(seq))
-
-        def active_avg(seq):
-            return sum(s.active_duration_sec for s in seq) / max(1, len(seq))
-
-        # 正常无输入等待不算变慢（设计第六节）：后半窗口的在途时长主要由
-        # 等待输入构成（waiting ≥ 0.8×在途总时长）时，判为业务等待而非处理退化
-        back_in_flight = sum(s.in_flight_duration_sec for s in back)
-        back_waiting = sum(s.waiting for s in back if s.waiting is not None)
-        if back_in_flight > 0 and back_waiting >= 0.8 * back_in_flight:
-            return False
-
-        # 设计第十一节：归一化速率持续下降 "且"（处理耗时上升 "或" 在途等待上升）
-        rate_declining = rate(back) < rate(front) * 0.8
-        process_slower = active_avg(back) > active_avg(front) * 1.2
-        wait_rising = in_flight(back) > in_flight(front) * 1.2
-        return rate_declining and (process_slower or wait_rising)
+        # 归一化速率持续下降即判慢
+        return rate(back) < rate(front) * 0.8
 
 
 @dataclass

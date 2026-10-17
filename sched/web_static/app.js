@@ -1280,7 +1280,6 @@ function buildJobPanel(data, focusAttempt) {
       <div class="so-section-title">协议与输入</div>
       <dl class="dl">
         <dt>幂等键</dt><dd>${esc(j.idempotency_key || "—")}</dd>
-        <dt>进展语义</dt><dd>v${esc(j.progress_semver)}</dd>
         <dt>内容摘要</dt><dd>${esc(j.content_hash || "")}</dd>
         <dt>工作目录</dt><dd>${esc(j.workdir)}</dd>
         <dt>入口参数</dt><dd>${esc(JSON.stringify(j.entry_args_json ?? []))}</dd>
@@ -1514,7 +1513,6 @@ function _tlItemHtml(e, attemptId) {
   else if (e.kind === "started") {
     const bits = [];
     if (p.pid) bits.push(`PID ${p.pid}`);
-    if (p.feedback_interval_sec) bits.push(`反馈间隔 ${p.feedback_interval_sec}s`);
     extra = bits.join(" · ");
   }
   const key = attemptId + ":" + e.seq;
@@ -1644,7 +1642,7 @@ function openTaskDetail(taskId) {
           <span class="pri-chip"><span class="bar"></span>优先级 ${t.priority}</span>
         </div>
         <div class="so-title">${esc(t.task_id)}</div>
-        <div class="dim" style="font-size:11.5px;margin-top:4px">进展语义 v${esc(t.progress_semver)} · 授权作业优先级上限 ${t.job_priority_cap ?? t.priority}</div>
+        <div class="dim" style="font-size:11.5px;margin-top:4px">授权作业优先级上限 ${t.job_priority_cap ?? t.priority}</div>
       </div>
       <button class="so-close" title="关闭 (Esc)"><svg class="ic" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" stroke-linecap="round"/></svg></button>
     </div>
@@ -1696,8 +1694,6 @@ function openTaskDetail(taskId) {
       <dl class="dl">
         <dt>生产者入口</dt><dd>${esc(t.producer_entry.interpreter)} ${esc(t.producer_entry.file)} ${esc((t.producer_entry.args || []).join(" "))}</dd>
         <dt>执行入口</dt><dd>${esc(t.executor_entry.interpreter)} ${esc(t.executor_entry.file)} ${esc((t.executor_entry.args || []).join(" "))}</dd>
-        <dt>反馈间隔</dt><dd>${t.feedback_interval_sec ? t.feedback_interval_sec + "s" : "全局默认"}</dd>
-        <dt>单步上限</dt><dd>${t.max_step_sec ? t.max_step_sec + "s" : "全局默认"}</dd>
         <dt>恢复方式</dt><dd class="plain">${esc(t.recovery.replay)} · 保留：${esc(t.recovery.retain || "—")}</dd>
         <dt>遗漏识别</dt><dd class="plain">${esc(t.recovery.replay_note || "—")}</dd>
       </dl>

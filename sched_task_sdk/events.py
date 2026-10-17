@@ -4,8 +4,7 @@
   {"seq": N, "kind": "...", "at": ISO(UTC), "job_id": "...", "attempt_id": "...", "...payload 平铺..."}
 
 seq 单调递增，由本进程维护；调度器按 (attempt_id, seq) 去重。
-kind ∈ {started, heartbeat, progress, external_shortage, control_ack,
-        checkpoint, completed}（见 errors.EventKind）。
+kind ∈ {started, progress, error, done, ack}（见 errors.EventKind）。
 """
 
 from __future__ import annotations

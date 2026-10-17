@@ -26,7 +26,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     workdir TEXT NOT NULL DEFAULT '.',
     input_refs_json TEXT NOT NULL DEFAULT '[]',
     idempotency_key TEXT NOT NULL DEFAULT '',
-    progress_semver TEXT NOT NULL DEFAULT '1.0.0',
     status TEXT NOT NULL DEFAULT 'QUEUED',
     reason TEXT NOT NULL DEFAULT '',
     queued_at TEXT NOT NULL,
@@ -135,6 +134,9 @@ class DB:
     def _migrate(self) -> None:
         """旧库平滑加列（幂等）。"""
         job_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "progress_semver" in job_cols:
+            # 协议重构：进展语义版本号概念移除（过度设计）
+            self._conn.execute("ALTER TABLE jobs DROP COLUMN progress_semver")
         if "retry_count" not in job_cols:
             self._conn.execute(
                 "ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
@@ -213,15 +215,15 @@ class DB:
             self._conn.execute(
                 """INSERT INTO jobs
                    (job_id, task_id, priority, content_hash, env_json, entry_args_json,
-                    workdir, input_refs_json, idempotency_key, progress_semver,
+                    workdir, input_refs_json, idempotency_key,
                     status, queued_at, receive_seq)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (ready.job_id, ready.task_id, priority, content_hash,
                  json.dumps(ready.env, ensure_ascii=False),
                  json.dumps(ready.entry_args, ensure_ascii=False),
                  ready.workdir,
                  json.dumps(ready.input_refs, ensure_ascii=False),
-                 ready.idempotency_key, ready.progress_semver,
+                 ready.idempotency_key,
                  JobStatus.QUEUED, now,
                  self._next_receive_seq()),
             )

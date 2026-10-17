@@ -526,52 +526,19 @@ class TestProtectDeadlineDerivation:
         assert svc.protect.st.deadline_mono == pytest.approx(before + grace_max)
 
 
-# ---------- 修复 9：正常无输入等待不算变慢 ----------
-
-class TestWaitingNotSlow:
-    def _samples(self, waiting_back):
-        samples = []
-        for i in range(10):
-            back = i >= 5
-            samples.append(scaling.ProgressSample(
-                ts_mono=float(i * 30), completed_units=i + 1,
-                work_units=float(i * 100 if not back else 400 + (i - 5) * 10),
-                stage="s", active_duration_sec=2.0 if back else 1.0,
-                in_flight_duration_sec=50.0 if back else 10.0,
-                has_unfinished=True,
-                waiting=(45.0 if back else None) if waiting_back else None))
-        return deque(samples)
-
-    def test_slow_without_waiting_signal(self):
-        h = scaling.HealthTracker()
-        assert h._is_slow(self._samples(waiting_back=False)) is True
-
-    def test_not_slow_when_back_half_waiting_dominates(self):
-        h = scaling.HealthTracker()
-        # 后半窗口 waiting 225 ≥ 0.8×在途 250：判为等待输入，非变慢
-        assert h._is_slow(self._samples(waiting_back=True)) is False
-
-
-# ---------- 修复 10：控制节奏随反馈周期缩放 ----------
+# ---------- 修复 10：控制节奏随反馈周期（调度器自统计 EMA）缩放 ----------
 
 class TestControlRhythmScaling:
-    def test_grow_observe_clamped_to_feedback_interval(self, home):
-        svc = _svc(home)
-        _write_task(home, "t-fast")  # 无申报 → 保持配置值
-        _write_task(home, "t-mid", raw_extra={"feedback_interval_sec": 20.0})
-        _write_task(home, "t-long", raw_extra={"feedback_interval_sec": 200.0})
-        svc.refresh_specs()
-        assert svc.scaling.get("t-fast").grow_observe_sec == \
-            svc.cfg.control.grow_observe_sec
-        assert svc.scaling.get("t-mid").grow_observe_sec == 80.0   # 4×20
-        assert svc.scaling.get("t-long").grow_observe_sec == 600.0  # 封顶
-
     def test_backoff_cap_scaled_by_feedback_interval(self, home):
         svc = _svc(home)
-        _write_task(home, "t-long", raw_extra={"feedback_interval_sec": 200.0})
+        _write_task(home, "t-long")
         svc.refresh_specs()
         svc.db.upsert_job(_ready("j-1", "t-long"), "h1", "now", 50)
         svc.db.set_job_backoff("j-1", 30, "")  # 历史计数已高 → 直接触顶
+        # 喂事件让反馈间隔 EMA 升到 200s（调度器自统计，任务不再声明间隔）
+        svc.timing.note_event("t-long", 0.0)
+        svc.timing.note_event("t-long", 200.0)
+        assert svc.timing.feedback_interval("t-long") == pytest.approx(200.0)
         from datetime import datetime, timezone
         t0 = datetime.now(timezone.utc)
         svc._schedule_backoff_retry("j-1")

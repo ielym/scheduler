@@ -33,38 +33,34 @@ def _svc(home):
 # ---------- 1. 完成态样本计数为进展证据 ----------
 def test_completion_sample_counts_as_progress(home):
     h = scaling.HealthTracker()
-    h.record_progress("t", 100.0, 5, False, "s", None, None)  # 完成态：无在途工作
+    h.record_progress("t", 100.0, 5, "s")
     assert h.has_samples("t") is True
 
 
-# ---------- 2. 处理耗时上升（在途不变）也可判慢 ----------
+# ---------- 2. 归一化速率下降即可判慢 ----------
 def test_is_slow_via_process_duration_rise(home):
-    h = scaling.HealthTracker(slow_confidence_sec=5.0)
+    h = scaling.HealthTracker(slow_confidence_sec=5.0,
+                              timing=scaling.TaskTiming(default_interval_sec=0.5))
     samples = [
-        scaling.ProgressSample(ts_mono=float(i), completed_units=i * 10,
-                               work_units=float(i * 10), stage="s",
-                               active_duration_sec=1.0, in_flight_duration_sec=5.0)
+        scaling.ProgressSample(ts_mono=float(i), completed_units=i * 10, stage="s")
         for i in range(6)
     ] + [
-        scaling.ProgressSample(ts_mono=float(i), completed_units=60 + (i - 6) * 2,
-                               work_units=float(60 + (i - 6) * 2), stage="s",
-                               active_duration_sec=2.0, in_flight_duration_sec=5.0)
+        scaling.ProgressSample(ts_mono=float(i),
+                               completed_units=60 + (i - 6) * 2, stage="s")
         for i in range(6, 12)
     ]
-    # 速率下降（10 -> 2），处理耗时上升（1.0 -> 2.0），在途不变（5.0）
+    # 归一化速率下降（10 -> 2）：判慢
     assert h._is_slow(deque(samples))
 
 
 def test_completion_samples_do_not_trigger_slow(home):
-    h = scaling.HealthTracker(slow_confidence_sec=5.0)
+    h = scaling.HealthTracker(slow_confidence_sec=5.0,
+                              timing=scaling.TaskTiming(default_interval_sec=0.5))
     samples = [
-        scaling.ProgressSample(ts_mono=float(i), completed_units=i,
-                               work_units=float(i), stage="s",
-                               active_duration_sec=1.0, in_flight_duration_sec=0.0,
-                               has_unfinished=False)
+        scaling.ProgressSample(ts_mono=float(i), completed_units=i, stage="s")
         for i in range(12)
     ]
-    assert not h._is_slow(deque(samples))  # 完成态不计入变慢判定
+    assert not h._is_slow(deque(samples))  # 恒速率：不判慢
 
 
 # ---------- 3. _request_pause 退让账 ----------
@@ -124,14 +120,14 @@ def test_choose_oom_yield_candidate(home):
     assert svc._choose_oom_yield_candidate("a_lo") is None
 
 
-# ---------- 5. SDK 暂不足事件：只报事件不退 ----------
+# ---------- 5. SDK 错误归因事件：只报事件不退 ----------
 def test_report_shortage_event_module(tmp_path, monkeypatch):
     monkeypatch.setenv("SCHED_EVENT_FILE", str(tmp_path / "ev.jsonl"))
-    from sched_task_sdk import EventKind, report_shortage_event
-    report_shortage_event("临时不足")
+    from sched_task_sdk import EventKind, report_error_event
+    report_error_event("临时不足")
     lines = (tmp_path / "ev.jsonl").read_text().strip().splitlines()
     obj = json.loads(lines[0])
-    assert obj["kind"] == EventKind.SHORTAGE
+    assert obj["kind"] == EventKind.ERROR
     assert obj["reason"] == "临时不足"
 
 

@@ -88,15 +88,11 @@ class AttMeta:
         self.last_progress_cu: int | None = None  # 进展单调基准（回退样本拒绝入基线）
         self.pause_command: dict | None = None
         self.pause_deadline_mono = 0.0
-        self.pause_requested_mono = 0.0    # 暂停请求发出时刻（暂停时长/检查点延迟统计）
-        self.last_ckpt_mono = 0.0          # 最近一次检查点事件到达时刻
+        self.pause_requested_mono = 0.0    # 暂停请求发出时刻（暂停时长统计）
         self.cancel_deadline_mono = 0.0
         self.started_mono = _now_mono()
         self.last_event_mono = _now_mono()
-        self.last_heartbeat_mono = 0.0   # 上次心跳到达时刻（用于计算承诺反馈间隔）
-        self.heartbeat_gap = 0.0         # 最近一次心跳间隔（秒）
-        self.feedback_interval = 0.0     # 执行者承诺的反馈间隔（STARTED 事件携带；0=未申报）
-        self.max_step_sec = 0.0          # 执行者申报的单步最长耗时（STARTED 携带；0=未申报）
+        self.last_progress_mono = 0.0    # 最近一次 progress 事件到达时刻（B7 判定）
 
 
 class SchedulerService:
@@ -105,8 +101,12 @@ class SchedulerService:
         self.db = dbmod.DB()
         self.guard = prodguard.ProducerGuard(self.cfg)
         self.scaling = scaling.Scaling(self.cfg)
+        # 任务级实测 timing EMA（反馈间隔等由调度器自统计，任务不声明）
+        self.timing = scaling.TaskTiming(
+            default_interval_sec=self.cfg.control.heartbeat_interval_sec)
         self.health = scaling.HealthTracker(
-            slow_confidence_sec=self.cfg.control.slow_confidence_sec)
+            slow_confidence_sec=self.cfg.control.slow_confidence_sec,
+            timing=self.timing)
         self.protect = scaling.Protect(self.cfg)
         self.trend = scaling.ResourceTrend(
             unhealthy_ratio=self.cfg.control.resource_unhealthy_ratio,
@@ -230,7 +230,7 @@ class SchedulerService:
         （(attempt_id, seq) 去重幂等）并返回 True。文件缺失/损坏行按"无完成
         记录"处理，不让恢复流程崩溃。
         """
-        if self.db.has_event_kind(attempt_id, EventKind.COMPLETED):
+        if self.db.has_event_kind(attempt_id, EventKind.DONE):
             return True
         try:
             p = config.run_dir(attempt_id) / "events.jsonl"
@@ -250,10 +250,10 @@ class SchedulerService:
                         continue
                     if ev.get("attempt_id") and ev["attempt_id"] != attempt_id:
                         continue
-                    if ev.get("kind") != EventKind.COMPLETED:
+                    if ev.get("kind") != EventKind.DONE:
                         continue
                     self.db.append_event(attempt_id, int(ev.get("seq") or 0),
-                                         EventKind.COMPLETED, ev, runner.now_iso())
+                                         EventKind.DONE, ev, runner.now_iso())
                     found = True
             return found
         except OSError:
@@ -464,7 +464,6 @@ class SchedulerService:
                 entry_args=_json.loads(job["entry_args_json"]),
                 workdir=job["workdir"],
                 env=_json.loads(job["env_json"]),
-                progress_semver=job["progress_semver"],
             )
             from . import cgroup as _cg
             cg_name = str(att.get("cgroup") or "")
@@ -480,7 +479,6 @@ class SchedulerService:
             meta = AttMeta(attempt_id, job_id, task_id, int(job["priority"]),
                            aspec.token)
             meta.status = str(att.get("status") or JobStatus.STARTING)
-            meta.feedback_interval = spec.feedback_interval_sec or 0.0
             self.attempts[attempt_id] = a
             self.meta[attempt_id] = meta
             # permit 幂等补写：等待许可中的 worker 立即解锁（已授予的无影响）
@@ -498,16 +496,6 @@ class SchedulerService:
     def refresh_specs(self) -> dict[str, config.TaskSpec]:
         specs = load_all_specs()
         self.specs = specs
-        # 控制节奏随任务反馈周期缩放（设计第十四节：观察时间随处理周期调整）：
-        # 扩容观察期不短于 4×反馈间隔，封顶 600s；变慢观察期同步登记反馈间隔
-        # （审查修复，设计第十一节 L193"观察期参考实际反馈间隔"）
-        for tid, spec in specs.items():
-            if spec.feedback_interval_sec:
-                ts = self.scaling.get(tid)
-                ts.grow_observe_sec = min(
-                    600.0, max(self.cfg.control.grow_observe_sec,
-                               spec.feedback_interval_sec * 4.0))
-            self.health.set_task_feedback(tid, spec.feedback_interval_sec or 0.0)
         return specs
 
     # ---------- 主循环 ----------
@@ -792,14 +780,11 @@ class SchedulerService:
             meta.after_seq = max(meta.after_seq, seq)
             meta.last_event_mono = _now_mono()
             kind = ev.get("kind")
+            now_m = _now_mono()
+            # 每次业务事件都喂反馈间隔 EMA（TaskTiming，调度器自统计）
+            self.timing.note_event(meta.task_id, now_m)
             if kind == EventKind.STARTED:
                 if meta.status == JobStatus.STARTING:
-                    fi = ev.get("feedback_interval_sec")
-                    if isinstance(fi, (int, float)) and not isinstance(fi, bool) and fi > 0:
-                        meta.feedback_interval = float(fi)  # 反馈间隔契约（STARTED 申报）
-                    ms = ev.get("max_step_sec")
-                    if isinstance(ms, (int, float)) and not isinstance(ms, bool) and ms > 0:
-                        meta.max_step_sec = float(ms)  # B14：单步耗时申报（暂停宽限推导）
                     self._transition(meta, JobStatus.RUNNING)
                     # A7 启动许可：调度器确认 STARTED/RUNNING 后写 permit.json，
                     # worker 在许可前不产生业务副作用（设计第十三节）
@@ -808,41 +793,29 @@ class SchedulerService:
                     except Exception:
                         log.warning("write permit failed for attempt %s",
                                     meta.attempt_id)
-            elif kind == EventKind.HEARTBEAT:
-                now_m = _now_mono()
-                if meta.last_heartbeat_mono:
-                    meta.heartbeat_gap = now_m - meta.last_heartbeat_mono
-                meta.last_heartbeat_mono = now_m
             elif kind == EventKind.PROGRESS:
-                self._ingest_progress_event(meta, int(ev.get("completed_units") or 0), ev)
+                meta.last_progress_mono = now_m
+                self._ingest_progress_event(
+                    meta, int(ev.get("completed_units") or 0), ev)
                 # 一次正确执行的步骤：解除"逐个拉取"的首步验证位 /
                 # 任务退避（VERIFY/EMPTY）恢复正常（TaskBackoff）
-                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, _now_mono())
+                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, now_m)
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
-            elif kind == EventKind.SHORTAGE:
-                meta.shortage_at_mono = _now_mono()
+            elif kind == EventKind.ERROR:
+                meta.shortage_at_mono = now_m
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
                 self._on_explicit_shortage(meta)
-            elif kind == EventKind.CONTROL_ACK:
-                self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
-            elif kind == EventKind.CHECKPOINT:
-                meta.last_ckpt_mono = _now_mono()
-                # 检查点落地 = 一次正确执行的步骤（TaskBackoff 首步验证/恢复）
-                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, _now_mono())
-                self.db.record_checkpoint(meta.attempt_id, int(ev.get("commit_seq") or 0),
-                                          str(ev.get("input_ref") or ""), runner.now_iso())
-                self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
-            elif kind == EventKind.COMPLETED:
+            elif kind == EventKind.DONE:
                 meta.had_completed = True
                 # 成功也是"正确一步"：任务退避立即恢复正常（TaskBackoff）
-                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, _now_mono())
+                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, now_m)
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
             else:
+                # ack / 未知类型：仅落库
                 self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
 
     def _ingest_progress_event(self, meta: AttMeta, cu: int, ev: dict) -> None:
-        """进展样本入健康基线（审查修复，设计第六节 L91"进展必须给出单调递增
-        的已完成单元数"）：回退样本拒绝入基线（防污染变慢判定的速率差分），
+        """进展样本入健康基线：回退样本拒绝入基线（防污染变慢判定的速率差分），
         仅告警；新 attempt 从 0 重新计数合法（meta 级基准）。"""
         if meta.last_progress_cu is not None and cu < meta.last_progress_cu:
             log.warning("attempt %s progress regressed %d -> %d, "
@@ -851,15 +824,7 @@ class SchedulerService:
             return
         meta.last_progress_cu = cu
         self.health.record_progress(
-            meta.task_id, _now_mono(), cu,
-            bool(ev.get("has_unfinished")),
-            str(ev.get("stage") or ""),
-            ev.get("active_duration_sec"),
-            ev.get("in_flight_duration_sec"),
-            ev.get("work_units"),
-            ev.get("waiting"),
-            str(ev.get("metric_semver") or ""),
-        )
+            meta.task_id, _now_mono(), cu, str(ev.get("stage") or ""))
 
     def _transition(self, meta: AttMeta, status: str, reason: str = "") -> None:
         meta.status = status
@@ -895,8 +860,7 @@ class SchedulerService:
         # 会撤销近期放回；若新一轮保护被失败轮退避拒绝（返回 False），已放回
         # 任务既无门禁也无退让约束，将持续挤压再次受阻的高优先级对象，必须撤回。
         released_snapshot = dict(self.protect.st.released)
-        spec = self.specs.get(meta.task_id)
-        fi = (spec.feedback_interval_sec or 0.0) if spec is not None else 0.0
+        fi = self.timing.feedback_interval(meta.task_id)
         ok = self.protect.start_round(meta.task_id, meta.priority, now,
                                       reason="统一外部不足", cause="shortage",
                                       feedback_interval_sec=fi,
@@ -1006,14 +970,11 @@ class SchedulerService:
         # 探测（被步降暂停的最后一个执行退出后，VERIFY 不再有任何出口）
         self._task_backoff_reconcile(meta.task_id, _now_mono())
 
-        # 暂停闭环统计：暂停请求 → 实际退出耗时；暂停请求 → 检查点落地延迟
+        # 暂停闭环统计：暂停请求 → 实际退出耗时
         if (outcome.status in (JobStatus.PAUSED, JobStatus.BACKOFF,
                                JobStatus.CANCELLED)
                 and meta.pause_requested_mono > 0):
-            now_m = _now_mono()
-            self._pause_dur.append(now_m - meta.pause_requested_mono)
-            if meta.last_ckpt_mono >= meta.pause_requested_mono:
-                self._ckpt_lat.append(meta.last_ckpt_mono - meta.pause_requested_mono)
+            self._pause_dur.append(_now_mono() - meta.pause_requested_mono)
 
         stid = meta.task_id
         if outcome.status == JobStatus.SUCCEEDED:
@@ -1028,11 +989,11 @@ class SchedulerService:
             self._persist_scale(stid)
             # 不足证据破坏"稳定健康"：启动间隔阶梯立即回弹（设计第九节）
             self._healthy_since_mono = 0.0
-            # B7：本 attempt 已有真实业务进展（启动后收到过检查点）时，
+            # B7：本 attempt 已有真实业务进展（启动后收到过 progress）时，
             # 重试计数从头开始，不足恢复后的等待不继承历史退避长度
             self._schedule_backoff_retry(
                 meta.job_id,
-                had_evidence=meta.last_ckpt_mono > meta.started_mono)
+                had_evidence=meta.last_progress_mono > meta.started_mono)
             # 每任务独立资源退避（TaskBackoff）：同任务作业必共用资源 →
             # 步降同任务内最新启动的在途执行；无在途可退 → 任务级退避
             self._task_backoff_step_down(stid, _now_mono())
@@ -1067,10 +1028,8 @@ class SchedulerService:
         retry = 1 if had_evidence else int(job.get("retry_count") or 0) + 1
         base = self.cfg.control.shortage_retry_base_sec
         cap = self.cfg.control.shortage_retry_cap_sec
-        # 等待上限随任务处理周期调整（设计第十四节：等待上限和观察时间随
-        # 近期失败间隔与处理周期调整）：不低于 8×反馈间隔，封顶 3600s
-        spec = self.specs.get(task_id)
-        fi = (spec.feedback_interval_sec or 0.0) if spec is not None else 0.0
+        # 等待上限随任务反馈节奏调整：不低于 8×反馈间隔（实测 EMA），封顶 3600s
+        fi = self.timing.feedback_interval(task_id)
         if fi > 0:
             cap = min(3600.0, max(cap, fi * 8.0))
         # 近期失败间隔：连续快速失败说明外部严重不可得 → 提高等待上限、
@@ -1641,8 +1600,7 @@ class SchedulerService:
                 task_id, pri = demand
                 min_run_pri = self._min_running_priority()
                 if min_run_pri is not None and pri > min_run_pri:
-                    spec = self.specs.get(task_id)
-                    fi = (spec.feedback_interval_sec or 0.0) if spec is not None else 0.0
+                    fi = self.timing.feedback_interval(task_id)
                     if self.protect.start_round(
                             task_id, pri, now,
                             reason="高优先级请求到达且执行侧接近饱和",
@@ -1661,8 +1619,7 @@ class SchedulerService:
             for meta in list(self.meta.values()):
                 if self.health.slow(meta.task_id, now) and \
                         self._protect_worthy(meta.priority):
-                    spec = self.specs.get(meta.task_id)
-                    fi = (spec.feedback_interval_sec or 0.0) if spec is not None else 0.0
+                    fi = self.timing.feedback_interval(meta.task_id)
                     if self.protect.start_round(meta.task_id, meta.priority, now,
                                                 reason="无报错持续变慢", cause="slow",
                                                 feedback_interval_sec=fi,
@@ -1833,34 +1790,23 @@ class SchedulerService:
                              "grace_sec": round(grace, 1)})
 
     def _pause_grace_sec(self, meta: AttMeta) -> float:
-        """暂停宽限：依据承诺反馈间隔 / 任务申报的单步耗时 / 已观测检查点延迟推导，
-        不固定等待（设计文档第六、十四节），封顶 pause_grace_max_sec。
+        """暂停宽限：依据实测反馈间隔 EMA 与已观测暂停耗时推导，封顶上限。
 
-        B14：优先用本 attempt STARTED 申报的单步耗时（最新契约），未申报时
-        回退 task.json 的任务级声明。
+        任务不声明单步耗时——调度器从实际事件间隔（反馈 EMA）与历史暂停
+        /检查点延迟自统计，宽限随真实节奏自适应。
         """
-        interval = meta.feedback_interval or self.cfg.control.heartbeat_interval_sec
+        interval = self.timing.feedback_interval(meta.task_id)
         grace = max(self.cfg.control.pause_grace_base_sec, interval * 4)
-        if meta.max_step_sec:
-            grace = max(grace, meta.max_step_sec * 1.5)
-        else:
-            spec = self.specs.get(meta.task_id)
-            if spec is not None and spec.max_step_sec:
-                grace = max(grace, spec.max_step_sec * 1.5)
-        avg_ckpt = self._avg(self._ckpt_lat)
-        if avg_ckpt is not None:
-            grace = max(grace, avg_ckpt * 2)
         return min(grace, self.cfg.control.pause_grace_max_sec)
 
     def _heartbeat_stale_threshold(self, meta: AttMeta) -> float:
-        """心跳过期阈值：取配置下限、承诺反馈间隔×倍数、实际最近心跳间隔×倍数的较大者。
+        """疑似卡死阈值：配置下限与实测反馈间隔×倍数的较大者（不固定等待）。
 
-        设计第十四节：心跳过期依据承诺反馈间隔和实际延迟计算，不固定等待。
+        存活检测由进程树 + 事件到达间隔承担，不再依赖任务自报心跳。
         """
-        interval = meta.feedback_interval or self.cfg.control.heartbeat_interval_sec
+        interval = self.timing.feedback_interval(meta.task_id)
         mult = self.cfg.control.heartbeat_stale_multiplier
-        actual = meta.heartbeat_gap or interval
-        return max(self.cfg.control.heartbeat_stale_sec, interval * mult, actual * mult)
+        return max(self.cfg.control.heartbeat_stale_sec, interval * mult)
 
     @staticmethod
     def _avg(d: deque) -> float | None:
@@ -2033,7 +1979,6 @@ class SchedulerService:
                 entry_args=_json.loads(job["entry_args_json"]),
                 workdir=job["workdir"],
                 env=_json.loads(job["env_json"]),
-                progress_semver=job["progress_semver"],
             )
             a = runner.launch(aspec, _json.loads(job["input_refs_json"]))
         except Exception as e:
@@ -2051,7 +1996,6 @@ class SchedulerService:
             return False
         meta = AttMeta(attempt_id, job["job_id"], job["task_id"], int(job["priority"]), token)
         meta.grown_at_mono = _now_mono()
-        meta.feedback_interval = spec.feedback_interval_sec or 0.0
         self.attempts[attempt_id] = a
         self.meta[attempt_id] = meta
         # 任务退避"逐个拉取"：新执行登记为未完成首步验证，其正确完成一步前

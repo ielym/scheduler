@@ -69,9 +69,9 @@ def _ready(job_id, task_id="t1"):
 def _write_disk_completed(home, attempt_id, job_id, seq=1, line_attempt_id=None):
     rd = home / "runtime" / "runs" / attempt_id
     rd.mkdir(parents=True, exist_ok=True)
-    ev = {"seq": seq, "kind": "completed", "at": "2026-10-12T00:00:00+08:00",
+    ev = {"seq": seq, "kind": "done", "at": "2026-10-12T00:00:00+08:00",
           "job_id": job_id, "attempt_id": line_attempt_id or attempt_id,
-          "result": {"ok": True}}
+          "record": {"ok": True}}
     with (rd / "events.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(ev) + "\n")
 
@@ -89,7 +89,7 @@ class TestDiskCompleted:
         db.create_attempt("att-1", "j-1", 1, "tok", "now")
         _write_disk_completed(home, "att-1", "j-1")
         assert svc._disk_completed("att-1") is True
-        assert db.has_event_kind("att-1", "completed")
+        assert db.has_event_kind("att-1", "done")
         # 幂等：重复核实不重复入库
         assert svc._disk_completed("att-1") is True
         with db._lock:
@@ -103,7 +103,7 @@ class TestDiskCompleted:
         db.create_attempt("att-1", "j-1", 1, "tok", "now")
         _write_disk_completed(home, "att-1", "j-1", line_attempt_id="att-OTHER")
         assert svc._disk_completed("att-1") is False
-        assert not db.has_event_kind("att-1", "completed")
+        assert not db.has_event_kind("att-1", "done")
 
     def test_recover_confirms_disk_completed_not_requeue(self, home):
         # worker 完成并落盘、调度器崩溃未入库 → 重启恢复确认成功（不重跑）
@@ -275,40 +275,6 @@ class TestInterpreterValidation:
     def test_accepts_command_name(self, home):
         _write_task(home, "demo")
         assert config.load_task("demo").producer_entry.interpreter == "python3"
-
-
-# ---------- HealthTracker semver 基线分离 ----------
-class TestSemverBaseline:
-    def test_different_semvers_are_separate_keys(self):
-        h = scaling.HealthTracker()
-        h.record_progress("t", 0.0, 1, True, "s", 1.0, 1.0, semver="1.0.0")
-        h.record_progress("t", 10.0, 5, True, "s", 1.0, 1.0, semver="2.0.0")
-        assert set(h._samples) == {("t", "s", "1.0.0"), ("t", "s", "2.0.0")}
-
-    def test_new_semver_baseline_not_polluted_by_old(self):
-        h = scaling.HealthTracker(slow_confidence_sec=5.0)
-        # 旧口径：速率下降 + 处理耗时上升的完整变慢证据链
-        t = 0.0
-        for i, (wu, act) in enumerate(zip(
-                [0.0, 40.0, 70.0, 90.0, 100.0, 105.0],
-                [1.0, 1.0, 2.0, 3.0, 4.0, 5.0])):
-            h.record_progress("t", t, i + 1, True, "s", act, 1.0,
-                              work_units=wu, semver="1.0.0")
-            t += 2.0
-        assert h._is_slow(h._samples[("t", "s", "1.0.0")]) is True
-        # 口径切换：新基线仅 1 个样本，不因旧序列被误判变慢
-        h.record_progress("t", t, 1, True, "s", 1.0, 1.0,
-                          work_units=50.0, semver="2.0.0")
-        dq_new = h._samples[("t", "s", "2.0.0")]
-        assert len(dq_new) == 1
-        assert h._is_slow(dq_new) is False
-
-    def test_stages_summary_includes_semver(self):
-        h = scaling.HealthTracker()
-        h.record_progress("t", 0.0, 1, True, "s", 1.0, 1.0, semver="1.0.0")
-        h.record_progress("t", 1.0, 1, True, "s", 1.0, 1.0, semver="2.0.0")
-        stages = h.stages_summary("t", 2.0)
-        assert {x["semver"] for x in stages} == {"1.0.0", "2.0.0"}
 
 
 # ---------- OOM 让级候选 ----------

@@ -282,16 +282,17 @@ def test_cancel_job_persists_immediately(home):
 
 # ---------- B14 暂停宽限推导 ----------
 
-def test_pause_grace_prefers_declared_max_step(home):
+def test_pause_grace_uses_feedback_interval(home):
     svc = _svc(home)
     _write_task(home, "tg")
     svc.cfg.control.pause_grace_max_sec = 300.0  # 不让封顶干扰断言
     meta = AttMeta("a1", "j1", "tg", 50, "tok")
     undeclared = svc._pause_grace_sec(meta)
-    meta.max_step_sec = 40.0
+    # 喂事件让反馈间隔 EMA = 40s → 宽限抬升为 40×4=160
+    svc.timing.note_event("tg", 0.0)
+    svc.timing.note_event("tg", 40.0)
     declared = svc._pause_grace_sec(meta)
-    # STARTED 申报的单步耗时优先：40 * 1.5 = 60
-    assert declared == pytest.approx(60.0)
+    assert declared == pytest.approx(160.0)
     assert declared >= undeclared
 
 

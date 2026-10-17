@@ -46,7 +46,6 @@ class AttemptSpec:
     entry_args: list[str]
     workdir: str
     env: dict[str, str]
-    progress_semver: str
 
 
 class AttemptRun:
@@ -429,7 +428,6 @@ def build_env(spec: AttemptSpec, input_refs: list[str]) -> dict[str, str]:
         "SCHED_CHECKPOINT_FILE": str(config.run_dir(spec.attempt_id) / "checkpoint.json"),
         "SCHED_PERMIT_FILE": str(config.run_dir(spec.attempt_id) / "permit.json"),
         "SCHED_WORKSPACE": str(spec.task_root),
-        "SCHED_PROGRESS_SEMVER": spec.progress_semver,
     })
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + existing if existing else "")
