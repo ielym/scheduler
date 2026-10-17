@@ -39,23 +39,32 @@ def load_json(path: Path, default: Any = None) -> Any:
             return default
 
 
-def save_json(path: Path, obj: Any) -> None:
-    """写临时文件 → fsync → os.replace，读者永远看不到半截文件。"""
+def atomic_write_json(path: Path, obj: Any) -> None:
+    """写临时文件 → fsync → os.replace，读者永远看不到半截文件。
+
+    不持锁：并发安全由调用方保证（save_json 持 flock；run_dir 下的控制/许可
+    文件按 attempt 独占写入，无需跨进程锁）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(path):
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_json(path: Path, obj: Any) -> None:
+    """持有 flock 的原子 JSON 写（多进程可能并发写同一文件的场景）。"""
+    with file_lock(path):
+        atomic_write_json(path, obj)
 
 
 # ---------- jsonl 尺寸轮转（防止 decisions/runs 审计日志无限增长打爆磁盘） ----------

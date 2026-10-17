@@ -11,8 +11,8 @@
   sched job list [task]         作业清单（最近 N 条）
   sched job show <job_id>       作业详情 + attempts
   sched job cancel <job_id>     显式取消（经 serve 控制通道；serve 不在时直连处理）
-  sched job requeue <job_id>    重排作业（RECOVERY_BLOCKED 等状态的解除出口；
-                                运行中/恢复核实中的作业拒绝重排）
+  sched job requeue <job_id>    人工重排作业（关闭遗留 attempt 并重新排队；
+                                运行中拒绝重排）
   sched attempt list [job]      attempt 清单
   sched attempt cancel <id>     显式取消单个 attempt
   sched version
@@ -29,12 +29,9 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timedelta, timezone
 
-from . import config, db as dbmod, runner, scheduler as schedmod, store
+from . import config, db as dbmod, ipc, runner, scheduler as schedmod, store
 from .config import JobStatus
-
-SNAPSHOT_FRESH_SEC = 10.0
 
 
 def _db():
@@ -47,69 +44,18 @@ def _print_json(obj) -> None:
 
 def _serve_alive() -> bool:
     """serve 是否持有单实例锁（flock 探测）。"""
-    import fcntl
-    import os
-    p = config.lock_file()
-    if not p.exists():
-        return False
-    try:
-        fd = os.open(str(p), os.O_RDWR)
-    except OSError:
-        return False
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return False
-        except OSError:
-            return True
-    finally:
-        os.close(fd)
+    return ipc.serve_alive()
 
 
 def _fresh_snapshot() -> dict | None:
-    """读取 serve 快照并校验新鲜度（双时钟，防重启后误报 serve=alive）。
-
-    单调时钟只在同一次开机内可比：系统重启后 monotonic 归零，旧快照的差值
-    为大负数、永不过阈值，`sched status` 会一直显示重启前的 serve=alive。
-    故同时校验墙钟 ts——serve 每 loop_tick 秒写快照，ts 超过 SNAPSHOT_FRESH_SEC
-    即为陈旧或来自上一次开机（设计第十四节：时钟跳变保守核实）。
-    """
-    snap = store.load_json(config.snapshot_file(), default=None)
-    if not isinstance(snap, dict):
-        return None
-    mono = snap.get("mono")
-    if not isinstance(mono, (int, float)):
-        return None
-    if time.monotonic() - mono > SNAPSHOT_FRESH_SEC:
-        return None
-    ts = snap.get("ts")
-    if not isinstance(ts, str):
-        return None
-    try:
-        t = datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-    if t.tzinfo is None:
-        t = t.astimezone()
-    if datetime.now(timezone.utc) - t > timedelta(seconds=SNAPSHOT_FRESH_SEC):
-        return None
-    return snap
+    """读取 serve 快照并校验新鲜度（双时钟）；陈旧/缺失返回 None。"""
+    return ipc.fresh_snapshot()
 
 
 def _send_command(kind: str, target: str, reason: str = "显式取消") -> dict | None:
     """写控制命令并等待 serve 回执；超时返回 None。"""
-    cfg = config.load_config()
-    cmd = {"id": runner.new_id("cmd"), "kind": kind, "target": target,
-           "reason": reason, "ts": runner.now_iso()}
-    store.append_jsonl(config.commands_file(), cmd)
-    deadline = time.monotonic() + cfg.control.cmd_ack_wait_sec
-    while time.monotonic() < deadline:
-        for ack in store.read_jsonl(config.commands_ack_file()):
-            if ack.get("id") == cmd["id"]:
-                return ack
-        time.sleep(0.2)
-    return None
+    return ipc.send_command(kind, target, reason,
+                            config.load_config().control.cmd_ack_wait_sec)
 
 
 def _direct_cancel_attempt(db, att: dict, reason: str) -> None:
@@ -163,7 +109,7 @@ def _cancel(kind: str, target: str, reason: str) -> int:
 
 
 def _requeue(job_id: str, reason: str) -> int:
-    """重排作业：RECOVERY_BLOCKED 等不可解状态的解除出口。
+    """重排作业：关闭遗留 attempt（进程仍在先终止）→ 作业回 QUEUED。
 
     serve 存活走命令通道；否则直连关闭遗留 attempt（进程仍在先终止）→ QUEUED。
     """
@@ -251,7 +197,7 @@ def cmd_status(args) -> int:
     if snap:
         print(f"serve=alive ts={snap.get('ts')}")
         print(f"tasks={snap['tasks']} queued={snap['queued']} "
-              f"live_attempts={snap['live_attempts']} recovering={snap.get('recovering', 0)}")
+              f"live_attempts={snap['live_attempts']}")
         print(f"exec_cpu_usec={snap['exec_cpu_usec']} exec_mem_mb={snap['exec_mem_mb']} "
               f"exec_io_bytes={snap.get('exec_io_bytes', 0)} "
               f"observability={'ok' if snap.get('observability_ok', True) else 'insufficient'} "

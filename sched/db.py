@@ -1,4 +1,4 @@
-"""SQLite 执行库：jobs / attempts / events / checkpoints / task_state。
+"""SQLite 执行库：jobs / attempts / events / task_state。
 
 单机单实例，WAL 模式 + busy_timeout。数据库与锁放本机文件系统（config.runtime_dir()）。
 所有写走统一连接 + RLock；事件按 (attempt_id, seq) 去重。
@@ -69,14 +69,6 @@ CREATE TABLE IF NOT EXISTS events (
     payload TEXT NOT NULL DEFAULT '{}',
     at TEXT NOT NULL,
     PRIMARY KEY (attempt_id, seq)
-);
-
-CREATE TABLE IF NOT EXISTS checkpoints (
-    attempt_id TEXT NOT NULL,
-    cp_seq INTEGER NOT NULL,
-    ref TEXT NOT NULL DEFAULT '',
-    at TEXT NOT NULL,
-    PRIMARY KEY (attempt_id, cp_seq)
 );
 
 CREATE TABLE IF NOT EXISTS task_state (
@@ -163,7 +155,13 @@ class DB:
         ver = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
         if ver < 1:
             self._normalize_timestamps()
-            self._conn.execute("PRAGMA user_version=1")
+            ver = 1
+        if ver < 2:
+            # 协议调整：调度器不再管理断点，checkpoints 表（历史恒空）移除
+            self._conn.execute("DROP TABLE IF EXISTS checkpoints")
+            ver = 2
+        if ver != int(self._conn.execute("PRAGMA user_version").fetchone()[0]):
+            self._conn.execute(f"PRAGMA user_version={ver}")
         # 内存计数器从库内最大值续接（重启不回退、不重扫全表）
         self._status_seq = int(self._conn.execute(
             "SELECT COALESCE(MAX(status_seq),0) FROM jobs").fetchone()[0])
@@ -338,9 +336,10 @@ class DB:
         return row is not None
 
     def status_counts(self) -> dict[str, int]:
+        """各状态作业数（已删除作业不统计，与 Web 总览口径一致）。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT status, COUNT(*) n FROM jobs GROUP BY status").fetchall()
+                "SELECT status, COUNT(*) n FROM jobs WHERE deleted=0 GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
 
     def all_task_states(self) -> list[dict]:
@@ -382,10 +381,10 @@ class DB:
 
     def min_queued_priority(self) -> int | None:
         """排队作业中的最低优先级（A2 保护门槛：报不足对象须严格高于它，
-        否则无退让空间，同优先级互相报不足会互冻结）。"""
+        否则无退让空间，同优先级互相报不足会互冻结）。已删除作业不参与。"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT MIN(priority) p FROM jobs WHERE status=?",
+                "SELECT MIN(priority) p FROM jobs WHERE status=? AND deleted=0",
                 (JobStatus.QUEUED,)).fetchone()
         v = row["p"] if row else None
         return None if v is None else int(v)
@@ -475,11 +474,7 @@ class DB:
         return [dict(r) for r in rows]
 
     def open_attempts_for_job(self, job_id: str) -> list[dict]:
-        """作业的所有非终态 attempt（含 RECOVERING/RECOVERY_BLOCKED/PAUSED/BACKOFF）。
-
-        live_attempts 只覆盖内存句柄对应的存活状态；重排（requeue）还需关闭
-        身份未知/待核实的遗留 attempt（设计第十二节）。
-        """
+        """作业的所有非终态 attempt（PAUSED/BACKOFF 等；人工重排时需关闭）。"""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM attempts WHERE job_id=? AND status NOT IN "
@@ -487,7 +482,7 @@ class DB:
                 (job_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ---------- events / checkpoints ----------
+    # ---------- events ----------
 
     def append_event(self, attempt_id: str, seq: int, kind: str,
                      payload: dict, at: str) -> bool:
@@ -498,30 +493,29 @@ class DB:
                 (attempt_id, seq, kind, json.dumps(payload, ensure_ascii=False), at))
         return cur.rowcount > 0
 
-    def record_checkpoint(self, attempt_id: str, cp_seq: int, ref: str, at: str) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO checkpoints (attempt_id, cp_seq, ref, at) VALUES (?,?,?,?)",
-                (attempt_id, cp_seq, ref, at))
-
     def list_jobs(self, task_id: str | None = None, status: str | None = None,
                   limit: int = 100) -> list[dict]:
+        """作业清单（已删除作业不列出，与 Web 口径一致）。"""
         with self._lock:
             if task_id and status:
                 rows = self._conn.execute(
-                    "SELECT * FROM jobs WHERE task_id=? AND status=? ORDER BY receive_seq DESC LIMIT ?",
+                    "SELECT * FROM jobs WHERE task_id=? AND status=? AND deleted=0 "
+                    "ORDER BY receive_seq DESC LIMIT ?",
                     (task_id, status, limit)).fetchall()
             elif task_id:
                 rows = self._conn.execute(
-                    "SELECT * FROM jobs WHERE task_id=? ORDER BY receive_seq DESC LIMIT ?",
+                    "SELECT * FROM jobs WHERE task_id=? AND deleted=0 "
+                    "ORDER BY receive_seq DESC LIMIT ?",
                     (task_id, limit)).fetchall()
             elif status:
                 rows = self._conn.execute(
-                    "SELECT * FROM jobs WHERE status=? ORDER BY receive_seq DESC LIMIT ?",
+                    "SELECT * FROM jobs WHERE status=? AND deleted=0 "
+                    "ORDER BY receive_seq DESC LIMIT ?",
                     (status, limit)).fetchall()
             else:
                 rows = self._conn.execute(
-                    "SELECT * FROM jobs ORDER BY receive_seq DESC LIMIT ?", (limit,)).fetchall()
+                    "SELECT * FROM jobs WHERE deleted=0 "
+                    "ORDER BY receive_seq DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
     def list_attempts(self, job_id: str | None = None, limit: int = 100) -> list[dict]:
@@ -540,7 +534,7 @@ class DB:
     def stale_terminal_attempts(self, before_iso: str, limit: int = 100) -> list[str]:
         """取「已完成作业（SUCCEEDED/CANCELLED）且作业结束时间早于阈值」的 attempt_id。
 
-        FAILED 作业的 attempt 工件保留——执行诊断需要 events/checkpoints 证据；
+        FAILED 作业的 attempt 工件保留——执行诊断需要 events 证据；
         仅清理已确认完结的作业（设计第十三节：清理已确认完成的执行记录）。
         """
         with self._lock:
@@ -554,13 +548,11 @@ class DB:
         return [r["attempt_id"] for r in rows]
 
     def delete_attempt_artifacts(self, attempt_id: str) -> None:
-        """同一事务内删除指定 attempt 的 events / checkpoints / attempts 行。"""
+        """同一事务内删除指定 attempt 的 events / attempts 行。"""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute("DELETE FROM events WHERE attempt_id=?",
-                                   (attempt_id,))
-                self._conn.execute("DELETE FROM checkpoints WHERE attempt_id=?",
                                    (attempt_id,))
                 self._conn.execute("DELETE FROM attempts WHERE attempt_id=?",
                                    (attempt_id,))
@@ -590,3 +582,35 @@ class DB:
                 self._conn.execute(
                     f"INSERT INTO task_state ({cols}) VALUES ({marks})",
                     list(base.values()))
+
+    # ---------- 重启冷启动（无恢复语义） ----------
+
+    def reset_task_states(self) -> None:
+        """清空动态目标/模式学习态（重启冷启动：run_target 归零重新探索）。"""
+        with self._lock:
+            self._conn.execute("DELETE FROM task_state")
+
+    def non_terminal_attempts(self) -> list[dict]:
+        """全部未终结 attempt（重启时统一终止并清除的记录集合）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM attempts WHERE status NOT IN (?,?,?)",
+                tuple(sorted(JobStatus.TERMINAL))).fetchall()
+        return [dict(r) for r in rows]
+
+    def requeue_unfinished_jobs(self, now: str) -> int:
+        """重启冷启动：全部未完结作业（非终态）回 QUEUED，清退避/冷却/原因。
+
+        语义：重启/启动一律"重新开始"——不核实完成、不接管、不重放断点；
+        已完成（SUCCEEDED）/失败（FAILED）/取消（CANCELLED）保持终态不重排。
+        返回被重排的作业数。
+        """
+        seq = self._next_status_seq()
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE jobs SET status=?, reason=?, retry_count=0, next_retry_at='',
+                                   started_at='', finished_at='', status_seq=?
+                   WHERE deleted=0 AND status NOT IN (?,?,?)""",
+                (JobStatus.QUEUED, "重启重排：按策略重新开始",
+                 seq, *sorted(JobStatus.TERMINAL)))
+        return cur.rowcount if isinstance(cur.rowcount, int) and cur.rowcount > 0 else 0

@@ -91,7 +91,8 @@ SCHED_HOME/
     ├── commands.jsonl               # CLI → serve 控制命令通道
     ├── commands_ack.jsonl           # serve 对控制命令的回执
     ├── archive/  isolation/         # 归档 / 异常隔离
-    ├── runs/<attempt_id>/           # events.jsonl / control.json / checkpoint.json
+    ├── runs/<attempt_id>/           # events.jsonl / control.json / permit.json / worker.log
+    │                               # （checkpoint.json 由任务自行按需写入，调度器不管理）
     ├── logs/<task_id>/              # 生产者日志
     └── status.jsonl                 # 状态日志
 ```
@@ -118,6 +119,7 @@ sched attempt cancel <id> [--reason r]  # 显式取消单个 attempt
 | 退出码 | 含义 | 调度器动作 |
 | --- | --- | --- |
 | 0 | 成功（已发 done 事件） | SUCCEEDED |
+| 0 | 未提交完成记录 | 作业回 QUEUED 重跑（attempt 记 FAILED） |
 | 75 | 资源不足 | BACKOFF 到期探测 |
 | 其他非 0 | 业务/未知失败 | FAILED |
 
@@ -131,7 +133,9 @@ sched attempt cancel <id> [--reason r]  # 显式取消单个 attempt
 - **动态运行目标**：无写死上限；冷启动 1、观察后逐步 +1；不足/退化先撤销近期增加。
 - **高优保护 + 累计退让**：高优受阻逐步让低优退让，有界、有截止、可恢复。
 - **变慢检测**：按任务基线识别无报错变慢（温和退让）。
-- **状态机**：QUEUED → STARTING → RUNNING → PAUSING → PAUSED / BACKOFF / SUCCEEDED / FAILED / RECOVERING / CANCELLED。
+- **状态机**：QUEUED → STARTING → RUNNING → PAUSING → PAUSED / BACKOFF / SUCCEEDED / FAILED / CANCELLED。
+- **启动/重启**：一律冷启动重排（不接管、不核实完成、不重放断点）——终止上一实例遗留执行进程 → 删除未终结 attempt 与工件 → 全部未完结作业回 QUEUED → 调度学习态归零。生产者跨重启保留（由新实例经任务级 flock 接管）。
+- **断点**：调度器不感知/不管理；断点纯属任务自身实践（`sched_task_sdk` 仅提供本地原子读写设施，落在本次 attempt 的 run_dir）。
 
 ## 开发
 

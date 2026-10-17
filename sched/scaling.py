@@ -278,6 +278,10 @@ class TaskBackoff:
     - 探测（EMPTY）：距上次资源错误按 probe_base × 2^level 间隔放一个
       执行；成功一步 → NORMAL（level 清零）；失败 → level+1，间隔翻倍。
 
+    方案 A′（点 3 修正）：NORMAL 的恢复不是"一步即恢复"，而是**连续 N 步
+    且期间无新 75**（restore_steps）——一次进展不足以证明资源已稳定，需
+    连续证据；资源错误结束会清零连续步计数（不把"撞资源前的旧步"算进来）。
+
     全局不做任何跨任务协调（不知道是否共用资源，各自独立退避）。
     """
 
@@ -285,13 +289,16 @@ class TaskBackoff:
     VERIFY = "verify"    # 已步降，等剩余在途执行完成一步验证
     EMPTY = "empty"      # 任务全部退避（无在途执行）：按递增间隔探测
 
-    def __init__(self, probe_base_sec: float = 30.0, probe_cap_sec: float = 600.0):
+    def __init__(self, probe_base_sec: float = 30.0, probe_cap_sec: float = 600.0,
+                 restore_steps: int = 2):
         self.probe_base_sec = float(probe_base_sec)
         self.probe_cap_sec = float(probe_cap_sec)
+        self.restore_steps = max(1, int(restore_steps))
         self._state: dict[str, str] = {}
         self._last_shortage: dict[str, float] = {}
         self._level: dict[str, int] = {}     # EMPTY 探测级别（间隔递增）
         self._unverified: dict[str, str] = {}  # task -> 未完成首步的在途执行
+        self._steps: dict[str, int] = {}     # task -> 退避期中累计的连续验证步数
 
     # ---- 状态查询 ----
     def state_of(self, task_id: str) -> str:
@@ -312,6 +319,9 @@ class TaskBackoff:
     def set_state(self, task_id: str, state: str, now_mono: float = 0.0) -> None:
         prev = self.state_of(task_id)
         self._state[task_id] = state
+        if state != self.NORMAL:
+            # 资源问题证据：连续验证步清零（恢复 NORMAL 需其后重新累计 N 步）
+            self._steps.pop(task_id, None)
         if state == self.EMPTY:
             self._last_shortage[task_id] = now_mono
             if prev != self.EMPTY:
@@ -328,21 +338,39 @@ class TaskBackoff:
         """新执行拉起（新作业或放回续跑）：登记"未完成首步"。"""
         self._unverified[task_id] = attempt_id
 
-    def clear_attempt(self, task_id: str, attempt_id: str) -> None:
-        """执行结束（任意结局）：若是该任务的未验证执行则解除占位。"""
+    def clear_attempt(self, task_id: str, attempt_id: str,
+                      resource_error: bool = False) -> None:
+        """执行结束：若是该任务的未验证执行则解除占位。
+
+        占位执行已死、无法再上报步骤，故必须解除（否则任务永久封锁）。
+        资源错误结束（resource_error=True）不在此恢复节奏——其节奏由状态机
+        承担：`_task_backoff_step_down` 已把任务置 VERIFY/EMPTY，回到 NORMAL
+        只能靠 `note_progress` **连续 N 步且期间无新 75**。这里额外清零连续步
+        计数，防止"撞资源前完成的步"被计入恢复证据。
+        """
         if self._unverified.get(task_id) == attempt_id:
             del self._unverified[task_id]
+        if resource_error:
+            self._steps.pop(task_id, None)
 
     def note_progress(self, task_id: str, attempt_id: str, now_mono: float) -> None:
         """一次正确执行的步骤（progress/checkpoint/成功）：
         ① 该执行通过首步验证（解除"未完成首步"占位，允许放下一个）；
-        ② 任务处于 VERIFY/EMPTY → 资源对该任务恢复 → NORMAL，级别清零。
+        ② 任务处于 VERIFY/EMPTY → 累计连续验证步；达到 N 步（期间无新 75）
+        才恢复 NORMAL，级别清零。一步不足以证明资源已稳定（方案 A′）。
         """
         if self._unverified.get(task_id) == attempt_id:
             del self._unverified[task_id]
-        if self.state_of(task_id) != self.NORMAL:
+        if self.state_of(task_id) == self.NORMAL:
+            self._steps.pop(task_id, None)
+            return
+        n = self._steps.get(task_id, 0) + 1
+        if n >= self.restore_steps:
             self._state[task_id] = self.NORMAL
             self._level.pop(task_id, None)
+            self._steps.pop(task_id, None)
+        else:
+            self._steps[task_id] = n
 
     def admission_allowed(self, task_id: str, now_mono: float) -> tuple[bool, str]:
         """该任务此刻是否允许再放一个新执行（逐个拉取纪律）。
@@ -448,10 +476,14 @@ class Scaling:
 
     def may_grow(self, task_id: str, now_mono: float, live_count: int,
                  has_progress: bool, healthy_resource: bool,
-                 observe_factor: float = 1.0) -> bool:
-        """是否允许 +1：完成启动观察、有真实进展、无持续不足、资源可解释、已达到当前目标。
+                 observe_factor: float = 1.0,
+                 evidence_since_grow: bool = False) -> bool:
+        """是否允许 +1：有真实进展、无持续不足、资源可解释、已达到当前目标。
 
-        observe_factor：观测不足时由调度器传入放大倍数（>1 拉长观察期，减速探索）。
+        观察期改为**证据驱动**（方案 A′）：自上次扩容以来已有新进展样本
+        （evidence_since_grow）即视为观察完成，不必再等墙钟；`grow_observe_sec`
+        仅作**安全上限兜底**——长期无进展样本时按该秒数放行，防探索永久停摆。
+        observe_factor：观测不足时由调度器传入放大倍数（>1 拉长兜底观察期）。
         """
         ts = self.get(task_id)
         if ts.mode != "steady" or ts.shortage_streak > 0:
@@ -460,10 +492,10 @@ class Scaling:
             return False
         if ts.run_target <= 0:
             return False
-        # 平缓探索：观察期 + 一次只 +1
-        effective_observe = ts.grow_observe_sec * max(1.0, observe_factor)
-        if now_mono - ts.last_grow_mono < effective_observe:
-            return False
+        if not evidence_since_grow:
+            cap = ts.grow_observe_sec * max(1.0, observe_factor)
+            if now_mono - ts.last_grow_mono < cap:
+                return False
         return live_count >= ts.run_target
 
     def apply_grow(self, task_id: str, now_mono: float) -> None:

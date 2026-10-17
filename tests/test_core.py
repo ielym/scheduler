@@ -167,11 +167,13 @@ def test_task_backoff_state_machine():
     # 正确一步 → 解除占位，恢复放行
     tb.note_progress("t", "att-1", 2.0)
     assert tb.admission_allowed("t", 3.0) == (True, "")
-    # VERIFY（步降后等剩余执行验证）：阻止新准入；正确一步 → NORMAL
+    # VERIFY（步降后等剩余执行验证）：阻止新准入；需连续 N 步（默认 2）且无新 75
     tb.set_state("t", tb.VERIFY)
     ok, why = tb.admission_allowed("t", 4.0)
     assert not ok and why == "verify"
     tb.note_progress("t", "att-1", 5.0)
+    assert tb.state_of("t") == tb.VERIFY        # 一步不足以恢复（方案 A′）
+    tb.note_progress("t", "att-1", 5.5)
     assert tb.state_of("t") == tb.NORMAL
     assert tb.admission_allowed("t", 6.0) == (True, "")
     # EMPTY（全退避）：探测间隔内阻止，到期放行；探测失败级别递增
@@ -188,8 +190,10 @@ def test_task_backoff_state_machine():
     assert not ok
     ok, _ = tb.admission_allowed("t", 192.0)  # 100+60+1 边界后放行
     assert ok
-    # 探测执行成功一步 → NORMAL，级别清零
+    # 探测执行连续 N 步 → NORMAL，级别清零（方案 A′：连续步才恢复）
     tb.note_progress("t", "att-3", 193.0)
+    assert tb.state_of("t") == tb.EMPTY
+    tb.note_progress("t", "att-3", 193.5)
     assert tb.state_of("t") == tb.NORMAL
     assert tb.probe_level_of("t") == 0
     # 任务间完全独立：t 的退避不影响 u

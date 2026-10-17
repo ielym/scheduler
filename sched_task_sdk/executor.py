@@ -280,10 +280,6 @@ class ExecutorTask:
         print(msg, flush=True)
 
 
-def _env(k: str, default: str) -> str:
-    return os.environ.get(k) or default
-
-
 def run_task(task: ExecutorTask) -> int:
     if not os.environ.get("SCHED_ATTEMPT_ID") and not os.environ.get("SCHED_DEV"):
         print("缺少 SCHED_ATTEMPT_ID（仅允许调度器触发正式执行）", file=sys.stderr, flush=True)

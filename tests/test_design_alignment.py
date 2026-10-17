@@ -1,7 +1,8 @@
 """设计方案对齐修复的专项回归（对应审计报告修复 1-11）。
 
 每项修复与设计条款的对应：
-1. 启动间隔稳定证据下平缓缩短 + 令牌制（设计第九节 L155）；
+1. 启动节奏改为反馈轴限速（方案 A′）：并发预算 + 采样周期硬下界，
+   取代"健康时长阶梯 + 令牌制"；
 2. 内存快速增长触发低优先级退让（设计第八节 L137）；
 3. outbox 分目录接收/归档/隔离（设计第二、五节）；
 4. 重启后保护退让节流恢复（设计第十节 L179）；
@@ -117,96 +118,143 @@ class _FakeMemAttempt:
         self.cgrp = _FakeMemCgroup(mem_mb)
 
 
-# ---------- 修复 1：启动间隔阶梯缩短 + 令牌制 ----------
+# ---------- 方案 A′：反馈轴限速（并发预算 + 采样周期下界，取代令牌制） ----------
 
-class TestStartIntervalLadder:
-    def test_ladder_shortens_with_stable_health(self, home):
-        svc = _svc(home)
-        base = svc.cfg.control.start_interval_sec
-        # 时间用正数基准：_healthy_since_mono<=0 视为未锚定，now=0 会反复重新锚定
-        assert svc._effective_start_interval(1000.0) == base  # 冷启动锚定
-        assert svc._effective_start_interval(1059.0) == base  # 未满 60s
-        assert svc._effective_start_interval(1061.0) == pytest.approx(base * 0.5)
-        assert svc._effective_start_interval(1181.0) == pytest.approx(base * 0.25)
-        assert svc._effective_start_interval(1301.0) == pytest.approx(
-            max(0.125, base * 0.125))
+class _FakeLaunch:
+    pid = 1
+    pgid = 1
+    start_time = 1.0
 
-    def test_unhealthy_or_shortage_resets_to_base(self, home):
-        svc = _svc(home)
-        base = svc.cfg.control.start_interval_sec
-        svc._effective_start_interval(1000.0)
-        assert svc._effective_start_interval(1301.0) < base  # 已缩短
+
+def _prep_admit(home, monkeypatch, tasks=("ta", "tb"), jobs=4):
+    svc = _svc(home)
+    for tid in tasks:
+        _write_task(home, tid)
+    svc.refresh_specs()
+    for tid in tasks:
+        svc.scaling.get(tid).run_target = 10
+        svc.scaling.get(tid).mode = "steady"
+        for i in range(jobs):
+            svc.db.upsert_job(_ready(f"j{tid}-{i}", tid), f"h{tid}{i}", "now", 50)
+    monkeypatch.setattr(runner, "launch", lambda aspec, refs: _FakeLaunch())
+    return svc
+
+
+class TestAdmitPacingFeedbackAxis:
+    def test_cold_start_budget_one_then_additive_growth(self, home, monkeypatch):
+        """冷启动预算=1：只放 1 个新启动；完成一步（最高置信证据）释放预算位，
+        下一轮加法 +1（一次只 +1），不靠压缩启动间隔提速。"""
+        svc = _prep_admit(home, monkeypatch, tasks=("ta",), jobs=8)
+        t0 = 1000.0
+        assert svc._admit_budget == 1
+        svc._tick_admit(t0)
+        assert len(svc.attempts) == 1 and svc._pending_count() == 1
+        # 该新执行完成一步 → 解除任务逐个拉取占位 + 释放全局预算位
+        aid = next(iter(svc.meta))
+        svc.tbackoff.note_progress("ta", aid, t0 + 0.1)
+        svc._release_pending_verified(aid)
+        assert svc._pending_count() == 0
+        svc._tick_admit(t0 + 2.0)
+        assert svc._admit_budget == 2          # 加法增长（A）
+        assert len(svc.attempts) == 2
+
+    def test_sample_interval_hard_lower_bound(self, home, monkeypatch):
+        """硬时间下界：两次启动间隔 ≥ 采样周期（观测能力下界，不可压到采样以下）。"""
+        svc = _prep_admit(home, monkeypatch, tasks=("ta", "tb"))
+        svc._admit_budget = 5                  # 预算充足，隔离预算门
+        t0 = 1000.0
+        svc._tick_admit(t0)
+        assert len(svc.attempts) == 1
+        svc._tick_admit(t0 + 0.5)              # 采样周期内：不再启动
+        assert len(svc.attempts) == 1
+        svc._tick_admit(t0 + 2.0)              # 越过一个采样周期：放行
+        assert len(svc.attempts) == 2
+
+    def test_unhealthy_stops_admission(self, home, monkeypatch):
+        svc = _prep_admit(home, monkeypatch, tasks=("ta",))
         svc.trend.mark_oom()
-        assert svc._effective_start_interval(1302.0) == base  # 不健康立即回弹
-        assert svc._healthy_since_mono == 0.0
-        # 观测不足同样回弹（设计第八节：观测不足减慢探索）
-        svc._observability_ok = False
-        svc._effective_start_interval(1303.0)
-        svc._observability_ok = True
-        svc._effective_start_interval(1304.0)
-        svc._on_explicit_shortage(AttMeta("a", "j", "t", 50, "tok"))
-        assert svc._healthy_since_mono == 0.0
+        svc._tick_admit(1000.0)
+        assert not svc.attempts                  # 主闸：资源不健康停新增
 
-    def test_token_admission_multiple_starts_per_tick(self, home, monkeypatch):
-        """令牌制（跨任务并行）+ 每任务逐个拉取（TaskBackoff）：
-        份额充足时多个任务可同轮各启动一个；同一任务在首步验证
-        （progress/checkpoint/成功）完成前不放下一个。"""
+    def test_budget_multiplicative_shrink_and_recover(self, home):
+        """乘法收缩（M）：资源越线 → max(1, BUDGET//2)；不健康期只缩一次。"""
         svc = _svc(home)
-        _write_task(home, "ta")
-        _write_task(home, "tb")
-        svc.refresh_specs()
-        for tid in ("ta", "tb"):
-            svc.scaling.get(tid).run_target = 10
-            svc.scaling.get(tid).mode = "steady"
-        for i in range(4):
-            svc.db.upsert_job(_ready(f"ja-{i}", "ta"), f"ha{i}", "now", 50)
-            svc.db.upsert_job(_ready(f"jb-{i}", "tb"), f"hb{i}", "now", 50)
+        svc._admit_budget = 8
+        svc.trend.mark_oom()
+        svc._update_admit_budget(1000.0)
+        assert svc._admit_budget == 4
+        svc._update_admit_budget(1001.0)        # episode 去重：不连缩
+        assert svc._admit_budget == 4
+        for _ in range(4):
+            svc.trend.sample(0.1, 0.1, True)    # 连续低占用 → 恢复健康
+        assert svc.trend.healthy_enough()
+        svc._update_admit_budget(1002.0)
+        svc.trend.mark_oom()
+        svc._update_admit_budget(1003.0)
+        assert svc._admit_budget == 2
 
-        class _Launch:
-            pid = 1
-            pgid = 1
-            start_time = 1.0
-
-        monkeypatch.setattr(runner, "launch", lambda aspec, refs: _Launch())
-        t0 = 1000.0
-        # 持续健康 400s → 有效间隔 0.125s；上一节拍距今 1s → 份额 1.0
-        svc._healthy_since_mono = t0 - 400.0
-        svc._last_admit_tick_mono = t0 - 1.0
-        svc._admit_tokens = 0.0
-        svc._tick_admit(t0)
-        # 逐个拉取：每任务只拉 1 个（首步验证占位），跨任务并行不受影响
-        launched = {m.task_id for m in svc.meta.values()}
-        assert launched == {"ta", "tb"} and len(svc.attempts) == 2
-        # 同任务第二个作业：首步完成前被阻止（step_pending）
-        assert svc.tbackoff.admission_allowed("ta", t0 + 0.1) == (False, "step_pending")
-        # 首步正确完成 → 占位解除，下一轮允许再拉一个
-        aid_ta = next(a for a, m in svc.meta.items() if m.task_id == "ta")
-        svc.tbackoff.note_progress("ta", aid_ta, t0 + 0.1)
-        svc._admit_tokens = 1.0  # 份额充足，隔离令牌因素
-        svc._tick_admit(t0 + 0.2)
-        assert sum(1 for m in svc.meta.values() if m.task_id == "ta") == 2
-        # tb 未验证：仍只有 1 个
-        assert sum(1 for m in svc.meta.values() if m.task_id == "tb") == 1
-
-    def test_token_admission_single_start_at_base(self, home, monkeypatch):
+    def test_pending_secondary_evidence_releases_budget(self, home):
+        """次级验证：存活 ≥1 采样周期 + 资源连续不增长 + 本任务无近期 75
+        → 释放预算位，长单步任务不必久等首步。"""
         svc = _svc(home)
-        _write_task(home, "t")
-        svc.refresh_specs()
-        svc.scaling.get("t").run_target = 10
-        for i in range(8):
-            svc.db.upsert_job(_ready(f"j-{i}", "t"), f"h{i}", "now", 50)
+        meta = AttMeta("a1", "j1", "t", 50, "tok")
+        meta.status = JobStatus.RUNNING
+        meta.started_mono = 100.0
+        svc.meta["a1"] = meta
+        svc._pending_new["a1"] = {"task_id": "t", "started_mono": 100.0}
+        svc._mem_hist.extend([20.0, 20.0, 20.0])   # 连续不增长
+        svc._release_verified_pending(104.0)       # 存活 4s ≥ 采样周期 2s
+        assert "a1" not in svc._pending_new
+        assert svc._verified_since_grow == 1
 
-        class _Launch:
-            pid = 1
-            pgid = 1
-            start_time = 1.0
+    def test_pending_secondary_blocked_by_recent_shortage(self, home):
+        svc = _svc(home)
+        meta = AttMeta("a1", "j1", "t", 50, "tok")
+        meta.status = JobStatus.RUNNING
+        meta.started_mono = 100.0
+        svc.meta["a1"] = meta
+        svc._pending_new["a1"] = {"task_id": "t", "started_mono": 100.0}
+        svc._mem_hist.extend([20.0, 20.0, 20.0])
+        svc._last_shortage_mono["t"] = 102.0       # 近期新 75
+        svc._release_verified_pending(104.0)       # 一个观察窗口内 → 不释放
+        assert "a1" in svc._pending_new
 
-        monkeypatch.setattr(runner, "launch", lambda aspec, refs: _Launch())
-        t0 = 1000.0
-        svc._last_admit_tick_mono = t0 - 1.0  # 首次评估：冷启动一个份额
-        svc._admit_tokens = 0.0
-        svc._tick_admit(t0)
-        assert len(svc.attempts) == 1  # 间隔=配置值：仍然每间隔只启动一个
+
+class TestTaskBackoffRestore:
+    def test_restore_needs_consecutive_steps(self):
+        tb = scaling.TaskBackoff(probe_base_sec=5.0, probe_cap_sec=10.0,
+                                 restore_steps=2)
+        tb.set_state("t", tb.VERIFY)
+        tb.note_progress("t", "a1", 1.0)
+        assert tb.state_of("t") == tb.VERIFY     # 一步不足以恢复
+        tb.note_progress("t", "a1", 2.0)
+        assert tb.state_of("t") == tb.NORMAL     # 连续两步 → 恢复
+
+    def test_resource_error_resets_step_streak(self):
+        tb = scaling.TaskBackoff(probe_base_sec=5.0, probe_cap_sec=10.0,
+                                 restore_steps=2)
+        tb.set_state("t", tb.VERIFY)
+        tb.note_progress("t", "a1", 1.0)          # 第 1 步
+        tb.clear_attempt("t", "a1", resource_error=True)  # 又报 75：连续步清零
+        tb.note_progress("t", "a2", 2.0)          # 重新只算第 1 步
+        assert tb.state_of("t") == tb.VERIFY
+
+    def test_may_grow_observe_is_evidence_driven(self):
+        class Cfg:
+            class control:
+                grow_observe_sec = 30.0
+        s = scaling.Scaling(Cfg())
+        s.get("t").run_target = 2
+        s.grew_at("t", 10.0)                      # mode=steady, last_grow=10
+        # 观察期内：无新证据 → 不放行
+        assert not s.may_grow("t", 15.0, live_count=2, has_progress=True,
+                              healthy_resource=True)
+        # 观察期内：有新进展证据 → 证据驱动放行（不等墙钟）
+        assert s.may_grow("t", 15.0, live_count=2, has_progress=True,
+                          healthy_resource=True, evidence_since_grow=True)
+        # 越过安全上限秒兜底 → 无证据也放行（防探索停摆）
+        assert s.may_grow("t", 45.0, live_count=2, has_progress=True,
+                          healthy_resource=True)
 
 
 # ---------- 修复 2：内存快速增长触发低优先级退让 ----------
@@ -324,52 +372,25 @@ class TestOutboxSubdirectories:
 
 # ---------- 修复 4：重启后保护退让节流恢复 ----------
 
-class TestRestartThrottledResume:
-    def test_recover_injects_yield_paused_into_pending_resume(self, home):
-        svc = _svc(home)
-        now = "2026-10-12T00:00:00+00:00"
-        svc.db.upsert_job(_ready("j-y1", "lo"), "h1", now, 10)
-        svc.db.upsert_job(_ready("j-y2", "lo"), "h2", now, 10)
-        svc.db.upsert_job(_ready("j-y3", "lo2", priority=20), "h3", now, 20)
-        svc.db.upsert_job(_ready("j-hb", "t"), "h4", now, 50)
-        for jid in ("j-y1", "j-y2", "j-y3"):
-            svc.db.set_job_status(jid, JobStatus.PAUSED,
-                                  "高优先级保护退让（hi）；统一外部不足退出", now)
-            svc.db.create_attempt(f"att-{jid}", jid, 1, "tok", now)
-            svc.db.update_attempt(f"att-{jid}", status=JobStatus.PAUSED,
-                                  finished_at=now)
-        svc.db.set_job_status("j-hb", JobStatus.PAUSED, "心跳超时，疑似卡死", now)
-        svc._recover()
-        st = svc.protect.st
-        # 退让任务按任务分组注入逐步放回队列；心跳超时作业不注入
-        assert set(st.pending_resume) == {"lo", "lo2"}
-        assert st.protected_task == ""  # 保护轮不重建（重启即视为本轮结束）
-        assert st.pending_resume["lo2"] == 20
-        # 节流：首个放回也要等一个 recovery_probe_sec
-        assert st.next_release_mono > time.monotonic()
-
-    def test_released_one_task_per_probe_interval(self, home):
+class TestRestartColdStart:
+    def test_restart_requeues_all_unfinished_and_no_protect_restore(self, home):
+        # 重启冷启动：不重建保护轮、不注入逐步放回；全部未完结作业一律回 QUEUED
         svc = _svc(home)
         now = "2026-10-12T00:00:00+00:00"
         svc.db.upsert_job(_ready("j-y1", "lo"), "h1", now, 10)
         svc.db.upsert_job(_ready("j-y2", "lo2", priority=20), "h2", now, 20)
-        for jid, tid in (("j-y1", "lo"), ("j-y2", "lo2")):
+        svc.db.upsert_job(_ready("j-hb", "t"), "h4", now, 50)
+        for jid in ("j-y1", "j-y2"):
             svc.db.set_job_status(jid, JobStatus.PAUSED,
-                                  "撤销放回：hi 再次受阻，等待重新逐步放回", now)
+                                  "高优先级保护退让（hi）；统一外部不足退出", now)
             svc.db.create_attempt(f"att-{jid}", jid, 1, "tok", now)
-            svc.db.update_attempt(f"att-{jid}", status=JobStatus.PAUSED,
-                                  finished_at=now)
-        svc._recover()
+        svc.db.set_job_status("j-hb", JobStatus.PAUSED, "心跳超时，疑似卡死", now)
+        svc._reinitialize()
         st = svc.protect.st
-        # 未到 next_release：不放回（重启不一次性倾泻）
-        svc._tick_release(st.next_release_mono - 1.0)
-        assert svc.db.get_job("j-y1")["status"] == JobStatus.PAUSED
-        assert svc.db.get_job("j-y2")["status"] == JobStatus.PAUSED
-        # 到点后每次只放回一个任务（优先级高者先）
-        svc._tick_release(st.next_release_mono + 0.1)
-        statuses = {svc.db.get_job(j)["status"] for j in ("j-y1", "j-y2")}
-        assert statuses == {JobStatus.QUEUED, JobStatus.PAUSED}
-        assert svc.db.get_job("j-y2")["status"] == JobStatus.QUEUED  # pri 20 先放
+        assert st.pending_resume == {}
+        assert st.protected_task == ""
+        for jid in ("j-y1", "j-y2", "j-hb"):
+            assert svc.db.get_job(jid)["status"] == JobStatus.QUEUED
 
 
 # ---------- 修复 5：生产者守护每轮独立维护 ----------

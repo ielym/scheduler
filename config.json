@@ -8,7 +8,6 @@
     "producer_restart_base_sec": 1.0,
     "producer_restart_cap_sec": 30.0,
     "producer_crash_reset_after_sec": 300.0,
-    "start_interval_sec": 1.0,
     "grow_observe_sec": 30.0,
     "pause_grace_base_sec": 10.0,
     "pause_grace_max_sec": 60.0,

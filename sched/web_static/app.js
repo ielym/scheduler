@@ -107,15 +107,15 @@ const fmt = {
 };
 
 const STATUS_LIST = ["QUEUED", "STARTING", "RUNNING", "PAUSING", "PAUSED", "BACKOFF",
-  "SUCCEEDED", "FAILED", "RECOVERING", "RECOVERY_BLOCKED", "CANCELLED"];
+  "SUCCEEDED", "FAILED", "CANCELLED"];
 const STATUS_CN = {
   QUEUED: "排队", STARTING: "启动中", RUNNING: "运行中", PAUSING: "暂停中",
   PAUSED: "已暂停", BACKOFF: "退避等待", SUCCEEDED: "已成功", FAILED: "已失败",
-  RECOVERING: "恢复核实", RECOVERY_BLOCKED: "恢复受阻", CANCELLED: "已取消",
+  CANCELLED: "已取消",
   RUNNING_ACTIVE: "运行中", WAITING: "等待中", FINISHED: "已完成", ATTENTION: "需处理",
 };
-/* 运维四分法：等待细分（排队/退避/暂停/恢复核实）全部自动恢复归"等待中"；
-   RECOVERY_BLOCKED 不自愈，与 FAILED 同归"需处理"（唯一需要人工的类别） */
+/* 运维四分法：等待细分（排队/退避/暂停）全部自动恢复归"等待中"；
+   FAILED 不自愈，归"需处理"（唯一需要人工的类别） */
 const STATUS_GROUPS = {
   RUNNING_ACTIVE: { cls: "st-RUNNING" },
   WAITING: { cls: "st-QUEUED" },
@@ -124,9 +124,9 @@ const STATUS_GROUPS = {
 };
 const GROUP_STATES = {
   RUNNING_ACTIVE: ["STARTING", "RUNNING", "PAUSING"],
-  WAITING: ["QUEUED", "BACKOFF", "PAUSED", "RECOVERING"],
+  WAITING: ["QUEUED", "BACKOFF", "PAUSED"],
   FINISHED: ["SUCCEEDED", "CANCELLED"],
-  ATTENTION: ["FAILED", "RECOVERY_BLOCKED"],
+  ATTENTION: ["FAILED"],
 };
 const groupOf = st => Object.keys(GROUP_STATES).find(g => GROUP_STATES[g].includes(st));
 const TERMINAL = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
@@ -136,7 +136,6 @@ const STATUS_COLOR = {
   QUEUED: "var(--c-queued)", STARTING: "var(--c-starting)", RUNNING: "var(--c-running)",
   PAUSING: "var(--c-pausing)", PAUSED: "var(--c-paused)", BACKOFF: "var(--c-backoff)",
   SUCCEEDED: "var(--c-succeeded)", FAILED: "var(--c-failed)",
-  RECOVERING: "var(--c-recovering)", RECOVERY_BLOCKED: "var(--c-recovery-blocked)",
   CANCELLED: "var(--c-cancelled)",
 };
 const badge = st => `<span class="badge s-${esc(st)}"><span class="bdot"></span>${esc(STATUS_CN[st] || st)}</span>`;
@@ -146,8 +145,8 @@ const groupBadge = st => {
   const g = groupOf(st) || st;
   return `<span class="badge ${GROUP_BADGE_CLS[g] || ""}" title="调度状态：${esc(STATUS_CN[st] || st)}"><span class="bdot"></span>${esc(STATUS_CN[g] || g)}</span>`;
 };
-/* 尝试已终结（有完整起止）的状态：终态 + 恢复受阻 */
-const ATTEMPT_ENDED = st => TERMINAL.has(st) || st === "RECOVERY_BLOCKED";
+/* 尝试已终结（有完整起止）的状态：仅终态 */
+const ATTEMPT_ENDED = st => TERMINAL.has(st);
 /* 时间列口径：运行中=本次开始；等待中=无（下次尝试未定，历史见执行尝试）；已终结=开始+结束 */
 const jobTimes = j => {
   if (LIVE.has(j.status)) return j.started_at ? fmt.dateTime(j.started_at) : "—";
@@ -161,8 +160,7 @@ const EVENT_CN = {
 };
 const EV_KIND_CN = {
   attempt_launched: "启动执行", attempt_finalized: "执行结束",
-  checkpoint_restored: "检查点恢复", recover_requeued: "重启回收重排",
-  recover_confirmed: "恢复确认成功", producer_crash: "生产者崩溃",
+  producer_crash: "生产者崩溃", startup_requeued: "启动重排",
   pause_requested: "请求暂停", pause_grace_exceeded: "暂停宽限超时",
   protect_released: "保护解除", protect_ended: "保护轮结束",
   job_requeued: "作业重排", job_cancelled: "作业取消",
@@ -571,10 +569,10 @@ const Overview = {
     const snap = o.snapshot;
     const c = o.job_counts || {};
     const grp = {
-      waiting: (c.QUEUED || 0) + (c.BACKOFF || 0) + (c.PAUSED || 0) + (c.RECOVERING || 0),
+      waiting: (c.QUEUED || 0) + (c.BACKOFF || 0) + (c.PAUSED || 0),
       finished: (c.SUCCEEDED || 0) + (c.CANCELLED || 0),
       running: (c.STARTING || 0) + (c.RUNNING || 0) + (c.PAUSING || 0),
-      attention: (c.FAILED || 0) + (c.RECOVERY_BLOCKED || 0),
+      attention: (c.FAILED || 0),
     };
     const producers = snap ? snap.producers : [];
     const alive = producers.filter(p => p.alive).length;
@@ -698,8 +696,6 @@ const Tasks = {
     if (!tb) return;
     tb.innerHTML = tasks.map(t => {
       const m = t.monitor || {}, sc = t.scale || {}, p = m.producer || {};
-      const h = (m.health || [])[0];
-      const slow = (m.health || []).some(x => x.slow);
       const crashTitle = p.crash_count ? `累计崩溃 ${p.crash_count} 次${p.last_crash_wall ? "，最近 " + fmt.rel(p.last_crash_wall) : ""}` : "无崩溃记录";
       return `<tr class="clickable" tabindex="0" data-task="${esc(t.task_id)}">
         <td class="cell-mono" style="max-width:240px"><div class="truncate">${esc(t.task_id)}</div></td>
@@ -879,7 +875,7 @@ const Jobs = {
     const bc = $("#batch-cancel");
     if (bc) bc.onclick = () => confirmModal({
       title: "批量取消",
-      body: `将 <b>${nCancel}</b> 个排队/运行中作业终止执行并置为「已取消」终态，不再自动调度（检查点保留，可重新排队复活）。`,
+      body: `将 <b>${nCancel}</b> 个排队/运行中作业终止执行并置为「已取消」终态，不再自动调度（如需重跑请用「重排」）。`,
       confirmText: `取消 ${nCancel} 个作业`, danger: true, reason: true,
       onConfirm: rsn => this.runCommandBatch("cancel_job",
         sel.filter(j => LIVE.has(j.status) || j.status === "QUEUED").map(j => j.job_id), rsn, "批量取消"),
@@ -1174,7 +1170,7 @@ const Attempts = {
       const aid = b.dataset.cancel;
       confirmModal({
         title: "取消执行尝试",
-        body: `终止 <code>${esc(aid)}</code> 的整个执行进程树（先协作退出，宽限后强杀），作业置为「已取消」终态，不再自动调度；检查点保留，可手动重新排队复活。`,
+        body: `终止 <code>${esc(aid)}</code> 的整个执行进程树（先协作退出，宽限后强杀），作业置为「已取消」终态，不再自动调度；如需重跑可用「重排」。`,
         confirmText: "取消执行", danger: true, reason: true,
         onConfirm: rsn => sendCommand("cancel_attempt", aid, rsn).then(() => setTimeout(() => this.fetchNow(), 800)),
       });
@@ -1301,7 +1297,7 @@ function buildJobPanel(data, focusAttempt) {
   $("#so-next", inner).onclick = () => { if (det.idx < det.source.length - 1) openJobDetail(det.source[det.idx + 1], { source: det.source }); };
   $("#jd-cancel", inner).onclick = () => confirmModal({
     title: "取消作业",
-    body: `取消 <code>${esc(j.job_id)}</code>：终止存活执行进程树（先协作退出，宽限后强杀），作业置为「已取消」终态，不再自动调度；检查点保留，可重新排队复活。不影响其他生产者。`,
+    body: `取消 <code>${esc(j.job_id)}</code>：终止存活执行进程树（先协作退出，宽限后强杀），作业置为「已取消」终态，不再自动调度；如需重跑可用「重排」。不影响其他生产者。`,
     confirmText: "确认取消", danger: true, reason: true,
     onConfirm: rsn => sendCommand("cancel_job", j.job_id, rsn).then(ok => ok && refreshJobDetail()),
   });
@@ -1322,7 +1318,7 @@ function buildJobPanel(data, focusAttempt) {
   });
   $("#jd-requeue", inner).onclick = () => confirmModal({
     title: "重新排队",
-    body: `将 <code>${esc(j.job_id)}</code> 重排回 QUEUED（RECOVERY_BLOCKED 等状态的解除出口）。运行中的作业不可重排。`,
+    body: `将 <code>${esc(j.job_id)}</code> 重排回 QUEUED（关闭遗留 attempt 并重新排队）。运行中的作业不可重排。`,
     confirmText: "确认重排", reason: true,
     onConfirm: rsn => sendCommand("requeue_job", j.job_id, rsn).then(ok => ok && refreshJobDetail()),
   });
@@ -1561,7 +1557,6 @@ function renderTimeline(attemptId, diff) {
   $$(".tl-filter [data-tlf]", tl).forEach(b => b.classList.toggle("active", b.dataset.tlf === filter));
   const pass = e => filter === "all" || e.kind === filter;
   const evs = data.events || [];
-  const cps = data.checkpoints || [];
   const maxSeq = det._tlMax[attemptId] || 0;
   if (diff && list.children.length) {
     // 增量：只插入比 maxSeq 新的事件（倒序插入 → 最新在顶）
@@ -1582,11 +1577,10 @@ function renderTimeline(attemptId, diff) {
     _bindTlItems(list);
     det._tlMax[attemptId] = evs.length ? Math.max(...evs.map(e => e.seq)) : 0;
   }
-  // 底部：加载更早 + 检查点摘要
+  // 底部：加载更早事件
   const total = evs.length;
   const limit = det._tlLimit[attemptId] || 40;
-  foot.innerHTML = `${total >= limit ? `<div class="tl-more"><button data-more>加载更早事件（共 ${total}+）</button></div>` : ""}`
-    + `${cps.length ? `<div class="tl-more dim" style="font-size:10.5px">检查点 ${cps.length} 个 · 最新提交 ${fmt.time(cps[0].at)}${cps[0].ref ? " · " + esc(cps[0].ref) : ""}</div>` : ""}`;
+  foot.innerHTML = total >= limit ? `<div class="tl-more"><button data-more>加载更早事件（共 ${total}+）</button></div>` : "";
   const more = $("[data-more]", foot);
   if (more) more.onclick = () => loadAttemptTimeline(attemptId, limit * 3);
 }
@@ -1695,7 +1689,7 @@ function openTaskDetail(taskId) {
   const stopBtn = $("#td-stop", inner);
   if (stopBtn) stopBtn.onclick = () => confirmModal({
     title: "停止全部执行",
-    body: `协作暂停 <b>${m.live || 0}</b> 个存活执行（检查点保留）。作业回到<b>排队</b>状态：任务保持禁用时不会被启动；<b>重新启用后自动从检查点续跑</b>，无需人工重排。`,
+    body: `协作暂停 <b>${m.live || 0}</b> 个存活执行。作业回到<b>排队</b>状态：任务保持禁用时不会被启动；<b>重新启用后自动重新调度</b>（断点由任务自行维护）。`,
     confirmText: `停止 ${m.live || 0} 个执行`, danger: true, reason: true,
     onConfirm: async rsn => {
       try {
@@ -1717,7 +1711,7 @@ function openTaskDetail(taskId) {
         <ul style="margin:8px 0 8px 18px;padding:0;color:var(--text-2);font-size:12px">
           <li>停止全部存活执行并终止生产者进程</li>
           <li>删除任务目录（代码 / 配置 / outbox / producer_state / receipts）</li>
-          <li>清除数据库全部相关行（作业 / 尝试 / 事件 / 检查点 / 运行目标）</li>
+          <li>清除数据库全部相关行（作业 / 尝试 / 事件 / 运行目标）</li>
           <li>删除运行工件与归档（worker.log / 请求 JSON / 隔离区）</li>
         </ul>
         <b style="color:var(--c-failed)">不可恢复。</b>输入任务 ID 确认：
@@ -1906,9 +1900,9 @@ function handleOverview(o) {
         cpuPct: Math.max(0, (cur.cpu - last.cpu) / 1e6 / dt / o.machine.cpu_count * 100),
         ioBps: Math.max(0, (cur.io - last.io) / dt),
         jRunning: (jc.STARTING || 0) + (jc.RUNNING || 0) + (jc.PAUSING || 0),
-        jWaiting: (jc.QUEUED || 0) + (jc.BACKOFF || 0) + (jc.PAUSED || 0) + (jc.RECOVERING || 0),
+        jWaiting: (jc.QUEUED || 0) + (jc.BACKOFF || 0) + (jc.PAUSED || 0),
         jFinished: (jc.SUCCEEDED || 0) + (jc.CANCELLED || 0),
-        jAttention: (jc.FAILED || 0) + (jc.RECOVERY_BLOCKED || 0),
+        jAttention: (jc.FAILED || 0),
         producersAlive: snap.producers ? snap.producers.filter(p => p.alive).length : null,
       });
       if (S.history.length > HIST_MAX) S.history.shift();
@@ -1929,7 +1923,7 @@ function handleOverview(o) {
   // 标签页徽标
   const c = o.job_counts || {};
   const producersDown = snap ? snap.producers.filter(p => !p.alive).length : 0;
-  const abnormal = (c.FAILED || 0) + (c.RECOVERY_BLOCKED || 0) + producersDown;
+  const abnormal = (c.FAILED || 0) + producersDown;
   document.title = (abnormal > 0 ? `(${abnormal} 异常) ` : "") + "Sched · 调度器控制台";
   if (S.view === "overview") Overview.refresh();
   if (S.view === "jobs") {

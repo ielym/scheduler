@@ -16,10 +16,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from . import cgroup as cg
-from . import config
+from . import config, store
+from . import proc as procmod
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KILL_WAIT_SEC = 5
@@ -50,12 +50,11 @@ class AttemptSpec:
 
 
 class AttemptRun:
-    """一个存活执行尝试的运行句柄。
+    """一个存活执行尝试的运行句柄（调度器直接拉起的子进程）。
 
-    proc 为 None 时表示"接管句柄"（adopted）：调度器重启后对身份核实仍存活
-    的旧 worker 重新挂接事件/控制文件继续观测（设计第十三节 L221"存活 worker
-    可以通过事件与控制协议接管"）。接管进程不是当前实例的子进程，无法
-    wait() 拿退出码——退出码未知时由 decide_outcome 归入 RECOVERING 待核实。
+    重启不做接管：旧实例遗留的执行进程在下次启动时被统一终止清除
+    （见 SchedulerService._kill_previous_runs），因此这里始终持有一个可 wait()
+    的子进程，退出码可从 proc.returncode 取得。
     """
 
     def __init__(self, spec: AttemptSpec, proc: subprocess.Popen,
@@ -67,7 +66,7 @@ class AttemptRun:
         self.input_refs = input_refs
         self.pid = proc.pid
         self.pgid = proc.pid
-        self.start_time = _proc_start_time(self.pid)
+        self.start_time = procmod.start_time(self.pid)
         self.started_at = now_iso()
         self._pause: dict | None = None
         self._terminating = threading.Event()
@@ -77,29 +76,6 @@ class AttemptRun:
         # events.jsonl 增量读游标：已消费到的字节偏移与最大 seq（避免每轮全量重读）
         self._read_offset = 0
         self._read_seq = 0
-
-    @classmethod
-    def adopted(cls, spec: "AttemptSpec", run_dir: Path, cgrp: "cg.Cgroup",
-                input_refs: list[str], pid: int, pgid: int,
-                start_time: float, last_seq: int = 0) -> "AttemptRun":
-        """构造接管句柄：沿用持久化的执行身份（PID/PGID/启动时间/cgroup）。"""
-        self = cls.__new__(cls)
-        self.spec = spec
-        self.proc = None
-        self.run_dir = run_dir
-        self.cgrp = cgrp
-        self.input_refs = input_refs
-        self.pid = int(pid)
-        self.pgid = int(pgid)
-        self.start_time = float(start_time)
-        self.started_at = now_iso()
-        self._pause = None
-        self._terminating = threading.Event()
-        self._kill_at_mono = None
-        self._kill_sent = False
-        self._read_offset = 0
-        self._read_seq = int(last_seq)
-        return self
 
     @property
     def event_file(self) -> Path:
@@ -116,12 +92,8 @@ class AttemptRun:
     def is_alive(self) -> bool:
         if self.proc is not None and self.proc.poll() is not None:
             return False
-        if not _pid_alive(self.pid, self.start_time):
-            return False
-        # 僵尸/退出中进程不算存活（审查修复）：接管句柄的 worker 退出后，
-        # 若其父进程（旧调度器）仍存活而未 wait，会以僵尸态留在 /proc——
-        # PID+启动时间核实通过但进程已不可能再执行代码或产生事件
-        return not proc_never_runs_again(self.pid)
+        # PID + 启动时间联合核实，僵尸/退出中进程不算存活（proc.alive 内含僵尸检查）
+        return procmod.alive(self.pid, self.start_time)
 
     # ---- 事件 ----
     def read_events(self, after_seq: int = 0) -> list[dict]:
@@ -182,12 +154,12 @@ class AttemptRun:
         self._pause = {"command_id": command_id, "action": "pause",
                        "job_id": self.spec.job_id, "attempt_id": self.spec.attempt_id,
                        "token": self.spec.token, "reason": reason, "deadline": deadline}
-        _atomic_write(self.control_file, self._pause)
+        store.atomic_write_json(self.control_file, self._pause)
 
     def write_permit(self) -> None:
         """写入启动许可（设计第十三节）：调度器确认 STARTED/RUNNING 后授予，
         worker 在许可确认前不进行业务副作用。"""
-        _atomic_write(self.run_dir / "permit.json", {
+        store.atomic_write_json(self.run_dir / "permit.json", {
             "action": "permit",
             "job_id": self.spec.job_id,
             "attempt_id": self.spec.attempt_id,
@@ -205,46 +177,6 @@ class AttemptRun:
             os.killpg(self.pgid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             pass
-
-    def terminate(self, grace_sec: float) -> int | None:
-        """整棵进程树 SIGTERM → 等 grace → SIGKILL → cgroup.kill 兜底（防 setsid 漏杀）。
-
-        仅用于停机/启动恢复等一次性路径；主循环内请用 begin_terminate/poll_terminate
-        非阻塞状态机——同步等待会冻结整个控制平面（快照/命令/事件/准入）。
-        接管句柄（proc=None）走外部终止路径（无子进程 wait 权限，按身份核实轮询）。
-        """
-        self._terminating.set()
-        try:
-            os.killpg(self.pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        if self.proc is None:
-            return terminate_external(self.pid, self.pgid, self.start_time,
-                                      max(0.5, grace_sec),
-                                      cgroup=self.cgrp.name if self.cgrp.available else "")
-        try:
-            self.proc.wait(timeout=grace_sec)
-            return self.proc.returncode
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(self.pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        if self.cgrp.available:
-            try:
-                self.cgrp.kill_all()  # cgroup v2 无差别终止，覆盖自行 setsid 的后代
-            except OSError:
-                pass
-            for _ in range(4):
-                if not self.cgrp.procs():
-                    break
-                time.sleep(0.1)
-        try:
-            self.proc.wait(timeout=KILL_WAIT_SEC)
-        except subprocess.TimeoutExpired:
-            pass
-        return self.proc.returncode
 
     # ---- 非阻塞终止状态机（主循环内使用） ----
     def begin_terminate(self, now_mono: float, grace_sec: float) -> bool:
@@ -291,83 +223,17 @@ class AttemptRun:
         self.cgrp.remove()
 
 
-def _atomic_write(path: Path, obj: Any) -> None:
-    import tempfile
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _proc_start_time(pid: int) -> float:
-    try:
-        return os.stat(f"/proc/{pid}").st_ctime
-    except OSError:
-        return 0.0
-
-
-def _pid_alive(pid: int, start_time: float | None = None) -> bool:
-    """PID + 进程启动时间联合身份核实（防 PID 复用误判，设计文档第十三节）。"""
-    if not pid:
-        return False
-    try:
-        st = os.stat(f"/proc/{pid}")
-        if start_time and start_time != st.st_ctime:
-            return False
-    except OSError:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
 def pid_alive_with_start(pid: int, start_time: float) -> bool:
-    """对外暴露的身份核实（重启接管/直连取消使用）。
+    """对外暴露的身份核实（重启接管/直连取消使用）：PID+启动时间，僵尸不算存活。
 
-    僵尸/退出中进程不算存活（审查修复）：接管场景下旧 worker 退出后可能以
-    僵尸态留在 /proc（父进程未 wait），PID+启动时间核实通过但进程已死。
+    委托 sched.proc 统一实现（与生产者守护共用同一套逻辑）。
     """
-    if not _pid_alive(pid, start_time):
-        return False
-    return not proc_never_runs_again(pid)
-
-
-_ZOMBIE_STATES = frozenset((b"Z", b"x", b"X"))
+    return procmod.alive(pid, start_time)
 
 
 def proc_never_runs_again(pid: int) -> bool:
-    """进程是否已不可能再执行代码（退出中/僵尸/不存在）。
-
-    整树退出核实用它过滤 cgroup.procs 里的残留 pid：僵尸进程不消耗 CPU、
-    不写任何资源、信号杀不掉，等待它被父进程/init 收割不应阻塞 finalize；
-    cgroup 不可用降级为静态文件时（写入即不再更新）同理。
-    审查修复：/proc/<pid>/stat 读出的是 bytes，状态字符必须与 bytes 集合
-    比较（此前 b"Z" in frozenset("ZxX") 恒 False，僵尸检测从未生效）。
-    """
-    try:
-        data = open(f"/proc/{pid}/stat", "rb").read()
-    except OSError:
-        return True
-    try:
-        # stat 第 3 字段是状态字符，位于最后一个 ')' 之后（进程名可含括号）
-        state = data.rsplit(b")", 1)[1].split()[0][:1]
-        return state in _ZOMBIE_STATES
-    except (IndexError, ValueError):
-        return False
+    """进程是否已不可能再执行代码（退出中/僵尸/不存在）；委托 sched.proc。"""
+    return procmod.never_runs_again(pid)
 
 
 def terminate_external(pid: int, pgid: int, pid_start_time: float,
@@ -417,7 +283,7 @@ def build_argv(task_root: Path, entry: config.EntrySpec, entry_args: list[str]) 
     return argv
 
 
-def build_env(spec: AttemptSpec, input_refs: list[str]) -> dict[str, str]:
+def build_env(spec: AttemptSpec) -> dict[str, str]:
     env = {k: os.environ[k] for k in ENV_PASSTHROUGH if k in os.environ}
     for k, v in spec.env.items():
         if k not in ENV_BLACKLIST:
@@ -430,7 +296,6 @@ def build_env(spec: AttemptSpec, input_refs: list[str]) -> dict[str, str]:
         "SCHED_RUN_DIR": str(config.run_dir(spec.attempt_id)),
         "SCHED_EVENT_FILE": str(config.run_dir(spec.attempt_id) / "events.jsonl"),
         "SCHED_CONTROL_FILE": str(config.run_dir(spec.attempt_id) / "control.json"),
-        "SCHED_CHECKPOINT_FILE": str(config.run_dir(spec.attempt_id) / "checkpoint.json"),
         "SCHED_PERMIT_FILE": str(config.run_dir(spec.attempt_id) / "permit.json"),
         "SCHED_WORKSPACE": str(spec.task_root),
         "SCHED_HEARTBEAT_INTERVAL_SEC": str(spec.heartbeat_interval_sec),
@@ -456,24 +321,27 @@ def launch(spec: AttemptSpec, input_refs: list[str] | None = None) -> AttemptRun
 
     cgrp = cg.new_cgroup(f"{spec.task_id}/{spec.attempt_id}")
     argv = build_argv(spec.task_root, spec.executor_entry, spec.entry_args)
-    env = build_env(spec, input_refs)
+    env = build_env(spec)
 
     # 执行日志：重定向到该 attempt 的 run_dir（诊断证据，随工件周期清理——
     # SUCCEEDED/CANCELLED 的 run_dir 7 天后清理，FAILED 永久保留；不进调度器
     # 数据库/元数据，与设计第六节"原始输出不自动归档"的边界一致）。
     # 缓冲模式行刷新：worker 崩溃时已打印内容仍在（O_APPEND 无需 drain）。
     log_fh = open(run_dir / "worker.log", "ab", buffering=0)
-
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(workdir),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=log_fh,
-        stderr=log_fh,
-        start_new_session=True,
-        close_fds=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(workdir),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except BaseException:
+        log_fh.close()  # 拉起失败：关闭父侧日志 fd，避免每次失败泄漏一个句柄
+        raise
     log_fh.close()  # 子进程已继承 fd，父进程副本立即关闭
     if cgrp.available:
         cgrp.add_process(proc.pid)
@@ -485,6 +353,9 @@ class AttemptOutcome:
     status: str
     exit_code: int | None
     reason: str
+    # attempt 行的落库状态：缺省与 status 相同；"作业回 QUEUED 重跑"时
+    # attempt 以 FAILED 收尾（本次执行未按协议完成）而作业状态为 QUEUED
+    attempt_status: str | None = None
 
 
 def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
@@ -492,8 +363,8 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
     """把进程退出 + 事件证据归因为作业状态。
 
     status_ctx: scheduler 发起 PAUSING（协作暂停）或 CANCELLED（显式取消）。
-    归因优先级：显式控制 > 退出 0 且有持久化完成记录 > 不足（仅退出码 75）>
-    退出 0 无完成记录（待核实）> 失败。
+    归因优先级：显式控制 > 退出 0 且有持久化完成记录 > 不足（仅退出码 75）
+    > 失败；退出 0 但未提交完成记录、或退出码未知 → 作业回 QUEUED 重跑。
 
     设计第六节：只有约定退出码 75 才是"资源不足"——运行期曾报过不足
     事件不得把其它非零退出扩大为外部争用（业务逻辑错误必须归为 FAILED）。
@@ -503,7 +374,6 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
     if status_ctx == JobStatus.CANCELLED:
         if had_completed:
             # 取消请求到达时完成记录已持久化：完成证据优先于取消意图
-            # （设计第十二节：退出 0 + 持久化完成记录 → SUCCEEDED）
             return AttemptOutcome(JobStatus.SUCCEEDED, exit_code,
                                   "取消请求到达前已完成并持久化完成记录")
         return AttemptOutcome(JobStatus.CANCELLED, exit_code, "显式取消")
@@ -514,26 +384,27 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
             return AttemptOutcome(JobStatus.SUCCEEDED, exit_code,
                                   "暂停请求到达前已完成并持久化完成记录")
         if exit_code == EXIT_SHORTAGE:
-            # 暂停请求中以外不足退出：断点未必已保存，语义是不足而非已暂停
             return AttemptOutcome(JobStatus.BACKOFF, exit_code,
                                   "资源不足（暂停请求中退出）")
         if exit_code == 0:
-            return AttemptOutcome(JobStatus.PAUSED, exit_code, "协作暂停，断点已保存")
-        # 非 0/75 退出（崩溃/被杀）：断点可能未保存，保守按 PAUSED 重新排队核实，
-        # 不得冒充"断点已保存"（跨 attempt 恢复依赖该语义，设计第七节）
+            return AttemptOutcome(JobStatus.PAUSED, exit_code, "协作暂停")
+        # 非 0/75 退出（崩溃/被杀）：保守按 PAUSED 重新排队
         code = exit_code if exit_code is not None else "未知"
         return AttemptOutcome(JobStatus.PAUSED, exit_code,
-                              f"暂停请求中退出（码 {code}），断点可能未保存，重新排队")
+                              f"暂停请求中退出（码 {code}），重新排队")
     if exit_code == 0 and had_completed:
         return AttemptOutcome(JobStatus.SUCCEEDED, exit_code, "完成")
     if exit_code == EXIT_SHORTAGE:
         return AttemptOutcome(JobStatus.BACKOFF, exit_code, "资源不足")
-    if exit_code == 0 and not had_completed:
-        return AttemptOutcome(JobStatus.RECOVERING, exit_code, "退出 0 但无完成记录，待核实")
+    if exit_code == 0:
+        # 退出 0 但未显式提交完成记录：本次执行不算完成，作业重新排队重跑
+        # （attempt 以 FAILED 收尾留证据，作业状态为 QUEUED）
+        return AttemptOutcome(JobStatus.QUEUED, exit_code,
+                              "退出 0 但未提交完成记录，重新排队重跑",
+                              attempt_status=JobStatus.FAILED)
     if exit_code is None:
-        # 接管句柄（非子进程）无法获取退出码：状态歧义按 RECOVERING 待核实
-        # （设计第十二节 L203"状态歧义为 RECOVERING"），由恢复协议核实完成记录，
-        # 不简单从头执行（设计第十三节 L223）。
-        return AttemptOutcome(JobStatus.RECOVERING, exit_code,
-                              "退出码未知（接管进程退出），待核实")
+        # 退出码未知（无法 wait 的异常情形）：按"重新开始"回队列重跑
+        return AttemptOutcome(JobStatus.QUEUED, None,
+                              "退出码未知，重新排队重跑",
+                              attempt_status=JobStatus.FAILED)
     return AttemptOutcome(JobStatus.FAILED, exit_code, f"业务/未知失败（退出码 {exit_code}）")

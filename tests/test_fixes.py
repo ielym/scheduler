@@ -6,7 +6,7 @@
 3. ResourceTrend 滞回
 4. 接收器时间片 + 作业级优先级钳制 + 扫描顺序
 5. DB 新列与原子事务迁移
-6. BACKOFF→QUEUED / PAUSED→QUEUED / RECOVERING→QUEUED 闭环（内存态）
+6. BACKOFF→QUEUED / PAUSED→QUEUED 闭环 + 重启冷启动重排（内存态）
 7. 指数退避 + 抖动 + 封顶
 8. 准入保护门禁（保护期间低优先级不新增）
 """
@@ -35,9 +35,11 @@ class TestDecideOutcome:
         o = runner.decide_outcome("", 75, had_completed=False)
         assert o.status == JobStatus.BACKOFF
 
-    def test_exit0_no_completed_is_recovering(self):
+    def test_exit0_no_completed_requeues(self):
+        # 退出 0 但未提交完成记录 → 作业回 QUEUED 重跑（attempt 以 FAILED 收尾）
         o = runner.decide_outcome("", 0, had_completed=False)
-        assert o.status == JobStatus.RECOVERING
+        assert o.status == JobStatus.QUEUED
+        assert o.attempt_status == JobStatus.FAILED
 
     def test_pause_ctx_completed_wins(self):
         # 暂停请求到达前已完成（done）→ 完成证据优先于暂停意图，不误标 PAUSED 重跑
@@ -363,21 +365,39 @@ class TestStateClosures:
         svc._tick_release(0.0)
         assert d.get_job("j-1")["status"] == JobStatus.PAUSED
 
-    def test_recover_wait_requeue_when_dead(self, home):
+    def test_reinitialize_requeues_unfinished_and_clears_attempts(self, home):
+        # 冷启动：未终结 attempt 与工件被清除，作业一律回 QUEUED（不核实完成、不接管）
         svc = self._svc(home)
         d = svc.db
         d.upsert_job(_ready("j-1", "t1"), "h1", "now", 50)
-        d.create_attempt("att-1", "j-1", 1, "tok", "now")
-        # 已死进程（pid 不存在）
-        att = d.get_attempt("att-1")
+        d.create_attempt("att-1", "j-1", 1, "tok", "now", cgroup="t1/att-1")
         d.update_attempt("att-1", pid=999999999, pgid=999999999,
                          pid_start_time=12345.0)
-        att = d.get_attempt("att-1")
-        d.set_job_status("j-1", JobStatus.RECOVERING, "重启", "now")
-        svc._recover_wait["att-1"] = (att, 0.0)  # 宽限已过
-        svc._tick_recover(10.0)
+        d.append_event("att-1", 1, "done", {"ok": True}, "now")  # 有完成记录也不核实
+        d.set_job_status("j-1", JobStatus.RUNNING, "", "now")
+        svc._reinitialize()
         assert d.get_job("j-1")["status"] == JobStatus.QUEUED
-        assert d.get_attempt("att-1")["status"] == JobStatus.PAUSED
+        assert d.get_attempt("att-1") is None  # 旧 attempt 已删除
+
+    def test_reinitialize_keeps_terminal_jobs(self, home):
+        # 终态作业（成功/取消/失败）不重排；非终态一律回 QUEUED
+        svc = self._svc(home)
+        d = svc.db
+        d.upsert_job(_ready("j-done", "t1"), "h", "now", 50)
+        d.set_job_status("j-done", JobStatus.SUCCEEDED, "", "now")
+        d.upsert_job(_ready("j-run", "t1"), "h2", "now", 50)
+        d.set_job_status("j-run", JobStatus.RUNNING, "", "now")
+        svc._reinitialize()
+        assert d.get_job("j-done")["status"] == JobStatus.SUCCEEDED
+        assert d.get_job("j-run")["status"] == JobStatus.QUEUED
+
+    def test_reinitialize_resets_scheduler_state(self, home):
+        # 调度学习态冷启动：动态目标清零、task_state 清空
+        svc = self._svc(home)
+        svc.db.set_task_state("t1", run_target=5, mode="steady")
+        svc._reinitialize()
+        assert svc.db.all_task_states() == []
+        assert svc.scaling.get("t1").run_target == 0
 
     def test_backoff_retry_schedule_exponential_with_jitter(self, home):
         svc = self._svc(home)
@@ -421,34 +441,6 @@ class TestStateClosures:
         svc.protect.end_round(1.0)
         ids2 = [c["job_id"] for c in svc._candidates()]
         assert set(ids2) == {"j-low", "j-high"}
-
-    def test_recover_classify_completed_event(self, home):
-        # 重启核实：完成记录已持久化 → SUCCEEDED（不重跑）
-        svc = self._svc(home)
-        d = svc.db
-        d.upsert_job(_ready("j-1", "t1"), "h1", "now", 50)
-        d.create_attempt("att-1", "j-1", 1, "tok", "now")
-        d.update_attempt("att-1", pid=999999999, pgid=999999999)
-        d.append_event("att-1", 1, "done", {"ok": True}, "now")
-        d.set_job_status("j-1", JobStatus.RUNNING, "", "now")
-        svc._recover()
-        assert d.get_job("j-1")["status"] == JobStatus.SUCCEEDED
-        assert d.get_attempt("att-1")["status"] == JobStatus.SUCCEEDED
-
-    def test_recover_classify_no_pid_blocked(self, home):
-        # attempt 意图已持久化但 pid 未知：审计修复后（设计第十三节 L219）
-        # 不再一律 RECOVERY_BLOCKED——无进程身份即无残留，自动确认清理后
-        # 按检查点重放（QUEUED）；仅清理不净（不可中断 D 态）才保持
-        # RECOVERY_BLOCKED 待人工核实
-        svc = self._svc(home)
-        d = svc.db
-        d.upsert_job(_ready("j-1", "t1"), "h1", "now", 50)
-        d.create_attempt("att-1", "j-1", 1, "tok", "now")  # 无 pid、无 cgroup
-        d.set_job_status("j-1", JobStatus.STARTING, "", "now")
-        svc._recover()
-        job = d.get_job("j-1")
-        assert job["status"] == JobStatus.QUEUED
-        assert "按检查点重放" in job["reason"]
 
 
 def _spec(task_id, priority):

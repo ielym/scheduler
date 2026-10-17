@@ -6,7 +6,7 @@
 3. 协作暂停闭环：退让 → PAUSED → 重新排队 → 重入 → 完成（业务幂等，单元恰好一次）
 4. 显式取消：cancel_job → 进程树退出 → CANCELLED
 5. 重启接管：模拟调度器崩溃（进程不撤）→ 新实例核实身份 → 旧进程协作退出 →
-   RECOVERING → QUEUED → 重放完成；生产者任务级单实例锁接管（无重复生产者）
+   CUED → 重跑完成；生产者任务级单实例锁接管（无重复生产者）
 6. CLI IPC：status 读快照显示 serve=alive；job cancel 走命令通道并被 serve 确认
 """
 
@@ -43,7 +43,6 @@ def _fast_config(home):
     c = cfg.control
     c.loop_tick_sec = 0.2
     c.sample_interval_sec = 0.5
-    c.start_interval_sec = 0.2
     c.grow_observe_sec = 2.0
     c.feedback_interval_init_sec = 1.0
     c.heartbeat_interval_sec = 1.0
@@ -316,7 +315,7 @@ class TestEndToEnd:
         finally:
             svc.stop()
 
-    def test_restart_recovery_and_producer_adoption(self, home):
+    def test_restart_cold_start_requeues_and_keeps_producer(self, home):
         _fast_config(home)
         worklog = home / "worklog.json"
         _make_task(home, "t_long", _RUN_LONG,
@@ -336,7 +335,7 @@ class TestEndToEnd:
         svc1.db.close()
         assert runner.pid_alive_with_start(old_pid, old_start)
 
-        # ---- 重启：新实例接管 ----
+        # ---- 重启：冷启动重排（不接管旧执行，按策略重新开始） ----
         svc2 = SchedulerService()
         svc2.start()
         try:
@@ -344,7 +343,7 @@ class TestEndToEnd:
             producers = [p for p in svc2.guard.list() if p["task_id"] == "t_long"]
             assert producers and producers[0]["external"] is True
             assert producers[0]["alive"] is True
-            # 系统中只有一个该任务的生产者进程
+
             def producer_proc_count():
                 n = 0
                 for pid_dir in os.listdir("/proc"):
@@ -361,17 +360,17 @@ class TestEndToEnd:
             wait_until(lambda: producer_proc_count() == 1,
                        desc="single producer process")
 
-            # 审查修复后的接管语义（设计第十三节 L221）：存活的旧 worker 被
-            # 新实例接管继续跑完，不中断业务、不重放——同一 attempt 完成
+            # 冷启动语义：旧 worker 被终止，作业回 QUEUED 并按策略重新拉起新 attempt
+            wait_until(lambda: not runner.pid_alive_with_start(old_pid, old_start),
+                       timeout=20, desc="old worker terminated")
             wait_until(lambda: svc2.db.get_job(jid)["status"] == JobStatus.SUCCEEDED,
-                       timeout=40, desc="job SUCCEEDED after restart adoption")
+                       timeout=40, desc="job SUCCEEDED after restart rerun")
             atts = svc2.db.list_attempts(job_id=jid)
-            assert len(atts) == 1, "接管后不得新建 attempt（无重放）"
             assert atts[0]["status"] == JobStatus.SUCCEEDED
-            assert atts[0]["pid"] == old_pid, "完成的应是接管的旧 worker"
-            # 业务幂等：单元恰好一次
+            assert atts[0]["pid"] != old_pid, "重跑应新建 attempt（不接管旧 worker）"
+            # 业务幂等：单元恰好覆盖一次全集（可能夹带首轮未完成的部分）
             done = json.loads(worklog.read_text())
-            assert done == list(range(6))
+            assert set(done) == set(range(6))
         finally:
             svc2.stop()
 
@@ -427,8 +426,9 @@ class TestEndToEnd:
         assert "CANCELLED" in out
         assert dbmod.DB().get_job(jid)["status"] == JobStatus.CANCELLED
 
-    def test_requeue_recovery_blocked_via_command_channel(self, home):
-        # 退出 0 但无完成记录 → RECOVERY_BLOCKED → 命令通道 requeue → 重放完成
+    def test_exit0_without_done_requeues_and_completes(self, home):
+        # 退出 0 但未提交完成记录 → 作业回 QUEUED 重跑（attempt 以 FAILED 收尾）；
+        # 第二次 attempt 正常 complete → SUCCEEDED（无需人工介入）
         _fast_config(home)
         marker = home / "requeue.marker"
         _make_task(home, "t_rq", _RUN_EXIT0_THEN_OK, env={"MARKER": str(marker)})
@@ -436,56 +436,34 @@ class TestEndToEnd:
         svc.start()
         try:
             jid = _job_id(svc, "t_rq")
-            wait_until(lambda: svc.db.get_job(jid)["status"] == JobStatus.RECOVERY_BLOCKED,
-                       timeout=20, desc="job RECOVERY_BLOCKED")
-            att = svc.db.list_attempts(job_id=jid)[0]
-            assert att["status"] == JobStatus.RECOVERING  # 身份未知的存活 attempt
-            # serve 在线：走命令通道（CLI 语义 = _send_command("requeue_job", ...)）
-            cid = runner.new_id("cmd")
-            store.append_jsonl(config.commands_file(),
-                               {"id": cid, "kind": "requeue_job", "target": jid,
-                                "reason": "测试重排", "ts": runner.now_iso()})
-
-            def acked():
-                return next((a for a in store.read_jsonl(config.commands_ack_file())
-                             if a.get("id") == cid and a.get("ok")), None)
-
-            wait_until(acked, desc="requeue ack ok")
-            # 旧 attempt 被关闭为 CANCELLED（RECOVERING 遗留行也一并清理）
-            wait_until(
-                lambda: any(a["status"] == JobStatus.CANCELLED and "重排关闭" in (a["reason"] or "")
-                            for a in svc.db.list_attempts(job_id=jid)),
-                timeout=10, desc="legacy attempt closed by requeue")
-            # 新 attempt 准入并完成（QUEUED 是瞬态，直接等终态）
             wait_until(lambda: svc.db.get_job(jid)["status"] == JobStatus.SUCCEEDED,
-                       timeout=25, desc="job SUCCEEDED after requeue replay")
+                       timeout=30, desc="job SUCCEEDED after auto requeue")
             atts = svc.db.list_attempts(job_id=jid)
             assert len(atts) == 2
             assert atts[0]["status"] == JobStatus.SUCCEEDED
-            assert atts[1]["status"] == JobStatus.CANCELLED
-            assert "重排关闭" in atts[1]["reason"]
+            assert atts[1]["status"] == JobStatus.FAILED  # 首次退出 0 无 done，FAILED 收尾
+            assert "未提交完成记录" in atts[1]["reason"]
         finally:
             svc.stop()
 
     def test_requeue_cli_offline_direct(self, home, capsys):
-        # serve 不在：CLI 直连重排 RECOVERY_BLOCKED 作业
+        # serve 不在：CLI 直连重排 FAILED 作业 → QUEUED
         _fast_config(home)
-        marker = home / "requeue2.marker"
-        _make_task(home, "t_rq2", _RUN_EXIT0_THEN_OK, env={"MARKER": str(marker)})
+        _make_task(home, "t_rq2", "import sys\nsys.exit(3)\n")
         svc = SchedulerService()
         svc.start()
         jid = _job_id(svc, "t_rq2")
-        wait_until(lambda: svc.db.get_job(jid)["status"] == JobStatus.RECOVERY_BLOCKED,
-                   timeout=20, desc="job RECOVERY_BLOCKED")
+        wait_until(lambda: svc.db.get_job(jid)["status"] == JobStatus.FAILED,
+                   timeout=20, desc="job FAILED")
         svc.stop()  # serve 退出（释放单实例锁 → CLI 直连分支）
         assert cli_main(["job", "requeue", jid, "--reason", "offline test"]) == 0
         out = capsys.readouterr().out
         assert "REQUEUED" in out
         d = dbmod.DB()
-        assert d.get_job(jid)["status"] == JobStatus.QUEUED
-        att = d.list_attempts(job_id=jid)[0]
-        assert att["status"] == JobStatus.CANCELLED
-        assert "重排关闭" in att["reason"]
+        try:
+            assert d.get_job(jid)["status"] == JobStatus.QUEUED
+        finally:
+            d.close()
 
     def test_requeue_rejected_while_running(self, home):
         # 运行中的作业拒绝重排（防重复执行）

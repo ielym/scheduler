@@ -66,9 +66,9 @@ class EventWriter:
                 except OSError as e:
                     last_err = e
             if last_err is not None:
-                # C2：事件写失败必须大声告警（丢 completed 事件会触发"待核实"），
-                # 但不向上抛——抛异常会把退出 0 变非 0，被误归因为业务 FAILED；
-                # 退出 0 无完成记录 → RECOVERING 待核实是设计赋予的正确语义。
+                # C2：事件写失败必须大声告警（丢 completed 事件会让本次执行被判
+                # "退出 0 无完成记录"而回队列重跑），但不向上抛——抛异常会把退出 0
+                # 变非 0，被误归因为业务 FAILED。
                 print(f"[sched-sdk] 事件写入失败（seq={seq} kind={kind}）：{last_err}",
                       file=sys.stderr, flush=True)
             return seq

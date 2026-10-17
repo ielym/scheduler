@@ -29,8 +29,6 @@
   --c-backoff: #a78bfa;
   --c-succeeded: #2dd4bf;
   --c-failed: #fb7185;
-  --c-recovering: #e7d36b;
-  --c-recovery-blocked: #f87171;
   --c-cancelled: #64748b;
 
   /* 字体 */
@@ -311,8 +309,6 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .badge.s-BACKOFF { color: var(--c-backoff); background: rgba(167, 139, 250, 0.1); border-color: rgba(167, 139, 250, 0.25); }
 .badge.s-SUCCEEDED { color: var(--c-succeeded); background: rgba(45, 212, 191, 0.09); border-color: rgba(45, 212, 191, 0.22); }
 .badge.s-FAILED { color: var(--c-failed); background: rgba(251, 113, 133, 0.1); border-color: rgba(251, 113, 133, 0.25); }
-.badge.s-RECOVERING { color: var(--c-recovering); background: rgba(231, 211, 107, 0.08); border-color: rgba(231, 211, 107, 0.24); }
-.badge.s-RECOVERY_BLOCKED { color: var(--c-recovery-blocked); background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.3); }
 .badge.s-CANCELLED { color: var(--c-cancelled); background: rgba(100, 116, 139, 0.12); border-color: rgba(100, 116, 139, 0.24); }
 @keyframes blink { 50% { opacity: 0.35; } }
 
@@ -341,8 +337,6 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .pill.st-BACKOFF.active { color: #cec0fb; background: rgba(167, 139, 250, 0.13); border-color: rgba(167, 139, 250, 0.4); }
 .pill.st-SUCCEEDED.active { color: #93e9dd; background: rgba(45, 212, 191, 0.12); border-color: rgba(45, 212, 191, 0.4); }
 .pill.st-FAILED.active { color: #fba9b6; background: rgba(251, 113, 133, 0.12); border-color: rgba(251, 113, 133, 0.4); }
-.pill.st-RECOVERING.active { color: #efe4a1; background: rgba(231, 211, 107, 0.11); border-color: rgba(231, 211, 107, 0.4); }
-.pill.st-RECOVERY_BLOCKED.active { color: #fba3a3; background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.42); }
 .pill.st-CANCELLED.active { color: #b3bdcc; background: rgba(100, 116, 139, 0.14); border-color: rgba(100, 116, 139, 0.4); }
 
 .select {
@@ -661,8 +655,6 @@ tr:focus-visible { outline: 2px solid var(--accent-line); outline-offset: -2px; 
 .ev-item .ev-at { font-family: var(--mono); font-size: 10px; color: var(--text-3); white-space: nowrap; margin-left: auto; }
 .ev-k-attempt_launched .ev-dot { background: var(--text-3); }
 .ev-k-attempt_finalized .ev-dot { background: var(--c-queued); }
-.ev-k-checkpoint_restored .ev-dot { background: var(--c-succeeded); opacity: 0.6; }
-.ev-k-recover_requeued .ev-dot { background: var(--c-recovering); }
 .ev-k-producer_crash .ev-dot { background: var(--c-failed); box-shadow: 0 0 8px rgba(251, 113, 133, 0.5); }
 .ev-k-pause_requested, .ev-k-pause_grace_exceeded .ev-dot { background: var(--c-pausing); }
 .ev-k-pause_requested .ev-dot { background: var(--c-pausing); }

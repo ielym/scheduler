@@ -21,14 +21,12 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import __version__, config, db as dbmod, runner, scheduler as schedmod, store
+from . import __version__, config, db as dbmod, ipc, runner, scheduler as schedmod, store
 
-SNAPSHOT_FRESH_SEC = 10.0
 STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 _JOB_FIELDS = ("job_id", "task_id", "priority", "status", "reason", "queued_at",
                "started_at", "finished_at", "receive_seq", "retry_count",
@@ -41,43 +39,13 @@ _task_lock = threading.Lock()
 # ---------------------------------------------------------------- 工具
 
 def _serve_alive() -> bool:
-    import fcntl
-    p = config.lock_file()
-    if not p.exists():
-        return False
-    try:
-        fd = os.open(str(p), os.O_RDWR)
-    except OSError:
-        return False
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return False
-        except OSError:
-            return True
-    finally:
-        os.close(fd)
+    """serve 是否持有单实例锁（flock 探测）。"""
+    return ipc.serve_alive()
 
 
 def _fresh_snapshot() -> dict | None:
     """读取 serve 快照并校验新鲜度（双时钟，与 CLI status 相同规则）。"""
-    snap = store.load_json(config.snapshot_file(), default=None)
-    if not isinstance(snap, dict):
-        return None
-    mono = snap.get("mono")
-    if not isinstance(mono, (int, float)) or time.monotonic() - mono > SNAPSHOT_FRESH_SEC:
-        return None
-    ts = snap.get("ts")
-    try:
-        t = datetime.fromisoformat(str(ts))
-    except (ValueError, TypeError):
-        return None
-    if t.tzinfo is None:
-        t = t.astimezone()
-    if datetime.now(timezone.utc) - t > timedelta(seconds=SNAPSHOT_FRESH_SEC):
-        return None
-    return snap
+    return ipc.fresh_snapshot()
 
 
 def _ro_conn() -> sqlite3.Connection:
@@ -184,9 +152,9 @@ def api_tasks() -> dict:
         try:
             for r in conn.execute(
                     """SELECT task_id,
-                              SUM(CASE WHEN status IN ('QUEUED','BACKOFF','PAUSED','RECOVERING')
+                              SUM(CASE WHEN status IN ('QUEUED','BACKOFF','PAUSED')
                                   THEN 1 ELSE 0 END) waiting,
-                              SUM(CASE WHEN status IN ('FAILED','RECOVERY_BLOCKED')
+                              SUM(CASE WHEN status IN ('FAILED')
                                   THEN 1 ELSE 0 END) attention,
                               SUM(CASE WHEN status IN ('SUCCEEDED','CANCELLED')
                                   THEN 1 ELSE 0 END) finished
@@ -230,13 +198,13 @@ def api_tasks() -> dict:
 
 
 _VALID_STATUS = {v for v in vars(dbmod.JobStatus).values() if isinstance(v, str)}
-# 运维四分法（状态大类）：内部等待细分（排队/退避/暂停/恢复核实）全部自动恢复，
-# 归"等待中"；RECOVERY_BLOCKED 不自愈，与 FAILED 同归"需处理"。
+# 运维四分法（状态大类）：内部等待细分（排队/退避/暂停）全部自动恢复，
+# 归"等待中"；FAILED 不自愈，归"需处理"。
 _STATUS_GROUPS = {
     "RUNNING_ACTIVE": ("STARTING", "RUNNING", "PAUSING"),
-    "WAITING": ("QUEUED", "BACKOFF", "PAUSED", "RECOVERING"),
+    "WAITING": ("QUEUED", "BACKOFF", "PAUSED"),
     "FINISHED": ("SUCCEEDED", "CANCELLED"),
-    "ATTENTION": ("FAILED", "RECOVERY_BLOCKED"),
+    "ATTENTION": ("FAILED",),
 }
 
 
@@ -317,14 +285,10 @@ def api_attempt_events(attempt_id: str, limit: int = 300) -> tuple[dict, int]:
         rows = conn.execute(
             "SELECT seq, kind, payload, at FROM events WHERE attempt_id=? "
             "ORDER BY seq DESC LIMIT ?", (attempt_id, int(limit))).fetchall()
-        cps = conn.execute(
-            "SELECT cp_seq, ref, at FROM checkpoints WHERE attempt_id=? "
-            "ORDER BY cp_seq DESC LIMIT 50", (attempt_id,)).fetchall()
     finally:
         conn.close()
     events = _parse_json_cols([dict(r) for r in rows], "payload")
-    return {"attempt": dict(att), "events": events,
-            "checkpoints": [dict(c) for c in cps]}, 200
+    return {"attempt": dict(att), "events": events}, 200
 
 
 def api_attempt_log(attempt_id: str, tail: int = 200) -> tuple[dict, int]:
@@ -488,9 +452,9 @@ def _metrics_sampler() -> None:
                        "mem": snap["exec_mem_mb"], "io": round(io_bps, 1) if io_bps is not None else None,
                        "queued": snap["queued"], "live": snap["live_attempts"],
                        "jRunning": jc.get("STARTING", 0) + jc.get("RUNNING", 0) + jc.get("PAUSING", 0),
-                       "jWaiting": jc.get("QUEUED", 0) + jc.get("BACKOFF", 0) + jc.get("PAUSED", 0) + jc.get("RECOVERING", 0),
+                       "jWaiting": jc.get("QUEUED", 0) + jc.get("BACKOFF", 0) + jc.get("PAUSED", 0),
                        "jFinished": jc.get("SUCCEEDED", 0) + jc.get("CANCELLED", 0),
-                       "jAttention": jc.get("FAILED", 0) + jc.get("RECOVERY_BLOCKED", 0),
+                       "jAttention": jc.get("FAILED", 0),
                        "producers": sum(1 for p in snap.get("producers", [])
                                         if p.get("alive"))}
                 with _metrics_lock:
@@ -536,20 +500,19 @@ def api_metrics(rng: str = "24h") -> dict:
 
 
 def _wait_ack(cmd_id: str, wait_sec: float) -> dict | None:
-    deadline = time.monotonic() + wait_sec
-    while time.monotonic() < deadline:
-        for ack in store.read_jsonl(config.commands_ack_file()):
-            if ack.get("id") == cmd_id:
-                return ack
-        time.sleep(0.15)
-    return None
+    return ipc.wait_answers({cmd_id}, wait_sec).get(cmd_id)
+
+
+# 控制台可用命令类型（serve 侧 _exec_command 必须能处理；pause_attempt 为协作
+# 暂停——任务级停止用它，此前批量入口遗漏该类型导致 Web"停止任务"恒失败）
+_CMD_KINDS = ("cancel_job", "requeue_job", "cancel_attempt", "pause_attempt")
 
 
 def api_command_batch(kind: str, targets: list, reason: str) -> tuple[dict, int]:
     """批量控制命令：一次写入 N 条 → serve 一轮主循环批量消费 → 回执一次收齐。
     比逐条 POST 快一个数量级（50 条 ≈ 2s vs 90s+）。requeue/cancel 幂等，全量提交安全。
     """
-    if kind not in ("cancel_job", "requeue_job", "cancel_attempt"):
+    if kind not in _CMD_KINDS:
         return {"error": f"未知命令类型：{kind}"}, 400
     if not isinstance(targets, list) or not targets:
         return {"error": "targets 必须是非空数组"}, 400
@@ -559,24 +522,13 @@ def api_command_batch(kind: str, targets: list, reason: str) -> tuple[dict, int]
         return {"error": "targets 含非法项"}, 400
     reason = (reason or "").strip() or "Web 控制台批量操作"
     if _serve_alive():
-        cmds = [{"id": runner.new_id("cmd"), "kind": kind, "target": t,
-                 "reason": reason, "ts": runner.now_iso()} for t in targets]
         try:
-            for c in cmds:
-                store.append_jsonl(config.commands_file(), c)
+            cmds = ipc.enqueue_many(kind, targets, reason)
         except OSError as e:
             return {"error": f"写入命令通道失败：{e}"}, 500
-        want = {c["id"]: c["target"] for c in cmds}
-        got: dict[str, dict] = {}
         # serve 每 loop_tick（1s）批量消费一轮；等待时长随批量规模放宽，封顶 30s
         wait = min(30.0, config.load_config().control.cmd_ack_wait_sec + len(cmds) * 0.1)
-        deadline = time.monotonic() + wait
-        while time.monotonic() < deadline and len(got) < len(want):
-            for ack in store.read_jsonl(config.commands_ack_file()):
-                if ack.get("id") in want:
-                    got[ack["id"]] = ack
-            if len(got) < len(want):
-                time.sleep(0.15)
+        got = ipc.wait_answers({c["id"] for c in cmds}, wait)
         results = []
         for c in cmds:
             ack = got.get(c["id"])
@@ -589,10 +541,14 @@ def api_command_batch(kind: str, targets: list, reason: str) -> tuple[dict, int]
                                 else str(ack.get("detail") or "失败")})
         ok_n = sum(1 for r in results if r["ok"])
         return {"results": results, "ok": ok_n, "fail": len(results) - ok_n}, 200
-    # serve 不在：直连逐条处理（与 CLI 相同语义）
+    # serve 不在：直连逐条处理（与 CLI 相同语义）；协作暂停无 serve 无法执行
     from . import __main__ as cli
     results = []
     for t in targets:
+        if kind == "pause_attempt":
+            results.append({"target": t, "ok": False,
+                            "detail": "serve 未在线，无法协作暂停"})
+            continue
         try:
             rc = cli._requeue(t, reason) if kind == "requeue_job" else cli._cancel(kind, t, reason)
             results.append({"target": t, "ok": rc == 0,
@@ -604,24 +560,24 @@ def api_command_batch(kind: str, targets: list, reason: str) -> tuple[dict, int]
 
 
 def api_command(kind: str, target: str, reason: str) -> tuple[dict, int]:
-    if kind not in ("cancel_job", "requeue_job", "cancel_attempt"):
+    if kind not in _CMD_KINDS:
         return {"ok": False, "detail": f"未知命令类型：{kind}"}, 400
     if not target:
         return {"ok": False, "detail": "缺少 target"}, 400
     reason = (reason or "").strip() or "Web 控制台操作"
     if _serve_alive():
-        cmd = {"id": runner.new_id("cmd"), "kind": kind, "target": target,
-               "reason": reason, "ts": runner.now_iso()}
+        wait = config.load_config().control.cmd_ack_wait_sec
         try:
-            store.append_jsonl(config.commands_file(), cmd)
+            ack = ipc.send_command(kind, target, reason, wait)
         except OSError as e:
             return {"ok": False, "detail": f"写入命令通道失败：{e}"}, 500
-        ack = _wait_ack(cmd["id"], config.load_config().control.cmd_ack_wait_sec)
         if ack is None:
             return {"ok": False, "detail": "等待 serve 确认超时（serve 可能刚退出）"}, 504
         return {"ok": bool(ack.get("ok")),
                 "detail": "操作成功" if ack.get("ok") else str(ack.get("detail") or "失败")}, 200
-    # serve 不在：直连处理（与 CLI 相同语义）
+    # serve 不在：直连处理（与 CLI 相同语义）；协作暂停无 serve 无法执行
+    if kind == "pause_attempt":
+        return {"ok": False, "detail": "serve 未在线，无法协作暂停"}, 200
     from . import __main__ as cli
     if kind == "requeue_job":
         rc = cli._requeue(target, reason)
@@ -653,11 +609,15 @@ def _wipe_job_files(task_id: str, job_id: str) -> int:
 
 
 def _ensure_job_deleted_column() -> None:
-    """幂等迁移：jobs 表加 deleted 标记（逻辑删除，serve 不感知、默认 0）。"""
+    """幂等迁移：jobs 表加 deleted 标记（逻辑删除，serve 不感知、默认 0）。
+
+    表尚不存在（全新 SCHED_HOME、serve 未初始化过）时跳过——建表由 DB() 的
+    建库流程负责，此处只补列，不对缺失的表执行 ALTER。
+    """
     conn = _rw_conn()
     try:
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)")]
-        if "deleted" not in cols:
+        if cols and "deleted" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
     finally:
         conn.close()
@@ -797,8 +757,6 @@ def api_task_delete(task_id: str) -> tuple[dict, int]:
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM events WHERE attempt_id IN (SELECT attempt_id "
-                         "FROM attempts WHERE job_id IN (SELECT job_id FROM jobs WHERE task_id=?))", (task_id,))
-            conn.execute("DELETE FROM checkpoints WHERE attempt_id IN (SELECT attempt_id "
                          "FROM attempts WHERE job_id IN (SELECT job_id FROM jobs WHERE task_id=?))", (task_id,))
             conn.execute("DELETE FROM attempts WHERE job_id IN (SELECT job_id FROM jobs WHERE task_id=?)", (task_id,))
             conn.execute("DELETE FROM jobs WHERE task_id=?", (task_id,))
@@ -1014,8 +972,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve_static(self, path: str) -> None:
         if path in ("/", ""):
             path = "/index.html"
-        f = (STATIC_DIR / path.lstrip("/")).resolve()
-        if not str(f).startswith(str(STATIC_DIR.resolve())) or not f.is_file():
+        base = STATIC_DIR.resolve()
+        f = (base / path.lstrip("/")).resolve()
+        # is_relative_to（而非字符串前缀）——前缀比较会放行同名前缀的兄弟目录
+        # （如 web_static_x 以 "web_static" 开头），构成目录穿越
+        if not f.is_relative_to(base) or not f.is_file():
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         ctype = self._CTYPES.get(f.suffix.lower(), "application/octet-stream")

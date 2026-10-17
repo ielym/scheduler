@@ -123,46 +123,7 @@ class _FakeAttempt:
         pass
 
 
-# ---------- P0-1 检查点继承 ----------
-
-def test_restore_checkpoint_picks_latest(home):
-    svc = _svc(home)
-    _mk_job(svc.db, "j1")
-    svc.db.create_attempt("att-1", "j1", 1, "tok", "t0")
-    svc.db.update_attempt("att-1", status=JobStatus.PAUSED)  # 关闭在途约束
-    svc.db.create_attempt("att-2", "j1", 2, "tok", "t0")
-    svc.db.update_attempt("att-2", status=JobStatus.PAUSED)
-    _write_cp("att-1", 1, 10, "2026-10-12T01:00:00+00:00")
-    _write_cp("att-2", 2, 20, "2026-10-12T02:00:00+00:00")
-    assert svc._restore_checkpoint("j1", "att-new") is True
-    cp = json.loads((config.run_dir("att-new") / "checkpoint.json").read_text("utf-8"))
-    assert cp["data"] == {"n": 20} and cp["commit_seq"] == 2
-
-
-def test_restore_checkpoint_none_when_no_history(home):
-    svc = _svc(home)
-    _mk_job(svc.db, "j2")
-    svc.db.create_attempt("att-3", "j2", 1, "tok", "t0")
-    assert svc._restore_checkpoint("j2", "att-new2") is False
-    assert not (config.run_dir("att-new2") / "checkpoint.json").exists()
-
-
-def test_launch_copies_checkpoint_into_new_run_dir(home, monkeypatch):
-    svc = _svc(home)
-    _write_task(home, "t")
-    _mk_job(svc.db, "j1", task_id="t")
-    svc.db.create_attempt("att-old", "j1", 1, "tok", "t0")
-    svc.db.update_attempt("att-old", status=JobStatus.PAUSED)  # 关闭在途约束
-    _write_cp("att-old", 7, 42, "2026-10-12T01:00:00+00:00")
-
-    monkeypatch.setattr(runner, "launch", lambda aspec, refs: _FakeAttempt())
-    job = svc.db.jobs_in_status(JobStatus.QUEUED, limit=10)[0]
-    assert svc._launch(job, _spec("t")) is True
-    new_att = svc.db.list_attempts(job_id="j1", limit=1)[0]["attempt_id"]
-    assert new_att != "att-old"
-    cp = json.loads((config.run_dir(new_att) / "checkpoint.json").read_text("utf-8"))
-    assert cp["data"] == {"n": 42} and cp["commit_seq"] == 7
-
+# ---------- 检查点：调度器不搬运，SDK 仍可显式读写 ----------
 
 def test_sdk_resume_data_after_restore(home, monkeypatch, tmp_path):
     """恢复链端到端：调度器搬运的检查点能被 worker 侧 CheckpointStore 读回。"""
@@ -208,6 +169,18 @@ def test_finalize_backoff_persists_scale(home):
     # on_shortage 不再收缩目标（退避由 TaskBackoff 承担）：目标保持 3，
     # 但 explore（退避期不扩容）仍持久化，重启不回退
     assert st["run_target"] == 3 and st["mode"] == "explore"
+
+
+def test_finalize_backoff_shrinks_admit_budget(home):
+    """方案 A′：任一任务 exit 75 → 并发预算乘法收缩 max(1, BUDGET//2)。"""
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    svc._admit_budget = 6
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.RUNNING
+    svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
+    assert svc._admit_budget == 3
 
 
 # ---------- TaskBackoff VERIFY 死区（步降暂停最后一个执行→自锁） ----------
@@ -376,7 +349,7 @@ def test_finalize_preserves_pause_initiator_reason(home):
     svc._finalize(_FakeAttempt(returncode=0), meta, runner.now_iso())
     job = svc.db.get_job("j1")
     assert job["status"] == JobStatus.PAUSED
-    assert "心跳超时" in job["reason"] and "断点已保存" in job["reason"]
+    assert "心跳超时" in job["reason"] and "协作暂停" in job["reason"]
 
 
 # ---------- P2-7 事件归属字段 ----------
@@ -448,9 +421,9 @@ def test_decide_outcome_pausing_crash_is_conservative():
     from sched.runner import decide_outcome
     o = decide_outcome(JobStatus.PAUSING, 1, False)
     assert o.status == JobStatus.PAUSED
-    assert "断点可能未保存" in o.reason
+    assert "重新排队" in o.reason
     o0 = decide_outcome(JobStatus.PAUSING, 0, False)
-    assert o0.status == JobStatus.PAUSED and o0.reason == "协作暂停，断点已保存"
+    assert o0.status == JobStatus.PAUSED and o0.reason == "协作暂停"
     o75 = decide_outcome(JobStatus.PAUSING, 75, False)
     assert o75.status == JobStatus.BACKOFF
 

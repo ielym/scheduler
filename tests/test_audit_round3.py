@@ -1,8 +1,7 @@
 """第三轮审计修复的专项回归。
 
 覆盖本轮新语义的直接单测（不依赖真实子进程，端到端由 test_integration.py 覆盖）：
-- 磁盘完成核实（_disk_completed / _recover / _tick_recover）：worker 已写完成事件
-  但调度器未及入库时，重启恢复确认成功而非重放；
+- 重启冷启动：遗留执行按 cgroup 归属终止、attempt 清除、作业回 QUEUED（无完成核实）；
 - receiver task_id 不匹配分支补写 invalid 回执（回执闭环）；
 - 就绪 JSON workdir 包含校验 + task_id 格式校验（防越权）；
 - cmd_task enable/disable 容错与启用前校验；
@@ -64,87 +63,6 @@ def _ready(job_id, task_id="t1"):
         "schema_version": 1, "job_id": job_id, "task_id": task_id,
         "entry_args": [], "env": {}, "idempotency_key": job_id,
     })
-
-
-def _write_disk_completed(home, attempt_id, job_id, seq=1, line_attempt_id=None):
-    rd = home / "runtime" / "runs" / attempt_id
-    rd.mkdir(parents=True, exist_ok=True)
-    ev = {"seq": seq, "kind": "done", "at": "2026-10-12T00:00:00+08:00",
-          "job_id": job_id, "attempt_id": line_attempt_id or attempt_id,
-          "record": {"ok": True}}
-    with (rd / "events.jsonl").open("a", encoding="utf-8") as f:
-        f.write(json.dumps(ev) + "\n")
-
-
-# ---------- 磁盘完成核实 ----------
-class TestDiskCompleted:
-    def test_missing_file_is_false(self, home):
-        svc = _svc(home)
-        assert svc._disk_completed("att-none") is False
-
-    def test_ingests_completed_and_dedups(self, home):
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        _write_disk_completed(home, "att-1", "j-1")
-        assert svc._disk_completed("att-1") is True
-        assert db.has_event_kind("att-1", "done")
-        # 幂等：重复核实不重复入库
-        assert svc._disk_completed("att-1") is True
-        with db._lock:
-            n = db._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-        assert n == 1
-
-    def test_ignores_mismatched_attempt_line(self, home):
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        _write_disk_completed(home, "att-1", "j-1", line_attempt_id="att-OTHER")
-        assert svc._disk_completed("att-1") is False
-        assert not db.has_event_kind("att-1", "done")
-
-    def test_recover_confirms_disk_completed_not_requeue(self, home):
-        # worker 完成并落盘、调度器崩溃未入库 → 重启恢复确认成功（不重跑）
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        db.update_attempt("att-1", pid=999999999, pgid=999999999,
-                          pid_start_time=12345.0)
-        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
-        _write_disk_completed(home, "att-1", "j-1")
-        svc._recover()
-        assert db.get_job("j-1")["status"] == JobStatus.SUCCEEDED
-        assert db.get_attempt("att-1")["status"] == JobStatus.SUCCEEDED
-
-    def test_tick_recover_confirms_disk_completed(self, home):
-        # 协作退出宽限中旧 worker 落盘完成事件 → 确认成功而非按检查点重放
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        db.update_attempt("att-1", pid=999999999, pgid=999999999,
-                          pid_start_time=12345.0)
-        db.set_job_status("j-1", JobStatus.RECOVERING, "", "now")
-        att = db.get_attempt("att-1")
-        svc._recover_wait["att-1"] = (att, 0.0)  # 宽限已过
-        _write_disk_completed(home, "att-1", "j-1")
-        svc._tick_recover(10.0)
-        assert db.get_job("j-1")["status"] == JobStatus.SUCCEEDED
-        assert "att-1" not in svc._recover_wait
-
-    def test_recover_status_uses_disk_fallback(self, home):
-        # 运行期 RECOVERING（退出 0 无入库完成记录）经磁盘核实自动确认
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        db.set_job_status("j-1", JobStatus.RECOVERING, "", "now")
-        _write_disk_completed(home, "att-1", "j-1")
-        svc._tick_recover_status()
-        assert db.get_job("j-1")["status"] == JobStatus.SUCCEEDED
 
 
 # ---------- receiver：task_id 不匹配回执 ----------
@@ -313,57 +231,25 @@ class TestOOMYieldCandidate:
         assert svc._choose_oom_yield_candidate("att-victim") is None
 
 
-# ---------- 遗留行恢复安全化 ----------
-class TestLegacyRowRecovery:
-    def test_dead_pid_legacy_requeued(self, home):
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        db.update_attempt("att-1", pid=999999999, pgid=999999999)  # 无 pid_start_time
-        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
-        svc._recover()
-        assert db.get_job("j-1")["status"] == JobStatus.QUEUED
-
-    def test_alive_pid_without_identity_blocked(self, home):
-        # pid 存活但无启动时间身份、无 cgroup 归属 → 不盲目重放，人工核实
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        db.update_attempt("att-1", pid=os.getpid(), pgid=os.getpid())
-        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
-        svc._recover()
-        assert db.get_job("j-1")["status"] == JobStatus.RECOVERY_BLOCKED
-
-    def test_alive_pid_killed_via_cgroup_then_requeued(self, home, monkeypatch):
+# ---------- 遗留行冷启动处理 ----------
+class TestLegacyRowReinit:
+    def test_leftover_proc_killed_via_cgroup_and_requeued(self, home, monkeypatch):
+        # 重启冷启动：遗留执行按 cgroup 整组终止，attempt 与工件删除，作业回 QUEUED
         svc = _svc(home)
         db = svc.db
         db.upsert_job(_ready("j-1"), "h1", "now", 50)
         db.create_attempt("att-1", "j-1", 1, "tok", "now")
         db.update_attempt("att-1", pid=os.getpid(), pgid=os.getpid(),
-                          cgroup="t/att-1")
+                          pid_start_time=12345.0, cgroup="t/att-1")
         db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
         from sched import cgroup as cg
         killed: list[str] = []
-        monkeypatch.setattr(cg.Cgroup, "procs", lambda self: [4321])
         monkeypatch.setattr(cg.Cgroup, "kill_all",
                             lambda self: killed.append(self.name))
-        svc._recover()
+        svc._reinitialize()
         assert killed == ["t/att-1"]
         assert db.get_job("j-1")["status"] == JobStatus.QUEUED
-
-    def test_alive_pid_with_empty_cgroup_blocked(self, home):
-        # cgroup 记录存在但里面没有进程（pid 疑似被复用）→ 不能确认归属
-        svc = _svc(home)
-        db = svc.db
-        db.upsert_job(_ready("j-1"), "h1", "now", 50)
-        db.create_attempt("att-1", "j-1", 1, "tok", "now")
-        db.update_attempt("att-1", pid=os.getpid(), pgid=os.getpid(),
-                          cgroup="t/att-empty")
-        db.set_job_status("j-1", JobStatus.RUNNING, "", "now")
-        svc._recover()
-        assert db.get_job("j-1")["status"] == JobStatus.RECOVERY_BLOCKED
+        assert db.get_attempt("att-1") is None
 
 
 # ---------- skill 模板 ----------

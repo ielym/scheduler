@@ -40,8 +40,6 @@ class JobStatus:
     BACKOFF = "BACKOFF"          # 资源不足已退出、等待到期探测
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"            # 业务逻辑 / 未知非资源失败
-    RECOVERING = "RECOVERING"
-    RECOVERY_BLOCKED = "RECOVERY_BLOCKED"
     CANCELLED = "CANCELLED"      # 显式取消
 
     # 存活状态：STARTING/RUNNING/PAUSING 及尚未确认退出的状态都算存活
@@ -143,7 +141,10 @@ class ControlConfig(BaseModel):
     producer_restart_base_sec: float = 1.0  # 生产者崩溃退避起点
     producer_restart_cap_sec: float = 30.0  # 生产者崩溃退避上限
     producer_crash_reset_after_sec: float = 300.0  # 崩溃退避连续无崩溃后的复位
-    start_interval_sec: float = 1.0         # 全局启动间隔（错开启动，防突发）
+    # 启动节奏（方案 A′：反馈轴限速，取代时间轴令牌制）
+    admit_budget_init: int = 1              # 冷启动并发预算：全局“在途未验证新启动数”上限（AIMD 自稳，无硬上限）
+    pending_verify_flat_samples: int = 2    # 次级验证：全局执行内存连续不增长的采样数
+    task_backoff_restore_steps: int = 2     # VERIFY/EMPTY → NORMAL 需连续 N 步且期间无新 75
     exec_mem_cap_ratio: float = 0.80        # 资源水位 SHED 线：执行内存占机器 ≥ 此值即停新增+撤内存（单采样）
     grow_observe_sec: float = 30.0          # 扩容观察期初值
     pause_grace_base_sec: float = 10.0      # 暂停宽限节奏初值

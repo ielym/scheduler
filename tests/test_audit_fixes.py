@@ -3,7 +3,7 @@
 编号与审查报告一致：
 #1  reap_orphans exclude 保护协作退出 worker
 #2  _is_slow 速率差分（累计值不重复求和）
-#3  RECOVERY_BLOCKED 持续核实 + requeue_job
+#3  requeue_job（人工重排）
 #4  生产者空事件轮次游标持久化
 #5  准入同级任务轮转
 #6  反馈间隔契约（STARTED 申报 → 心跳超时/暂停宽限推导）
@@ -117,18 +117,24 @@ def test_is_slow_uses_rate_differential(home):
     assert h._is_slow(dq2)
 
 
-# ---------- #3 requeue_job + RECOVERY_BLOCKED 持续核实 ----------
+# ---------- #3 requeue_job（人工重排） ----------
 def test_requeue_job_unit(home):
     svc = _svc(home)
     d = svc.db
     _mk_job(d, "j-rq")
     d.create_attempt("a1", "j-rq", 1, "tok", "now")
-    d.set_job_status("j-rq", JobStatus.RECOVERY_BLOCKED, "test", "now")
+    d.set_job_status("j-rq", JobStatus.PAUSED, "test", "now")
+    d.update_attempt("a1", status=JobStatus.PAUSED)
     assert svc.requeue_job("j-rq", "测试重排") is True
     assert d.get_job("j-rq")["status"] == JobStatus.QUEUED
     atts = d.list_attempts(job_id="j-rq")
     assert atts and atts[0]["status"] == JobStatus.CANCELLED
     assert "重排关闭" in (atts[0].get("reason") or "")
+    # FAILED 终态作业也可人工重排（无遗留 attempt）
+    _mk_job(d, "j-fail")
+    d.set_job_status("j-fail", JobStatus.FAILED, "业务失败", "now")
+    assert svc.requeue_job("j-fail") is True
+    assert d.get_job("j-fail")["status"] == JobStatus.QUEUED
     # 不存在的作业
     assert svc.requeue_job("nope") is False
     # 运行中拒绝
@@ -136,33 +142,6 @@ def test_requeue_job_unit(home):
     d.set_job_status("j-run", JobStatus.RUNNING, "test", "now")
     assert svc.requeue_job("j-run") is False
     assert d.get_job("j-run")["status"] == JobStatus.RUNNING
-
-
-def test_recovering_without_completion_becomes_blocked(home):
-    svc = _svc(home)
-    d = svc.db
-    _mk_job(d, "j-rc")
-    d.create_attempt("a1", "j-rc", 1, "tok", "now")
-    d.set_job_status("j-rc", JobStatus.RECOVERING, "test", "now")
-    svc._tick_recover_status(0.0)
-    assert d.get_job("j-rc")["status"] == JobStatus.RECOVERY_BLOCKED
-    assert svc._stats["recovery_blocked_total"] == 1
-
-
-def test_recovery_blocked_recheck_unblocks_on_late_completion(home):
-    svc = _svc(home)
-    d = svc.db
-    _mk_job(d, "j-late")
-    d.create_attempt("a1", "j-late", 1, "tok", "now")
-    d.set_job_status("j-late", JobStatus.RECOVERY_BLOCKED, "test", "now")
-    # 第一次复核：无 completed → 维持阻塞
-    svc._tick_recover_status(31.0)
-    assert d.get_job("j-late")["status"] == JobStatus.RECOVERY_BLOCKED
-    # 迟到的 done 事件到达 → 自动确认成功
-    d.append_event("a1", 5, EventKind.DONE, {"record": {"ok": True}}, "now")
-    svc._tick_recover_status(100.0)
-    assert d.get_job("j-late")["status"] == JobStatus.SUCCEEDED
-    assert d.list_attempts(job_id="j-late")[0]["status"] == JobStatus.SUCCEEDED
 
 
 # ---------- #4 生产者空事件轮次游标持久化 ----------

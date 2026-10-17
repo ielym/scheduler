@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import config
+from . import proc as procmod
 
 log = logging.getLogger("sched.producer")
 
@@ -50,7 +51,7 @@ class ProducerProc:
     def alive(self) -> bool:
         if self.proc is not None:
             return self.proc.poll() is None
-        return _pid_alive(self.pid, self.start_time)
+        return procmod.alive(self.pid, self.start_time)
 
 
 def _build_argv(task_root: Path, entry: config.EntrySpec) -> list[str]:
@@ -71,38 +72,6 @@ def _build_env(task_id: str, task_root: Path) -> dict[str, str]:
     env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + existing if existing else "")
     env["PYTHONUNBUFFERED"] = "1"
     return env
-
-
-def _proc_start_time(pid: int) -> float:
-    try:
-        return os.stat(f"/proc/{pid}").st_ctime
-    except OSError:
-        return 0.0
-
-
-def _pid_alive(pid: int, expect_start_time: float) -> bool:
-    try:
-        if os.stat(f"/proc/{pid}").st_ctime != expect_start_time:
-            return False  # PID 复用：启动时间不一致即非本人
-    except OSError:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    # 僵尸态不算存活（父进程未 wait 时退出进程以僵尸态留在 /proc）
-    return not _proc_zombie(pid)
-
-
-def _proc_zombie(pid: int) -> bool:
-    try:
-        data = open(f"/proc/{pid}/stat", "rb").read()
-        state = data.rsplit(b")", 1)[1].split()[0][:1]
-        return state in ("Z", "x", "X")
-    except (OSError, IndexError, ValueError):
-        return False
 
 
 def _producer_lock_path(task_id: str) -> Path:
@@ -161,7 +130,7 @@ class ProducerGuard:
         # 接管：上个调度器遗留的生产者仍持有任务级单实例锁
         if _lock_busy(task_id):
             holder = _read_lock_holder(task_id)
-            if holder and _pid_alive(holder[0], holder[1]):
+            if holder and procmod.alive(holder[0], holder[1]):
                 with self._lock:
                     self._procs[task_id] = ProducerProc(
                         task_id=task_id, proc=None, pid=holder[0],
@@ -212,7 +181,7 @@ class ProducerGuard:
                     except OSError:
                         pass
         pp = ProducerProc(task_id=task_id, proc=proc, pid=proc.pid,
-                          start_time=_proc_start_time(proc.pid))
+                          start_time=procmod.start_time(proc.pid))
         with self._lock:
             self._procs[task_id] = pp
         return True
@@ -328,7 +297,7 @@ class ProducerGuard:
                 pass
         else:
             deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline and _pid_alive(pp.pid, pp.start_time):
+            while time.monotonic() < deadline and procmod.alive(pp.pid, pp.start_time):
                 time.sleep(0.1)
 
     def list(self) -> list[dict]:

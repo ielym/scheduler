@@ -132,40 +132,26 @@ def test_terminate_external_default_cgroup_no_crash(home, monkeypatch):
             pass
 
 
-def test_tick_recover_grace_timeout_cgroup_kill(home, monkeypatch):
-    """重启回收宽限超时：强杀旧进程树时 cgroup 可用则整组终止（A1）。"""
+def test_reinitialize_leftover_uses_cgroup_kill(home, monkeypatch):
+    """冷启动清理遗留执行：cgroup 归属可用时整组终止（A1）。"""
     svc = _svc(home)
     _mk_job(svc.db, "j1")
     svc.db.create_attempt("att-1", "j1", 1, "tok", runner.now_iso(),
                           cgroup="t/att-1")
-    proc = _spawn_sleep()
-    try:
-        att = {"attempt_id": "att-1", "job_id": "j1", "pid": proc.pid,
-               "pgid": proc.pid + 12345, "pid_start_time": _proc_start(proc.pid),
-               "cgroup": "t/att-1"}
-        svc._recover_wait["att-1"] = (att, time.monotonic() - 1.0)  # 已到期
-        calls: list[str] = []
+    svc.db.set_job_status("j1", JobStatus.RUNNING, "", runner.now_iso())
+    calls: list[str] = []
 
-        def fake_cgroup(name):
-            class _C:
-                def kill_all(self):
-                    calls.append(name)
-                    os.kill(proc.pid, signal.SIGKILL)
-                    proc.wait(timeout=5)
-            return _C()
+    def fake_cgroup(name):
+        class _C:
+            def kill_all(self):
+                calls.append(name)
+        return _C()
 
-        monkeypatch.setattr("sched.cgroup.Cgroup", fake_cgroup)
-        svc._tick_recover(time.monotonic())
-        assert calls == ["t/att-1"]
-        assert "att-1" not in svc._recover_wait
-        assert svc.db.get_job("j1")["status"] == JobStatus.QUEUED
-        assert svc.db.get_attempt("att-1")["status"] == JobStatus.PAUSED
-    finally:
-        try:
-            proc.kill()
-            proc.wait(timeout=5)
-        except Exception:
-            pass
+    monkeypatch.setattr("sched.cgroup.Cgroup", fake_cgroup)
+    svc._reinitialize()
+    assert calls == ["t/att-1"]
+    assert svc.db.get_job("j1")["status"] == JobStatus.QUEUED
+    assert svc.db.get_attempt("att-1") is None
 
 
 # ---------- A2：保护门槛限高优先级 ----------

@@ -1,12 +1,16 @@
-"""检查点存储（worker 侧）。
+"""检查点存储（worker 侧，调度器不感知/不管理）。
 
-调度器不理解业务检查点内容；SDK 只负责原子读写与提交编号递增。
-检查点结构（设计文档第七节）：
+调度器只负责作业状态调度，不搬运、不读取、不校验断点；断点是**任务自行**
+的恢复实践。SDK 提供的是一个便利的本地原子读写设施，默认落在本次 attempt 的
+run_dir（`SCHED_RUN_DIR/checkpoint.json`）。跨 attempt 的持久化由任务自行负责
+（例如把进度写到自己的工作目录），调度器不会把上一 attempt 的断点带过来。
+
+检查点结构：
   {format_version, input_ref, business_version, progress, commit_seq, checksum, data}
 
-写入：临时文件 + fsync + os.replace，保证调度器永远读不到半写检查点。
-checksum（B4）：业务数据规范化 JSON 的 sha256 前 32 位——读回校验不一致
-（磁盘损坏/半写被外部替换）时丢弃断点并大声告警，宁可从零重放也不带病恢复。
+写入：临时文件 + fsync + os.replace，保证读不到半写检查点。
+checksum：业务数据规范化 JSON 的 sha256 前 32 位——读回校验不一致（磁盘损坏/
+半写被外部替换）时丢弃断点并大声告警，宁可从零重放也不带病恢复。
 """
 
 from __future__ import annotations
@@ -22,10 +26,15 @@ from typing import Any
 
 
 def checkpoint_file() -> Path:
+    """检查点文件位置：优先 SCHED_CHECKPOINT_FILE（显式指定），否则本次
+    attempt 的 run_dir（SCHED_RUN_DIR/checkpoint.json）。"""
     v = os.environ.get("SCHED_CHECKPOINT_FILE")
-    if not v:
-        raise RuntimeError("SCHED_CHECKPOINT_FILE 未设置（非调度器启动？）")
-    return Path(v)
+    if v:
+        return Path(v)
+    run_dir = os.environ.get("SCHED_RUN_DIR")
+    if run_dir:
+        return Path(run_dir) / "checkpoint.json"
+    raise RuntimeError("SCHED_RUN_DIR 未设置（非调度器启动？）")
 
 
 def _data_checksum(data: Any) -> str:
