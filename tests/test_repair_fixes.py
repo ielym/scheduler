@@ -4,7 +4,7 @@ P0-1  跨 attempt 检查点继承：_launch 前把旧检查点复制进新 run_d
 P0-2  explore→steady 恢复链：on_success 恢复 steady；on_shortage 后持久化动态目标
 P1-3  consume_receipts 仅 status==received 才 ack（conflict/invalid 不误删）
 P1-4  Producer.advance 先持久化再推进内存游标（持久化失败不丢事件）
-P1-5  心跳过期暂停的作业恢复排队前冷却（防每秒重启循环）；_finalize 保留暂停发起原因
+P1-5  事件静默超时暂停的作业恢复排队前冷却（防每秒重启循环）；_finalize 保留暂停发起原因
 P2-7  SDK 事件每行自带 job_id/attempt_id 归属
 P2-8  归档对账：archive 文件数 vs 库内作业数不一致告警
 P2-9  保护起因 cause 标签：变慢退让放回间隔加倍
@@ -343,23 +343,23 @@ def test_advance_failure_then_retry_succeeds(monkeypatch, tmp_path):
     assert len(p._state["unacked"]) == 2
 
 
-# ---------- P1-5 心跳过期恢复冷却 + 暂停原因保留 ----------
+# ---------- P1-5 事件静默超时恢复冷却 + 暂停原因保留 ----------
 
-def test_tick_release_heartbeat_cooldown(home):
+def test_tick_release_stale_cooldown(home):
     svc = _svc(home)
     _mk_job(svc.db, "jH")
     _mk_job(svc.db, "jN")
-    hb_reason = "心跳过期，疑似卡住；协作暂停，断点已保存"
+    hb_reason = "事件静默超时，疑似卡住；协作暂停，断点已保存"
     svc.db.set_job_status("jH", JobStatus.PAUSED, hb_reason, ts=runner.now_iso())
     svc.db.set_job_status("jN", JobStatus.PAUSED, "高优先级保护退让；协作暂停，断点已保存",
                           ts=runner.now_iso())
     svc._tick_release(0.0)
-    # 普通暂停立即恢复；心跳过期暂停在冷却窗口内保持 PAUSED
+    # 普通暂停立即恢复；事件静默超时暂停在冷却窗口内保持 PAUSED
     assert svc.db.get_job("jN")["status"] == JobStatus.QUEUED
     assert svc.db.get_job("jH")["status"] == JobStatus.PAUSED
     # 冷却（默认 60s）过后恢复排队
     old = (datetime.now(timezone.utc) -
-           timedelta(seconds=svc.cfg.control.heartbeat_resume_cooldown_sec + 60)
+           timedelta(seconds=svc.cfg.control.stale_pause_cooldown_sec + 60)
            ).isoformat(timespec="seconds")
     svc.db.set_job_status("jH", JobStatus.PAUSED, hb_reason, ts=old)
     svc._tick_release(0.0)
@@ -372,11 +372,11 @@ def test_finalize_preserves_pause_initiator_reason(home):
     svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
     meta = AttMeta("a1", "j1", "t", 50, "tok")
     meta.status = JobStatus.PAUSING
-    meta.pause_command = {"reason": "心跳过期，疑似卡住"}
+    meta.pause_command = {"reason": "事件静默超时，疑似卡住"}
     svc._finalize(_FakeAttempt(returncode=0), meta, runner.now_iso())
     job = svc.db.get_job("j1")
     assert job["status"] == JobStatus.PAUSED
-    assert "心跳过期" in job["reason"] and "断点已保存" in job["reason"]
+    assert "事件静默超时" in job["reason"] and "断点已保存" in job["reason"]
 
 
 # ---------- P2-7 事件归属字段 ----------

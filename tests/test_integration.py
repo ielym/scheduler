@@ -45,8 +45,8 @@ def _fast_config(home):
     c.sample_interval_sec = 0.5
     c.start_interval_sec = 0.2
     c.grow_observe_sec = 2.0
-    c.heartbeat_interval_sec = 1.0
-    c.heartbeat_stale_sec = 8.0
+    c.feedback_interval_init_sec = 1.0
+    c.staleness_min_sec = 8.0
     c.starting_timeout_sec = 30.0
     c.shortage_retry_base_sec = 0.5
     c.shortage_retry_cap_sec = 2.0

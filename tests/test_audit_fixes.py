@@ -6,7 +6,7 @@
 #3  RECOVERY_BLOCKED 持续核实 + requeue_job
 #4  生产者空事件轮次游标持久化
 #5  准入同级任务轮转
-#6  反馈间隔契约（STARTED 申报 → 心跳过期/暂停宽限推导）
+#6  反馈间隔契约（STARTED 申报 → 事件静默超时/暂停宽限推导）
 #8  监控统计（task_monitor / 生产者状态摘要）
 #9  events.jsonl 增量读 + 轮转重置；SDK 事件文件 16MB 轮转
 #10 jobs_in_status 过滤与 LIMIT
@@ -215,20 +215,20 @@ def test_started_event_sets_feedback_interval(home):
 def test_feedback_interval_derives_thresholds(home):
     svc = _svc(home)
     c = svc.cfg.control
-    c.heartbeat_stale_sec = 10.0
-    c.heartbeat_stale_multiplier = 3.0
+    c.staleness_min_sec = 10.0
+    c.staleness_multiplier = 3.0
     meta = AttMeta("a", "j", "t", 50, "tok")
-    # 未观测到事件 → 用全局心跳间隔默认值
-    assert svc._heartbeat_stale_threshold(meta) == pytest.approx(15.0)
+    # 未观测到事件 → 用全局反馈间隔默认值
+    assert svc._staleness_threshold(meta) == pytest.approx(15.0)
     # 观测到 2s 反馈间隔 → 阈值回落到配置下限
     svc.timing.note_event("t", 0.0)
     svc.timing.note_event("t", 2.0)
     assert svc.timing.feedback_interval("t") == pytest.approx(2.0)
-    assert svc._heartbeat_stale_threshold(meta) == pytest.approx(10.0)
+    assert svc._staleness_threshold(meta) == pytest.approx(10.0)
     # 暂停宽限：无观测 → 基值
     assert svc._pause_grace_sec(meta) == pytest.approx(c.pause_grace_base_sec)
     # 观测到 100s 反馈间隔 → 宽限抬升并封顶
-    svc.timing = scaling.TaskTiming(default_interval_sec=c.heartbeat_interval_sec)
+    svc.timing = scaling.TaskTiming(default_interval_sec=c.feedback_interval_init_sec)
     svc.timing.note_event("t", 0.0)
     svc.timing.note_event("t", 100.0)
     assert svc._pause_grace_sec(meta) == pytest.approx(c.pause_grace_max_sec)
@@ -266,7 +266,7 @@ def _bare_run(tmp_path):
 def test_read_events_incremental_and_rotation(home, tmp_path):
     p = tmp_path / "events.jsonl"
     a = _bare_run(tmp_path)
-    p.write_text('{"seq":1,"kind":"started"}\n{"seq":2,"kind":"heartbeat"}\n')
+    p.write_text('{"seq":1,"kind":"started"}\n{"seq":2,"kind":"error"}\n')
     evs = a.read_events(0)
     assert [e["seq"] for e in evs] == [1, 2]
     assert a._read_offset == p.stat().st_size  # 偏移推进
@@ -279,7 +279,7 @@ def test_read_events_incremental_and_rotation(home, tmp_path):
         f.write('{"seq":4,"ki')
     assert a.read_events(3) == []
     with open(p, "a") as f:
-        f.write('nd":"heartbeat"}\n')
+        f.write('nd":"error"}\n')
     assert [e["seq"] for e in a.read_events(3)] == [4]
     # 轮转/截断 → size < offset → 重置游标从头读
     p.write_text('{"seq":1,"kind":"started"}\n')
@@ -293,12 +293,12 @@ def test_sdk_event_writer_rotation(tmp_path, monkeypatch):
     p.write_text("x" * 150)  # 预置超限内容
     w = EventWriter()
     monkeypatch.setattr(EventWriter, "_ROTATE_BYTES", 120)
-    w.emit("heartbeat")
+    w.emit("error")
     # 旧内容原子轮转到 .1，新事件从空文件续写
     assert (tmp_path / "events.jsonl.1").read_text() == "x" * 150
     lines = p.read_text().strip().splitlines()
     assert len(lines) == 1
-    assert json.loads(lines[0])["kind"] == "heartbeat"
+    assert json.loads(lines[0])["kind"] == "error"
 
 
 # ---------- #10 jobs_in_status 过滤与 LIMIT ----------

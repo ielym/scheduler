@@ -335,21 +335,6 @@ def test_shortage_exit_commits_checkpoint(monkeypatch, tmp_path):
     assert obj["commit_seq"] == 2  # 重提交递增了提交编号
 
 
-# ---------- 模块级 report_progress 单调校验 ----------
-
-def test_module_level_progress_monotonic(monkeypatch, tmp_path):
-    monkeypatch.setenv("SCHED_ATTEMPT_ID", "att-3")
-    ev = tmp_path / "ev3.jsonl"
-    monkeypatch.setenv("SCHED_EVENT_FILE", str(ev))
-    import sched_task_sdk.executor as ex
-    ex._module_last_cu = None
-    ex.report_progress(5)
-    ex.report_progress(5)   # 持平合法
-    with pytest.raises(ValueError):
-        ex.report_progress(4)  # 回退抛错
-    ex._module_last_cu = None
-
-
 # ---------- SDK 分目录发布 ----------
 
 def test_sdk_publish_subdir(monkeypatch, tmp_path):

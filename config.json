@@ -4,7 +4,7 @@
   "control": {
     "loop_tick_sec": 1.0,
     "sample_interval_sec": 2.0,
-    "heartbeat_interval_sec": 5.0,
+    "feedback_interval_init_sec": 5.0,
     "producer_restart_base_sec": 1.0,
     "producer_restart_cap_sec": 30.0,
     "producer_crash_reset_after_sec": 300.0,
@@ -21,8 +21,8 @@
     "slow_confidence_sec": 120.0,
     "recovery_probe_sec": 60.0,
     "scan_batch_size": 200,
-    "heartbeat_stale_sec": 30.0,
-    "heartbeat_stale_multiplier": 6.0,
+    "staleness_min_sec": 30.0,
+    "staleness_multiplier": 6.0,
     "starting_timeout_sec": 60.0,
     "resource_unhealthy_ratio": 0.9,
     "resource_healthy_ratio": 0.7,
@@ -31,7 +31,7 @@
     "observability_slow_factor": 3.0,
     "recover_grace_sec": 30.0,
     "cmd_ack_wait_sec": 6.0,
-    "heartbeat_resume_cooldown_sec": 60.0,
+    "stale_pause_cooldown_sec": 60.0,
     "cleanup_terminal_after_sec": 604800.0
   }
 }

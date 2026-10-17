@@ -205,7 +205,7 @@ class AttemptRun:
         """整棵进程树 SIGTERM → 等 grace → SIGKILL → cgroup.kill 兜底（防 setsid 漏杀）。
 
         仅用于停机/启动恢复等一次性路径；主循环内请用 begin_terminate/poll_terminate
-        非阻塞状态机——同步等待会冻结整个控制平面（快照/命令/心跳/准入）。
+        非阻塞状态机——同步等待会冻结整个控制平面（快照/命令/事件/准入）。
         接管句柄（proc=None）走外部终止路径（无子进程 wait 权限，按身份核实轮询）。
         """
         self._terminating.set()
@@ -489,7 +489,7 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
     归因优先级：显式控制 > 退出 0 且有持久化完成记录 > 不足（仅退出码 75）>
     退出 0 无完成记录（待核实）> 失败。
 
-    设计第六节：只有约定退出码 75 才是"统一外部不足"——运行期曾报过不足
+    设计第六节：只有约定退出码 75 才是"资源不足"——运行期曾报过不足
     事件不得把其它非零退出扩大为外部争用（业务逻辑错误必须归为 FAILED）。
     """
     from .config import JobStatus, EXIT_SHORTAGE
@@ -505,7 +505,7 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
         if exit_code == EXIT_SHORTAGE:
             # 暂停请求中以外不足退出：断点未必已保存，语义是不足而非已暂停
             return AttemptOutcome(JobStatus.BACKOFF, exit_code,
-                                  "统一外部不足（暂停请求中退出）")
+                                  "资源不足（暂停请求中退出）")
         if exit_code == 0:
             return AttemptOutcome(JobStatus.PAUSED, exit_code, "协作暂停，断点已保存")
         # 非 0/75 退出（崩溃/被杀）：断点可能未保存，保守按 PAUSED 重新排队核实，
@@ -516,7 +516,7 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
     if exit_code == 0 and had_completed:
         return AttemptOutcome(JobStatus.SUCCEEDED, exit_code, "完成")
     if exit_code == EXIT_SHORTAGE:
-        return AttemptOutcome(JobStatus.BACKOFF, exit_code, "统一外部不足")
+        return AttemptOutcome(JobStatus.BACKOFF, exit_code, "资源不足")
     if exit_code == 0 and not had_completed:
         return AttemptOutcome(JobStatus.RECOVERING, exit_code, "退出 0 但无完成记录，待核实")
     if exit_code is None:

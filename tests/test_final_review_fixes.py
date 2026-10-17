@@ -194,7 +194,7 @@ def test_resource_pause_resumes_after_cooldown(home):
     svc = _svc(home)
     _mk_job(svc.db, "jR")
     old = (datetime.now(timezone.utc) -
-           timedelta(seconds=svc.cfg.control.heartbeat_resume_cooldown_sec + 60)
+           timedelta(seconds=svc.cfg.control.stale_pause_cooldown_sec + 60)
            ).isoformat(timespec="seconds")
     _pause_job(svc, "jR", "执行内存不足（OOM 证据）；协作暂停，断点已保存", old)
     svc._tick_release(time.monotonic())
@@ -209,10 +209,10 @@ def test_plain_pause_still_resumes_immediately(home):
     assert svc.db.get_job("jN")["status"] == JobStatus.QUEUED
 
 
-def test_heartbeat_pause_cooldown_unchanged(home):
+def test_stale_pause_cooldown_unchanged(home):
     svc = _svc(home)
     _mk_job(svc.db, "jH")
-    _pause_job(svc, "jH", "心跳过期，疑似卡住；协作暂停，断点已保存")
+    _pause_job(svc, "jH", "事件静默超时，疑似卡住；协作暂停，断点已保存")
     svc._tick_release(time.monotonic())
     assert svc.db.get_job("jH")["status"] == JobStatus.PAUSED
 
@@ -223,7 +223,7 @@ def test_sdk_event_at_is_utc(monkeypatch, tmp_path):
     ev = tmp_path / "events.jsonl"
     monkeypatch.setenv("SCHED_EVENT_FILE", str(ev))
     w = event_writer()
-    w.emit("heartbeat")
+    w.emit("error")
     line = json.loads(ev.read_text("utf-8").splitlines()[0])
     assert str(line["at"]).endswith("+00:00"), "事件 at 必须是 UTC 时间戳"
 

@@ -37,7 +37,7 @@ class JobStatus:
     RUNNING = "RUNNING"
     PAUSING = "PAUSING"
     PAUSED = "PAUSED"
-    BACKOFF = "BACKOFF"          # 外部不足已退出、等待到期探测
+    BACKOFF = "BACKOFF"          # 资源不足已退出、等待到期探测
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"            # 业务逻辑 / 未知非资源失败
     RECOVERING = "RECOVERING"
@@ -138,7 +138,7 @@ def run_dir(attempt_id: str) -> Path:
 class ControlConfig(BaseModel):
     loop_tick_sec: float = 1.0              # 主循环 + 事件消费
     sample_interval_sec: float = 2.0        # 执行资源采样
-    heartbeat_interval_sec: float = 5.0     # 心跳初值
+    feedback_interval_init_sec: float = 5.0     # 反馈间隔 EMA 初值（实测动态更新）
     producer_restart_base_sec: float = 1.0  # 生产者崩溃退避起点
     producer_restart_cap_sec: float = 30.0  # 生产者崩溃退避上限
     producer_crash_reset_after_sec: float = 300.0  # 崩溃退避连续无崩溃后的复位
@@ -156,8 +156,8 @@ class ControlConfig(BaseModel):
     slow_confidence_sec: float = 120.0      # 变慢判定连续证据窗口
     recovery_probe_sec: float = 60.0        # 恢复探测最小机会间隔
     scan_batch_size: int = 200              # 每任务每轮接收时间片（文件数上限）
-    heartbeat_stale_sec: float = 30.0       # 心跳过期阈值下限（不固定，实际取梯形与反馈间隔的较大者）
-    heartbeat_stale_multiplier: float = 6.0 # 心跳过期 = 承诺反馈间隔 × 该倍数（依据实际延迟推导）
+    staleness_min_sec: float = 30.0       # 事件静默超时阈值下限（实际取与实测反馈间隔×倍数的较大者）
+    staleness_multiplier: float = 6.0 # 事件静默超时 = 实测反馈间隔 × 该倍数（依据实际延迟推导）
     starting_timeout_sec: float = 60.0      # STARTING 无 started 事件超时
     resource_unhealthy_ratio: float = 0.9   # 持续超过判定不健康
     resource_healthy_ratio: float = 0.7     # 持续低于判定恢复健康（滞回）
@@ -168,7 +168,7 @@ class ControlConfig(BaseModel):
     task_backoff_probe_cap_sec: float = 600.0   # 探测间隔上限（按级别翻倍递增）
     recover_grace_sec: float = 30.0         # 重启后旧执行进程协作退出宽限
     cmd_ack_wait_sec: float = 6.0           # CLI 控制命令等待确认超时
-    heartbeat_resume_cooldown_sec: float = 60.0  # 心跳过期/OOM/内存增长退让等暂停的作业恢复排队前冷却，防紧密重启循环
+    stale_pause_cooldown_sec: float = 60.0  # 事件静默超时/OOM/内存增长退让等暂停的作业恢复排队前冷却，防紧密重启循环
     cleanup_terminal_after_sec: float = 604800.0  # 已完结作业（成功/取消）attempt 工件保留时长
 
     model_config = {"extra": "forbid"}

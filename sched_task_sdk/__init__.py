@@ -5,24 +5,12 @@
 """
 
 from .errors import EXIT_OK, EXIT_SHORTAGE, EventKind
-from .executor import (
-    ExecutorTask,
-    PauseRequested,
-    Shortage,
-    complete,
-    emit_event,
-    report_error_event,
-    report_progress,
-    report_shortage,
-    run_task,
-)
+from .executor import ExecutorTask, PauseRequested, Shortage, run_task
 from .producer import Producer, ProducerError, atomic_write_json, job_id_of, run_producer
 from .checkpoint import CheckpointStore
 
 __all__ = [
     "ExecutorTask", "Shortage", "PauseRequested", "run_task",
-    "report_progress", "report_shortage", "report_error_event",
-    "complete", "emit_event",
     "Producer", "ProducerError", "job_id_of", "run_producer",
     "atomic_write_json",
     "CheckpointStore",

@@ -1585,7 +1585,7 @@ function renderTimeline(attemptId, diff) {
     const shown = evs.filter(pass);
     list.innerHTML = shown.length ? shown.map(e => _tlItemHtml(e, attemptId)).join("")
       : `<div class="empty" style="padding:14px"><p>${filter === "all"
-          ? "暂无入库事件<br><span style='font-size:10.5px'>心跳仅内存跟踪；进展 / 外部不足 / 检查点 / 完成事件将在此显示</span>"
+          ? "暂无入库事件<br><span style='font-size:10.5px'>进展 / 错误 / 完成事件在此显示</span>"
           : "该类型暂无事件"}</p></div>`;
     _bindTlItems(list);
     det._tlMax[attemptId] = evs.length ? Math.max(...evs.map(e => e.seq)) : 0;

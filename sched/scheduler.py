@@ -3,7 +3,7 @@
 启动：取单实例锁 → 恢复执行数据库与进程身份（完成记录核实 / 旧进程协作退出 /
 按检查点重放 / 身份未知转 RECOVERY_BLOCKED）→ 独立确认所有生产者常驻（任务级单实例锁接管）。
 
-每轮：消费控制命令 → 处理退出/心跳/进展/不足/检查点/控制确认（心跳过期、启动握手
+每轮：消费控制命令 → 处理退出/进展/错误/完成/控制确认（事件静默超时、启动握手
 超时监护）→ 重启恢复推进 → 增量接收（优先级序 + 同级轮转 + 时间片）→ 资源趋势
 （CPU/内存/IO/OOM 滞回，观测不足减速探索）→ 动态目标 / 高优先级保护（优先级防劫持、
 准入门禁、截止延长、改善释放、逐步放回）→ 不足到期重排（指数退避 + 抖动）→
@@ -103,7 +103,7 @@ class SchedulerService:
         self.scaling = scaling.Scaling(self.cfg)
         # 任务级实测 timing EMA（反馈间隔等由调度器自统计，任务不声明）
         self.timing = scaling.TaskTiming(
-            default_interval_sec=self.cfg.control.heartbeat_interval_sec)
+            default_interval_sec=self.cfg.control.feedback_interval_init_sec)
         self.health = scaling.HealthTracker(
             slow_confidence_sec=self.cfg.control.slow_confidence_sec,
             timing=self.timing)
@@ -226,7 +226,7 @@ class SchedulerService:
 
         设计第十二节"重启恢复"要求完成核实不只信执行数据库——调度器崩溃可能
         让"worker 已写完成事件、调度器未及入库"成为窗口。此处重读磁盘工件作为
-        第二事实源：找到 attempt_id 匹配且未入库的 COMPLETED 事件时补录入库
+        第二事实源：找到 attempt_id 匹配且未入库的 done 事件时补录入库
         （(attempt_id, seq) 去重幂等）并返回 True。文件缺失/损坏行按"无完成
         记录"处理，不让恢复流程崩溃。
         """
@@ -737,7 +737,7 @@ class SchedulerService:
                 if now_mono >= meta.pause_deadline_mono:
                     # 暂停宽限超时 → 强撤进程树（非阻塞状态机：TERM → 到期 KILL →
                     # D 态兜底），靠上次已提交检查点恢复。主循环内不做同步等待：
-                    # 单个卡死 worker 会把整个控制平面（快照/命令/心跳/准入）
+                    # 单个卡死 worker 会把整个控制平面（快照/命令/事件/准入）
                     # 冻结最长 grace 秒。
                     if a.begin_terminate(now_mono, self.cfg.control.pause_grace_max_sec):
                         log.warning("pause grace exceeded for attempt %s, TERM sent",
@@ -756,16 +756,16 @@ class SchedulerService:
                         self._finalize(a, meta, now)
                 continue
             if meta.status == JobStatus.RUNNING:
-                stale_threshold = self._heartbeat_stale_threshold(meta)
+                stale_threshold = self._staleness_threshold(meta)
                 if now_mono - meta.last_event_mono > stale_threshold:
-                    # 心跳过期（依据承诺反馈间隔与实际延迟推导，非固定等待）：先告警 + 协作暂停
-                    log.warning("attempt %s heartbeat stale >%.1fs, requesting pause",
+                    # 事件静默超时（依据实测反馈间隔与实际延迟推导，非固定等待）：先告警 + 协作暂停
+                    log.warning("attempt %s event silence >%.1fs, requesting pause",
                                 attempt_id, stale_threshold)
                     self._append_status({
-                        "ts": now, "kind": "heartbeat_stale", "attempt_id": attempt_id,
+                        "ts": now, "kind": "staleness", "attempt_id": attempt_id,
                         "job_id": meta.job_id, "task_id": meta.task_id,
                         "stale_sec": round(now_mono - meta.last_event_mono, 1)})
-                    self._request_pause(attempt_id, reason="心跳过期，疑似卡住")
+                    self._request_pause(attempt_id, reason="事件静默超时，疑似卡住")
             elif meta.status == JobStatus.STARTING:
                 if now_mono - meta.started_mono > self.cfg.control.starting_timeout_sec:
                     # 启动握手超时：拉起后长时间无 started 事件（非阻塞撤进程树）
@@ -861,7 +861,7 @@ class SchedulerService:
         released_snapshot = dict(self.protect.st.released)
         fi = self.timing.feedback_interval(meta.task_id)
         ok = self.protect.start_round(meta.task_id, meta.priority, now,
-                                      reason="统一外部不足", cause="shortage",
+                                      reason="资源不足", cause="shortage",
                                       feedback_interval_sec=fi,
                                       lower_tasks=self._lower_task_count(meta.priority),
                                       cooldown_remain_sec=self._backoff_remain_sec(meta.task_id))
@@ -949,7 +949,7 @@ class SchedulerService:
         reason = reason_override or outcome.reason
         if not reason_override and outcome.status == JobStatus.PAUSED \
                 and meta.pause_command and meta.pause_command.get("reason"):
-            # 保留发起暂停的原因（心跳过期/OOM/保护退让），供恢复冷却与审计区分暂停来源
+            # 保留发起暂停的原因（事件静默超时/OOM/保护退让），供恢复冷却与审计区分暂停来源
             reason = f"{meta.pause_command['reason']}；{outcome.reason}"
         self.db.commit_transition(
             meta.attempt_id,
@@ -982,7 +982,7 @@ class SchedulerService:
             # B7（设计第十四节）：成功后不足退避计数复位，下次从起点重新探测
             self.db.reset_job_retry(meta.job_id)
         elif outcome.status == JobStatus.BACKOFF:
-            # 统一外部不足：记录任务级不足证据（阻止退避期间的扩容探索）；
+            # 资源不足：记录任务级不足证据（阻止退避期间的扩容探索）；
             # 动态目标不收缩——恢复后按既有目标逐个（一步验证）拉回
             self.scaling.on_shortage(stid, _now_mono(), self._live_count(stid))
             self._persist_scale(stid)
@@ -1003,7 +1003,7 @@ class SchedulerService:
                 self.scaling.note_pause_cost(
                     stid, _now_mono() - meta.pause_requested_mono)
         elif outcome.status == JobStatus.FAILED:
-            # 业务逻辑/未知失败不得冒充外部不足，也不收缩动态目标（设计第十二节）；
+            # 业务逻辑/未知失败不得冒充资源不足，也不收缩动态目标（设计第十二节）；
             # 否则 shortage_streak 只增不清会让 may_grow 永久返回 False，导致准入停滞。
             pass
 
@@ -1327,17 +1327,17 @@ class SchedulerService:
 
     # ---------- 暂停恢复（PAUSED → QUEUED，逐步放回） ----------
     # 恢复排队前需冷却的暂停来源（防紧密"重启→再暂停"循环，设计第八/十四节）：
-    # - 心跳过期：疑似卡死，冷却后再探（原有行为）；
+    # - 事件静默超时：疑似卡死，冷却后再探（原有行为）；
     # - OOM 证据 / 内存增长退让：内存超限任务立即重启会周期性再触发 OOM，
     #   冷却把循环降到低频探测（与 BACKOFF 的"长期保持低频探测"一致）；
     # - 保护自收缩：设计第十节"失败的 A 作业自行保存进度并冷却"。
-    _RESUME_COOLDOWN_MARKERS = ("心跳过期", "OOM", "内存增长退让", "无低优先级可退让")
+    _RESUME_COOLDOWN_MARKERS = ("事件静默超时", "OOM", "内存增长退让", "无低优先级可退让")
 
     def _resume_cooldown_sec(self, job: dict) -> float:
         """该 PAUSED 作业恢复排队前的冷却秒数（0=立即恢复）。"""
         reason = str(job.get("reason") or "")
         if any(m in reason for m in self._RESUME_COOLDOWN_MARKERS):
-            return self.cfg.control.heartbeat_resume_cooldown_sec
+            return self.cfg.control.stale_pause_cooldown_sec
         return 0.0
 
     def _tick_release(self, now_mono: float) -> None:
@@ -1350,9 +1350,9 @@ class SchedulerService:
         # PAUSED 作业恢复正常排队：
         # - 无保护轮：全部按既有冷却规则恢复；
         # - A3：保护轮进行中，优先级不低于保护对象的作业（含保护对象自身
-        #   心跳过期暂停的执行）仍按正常冷却恢复——保护轮不得冻结高优先级
+        #   事件静默超时暂停的执行）仍按正常冷却恢复——保护轮不得冻结高优先级
         #   作业的恢复通道；仅低优先级作业保持逐步放回节奏（pending_resume）。
-        cooldown = self.cfg.control.heartbeat_resume_cooldown_sec
+        cooldown = self.cfg.control.stale_pause_cooldown_sec
         now_utc = datetime.now(timezone.utc)
         prot_pri = st.protected_priority if st.protected_task else None
         for j in self._jobs_in_status(JobStatus.PAUSED):
@@ -1778,7 +1778,7 @@ class SchedulerService:
         self._transition(meta, JobStatus.PAUSING)
         a.signal_pause()
         # 只有"高优先级保护退让"才计入保护轮的累计退让账（设计第十节）；
-        # 心跳过期、OOM 等其它暂停不得污染 yielded/yielded_tasks 或延长保护截止。
+        # 事件静默超时、OOM 等其它暂停不得污染 yielded/yielded_tasks 或延长保护截止。
         if yield_to_protect:
             # 截止延长按本次退让的实际暂停宽限推导（设计第十节：长度按暂停耗时计算）
             self.protect.note_yielded(attempt_id, meta.task_id, meta.priority,
@@ -1798,14 +1798,14 @@ class SchedulerService:
         grace = max(self.cfg.control.pause_grace_base_sec, interval * 4)
         return min(grace, self.cfg.control.pause_grace_max_sec)
 
-    def _heartbeat_stale_threshold(self, meta: AttMeta) -> float:
+    def _staleness_threshold(self, meta: AttMeta) -> float:
         """疑似卡死阈值：配置下限与实测反馈间隔×倍数的较大者（不固定等待）。
 
-        存活检测由进程树 + 事件到达间隔承担，不再依赖任务自报心跳。
+        存活检测由进程树 + 事件到达间隔承担，任务不单独上报存活。
         """
         interval = self.timing.feedback_interval(meta.task_id)
-        mult = self.cfg.control.heartbeat_stale_multiplier
-        return max(self.cfg.control.heartbeat_stale_sec, interval * mult)
+        mult = self.cfg.control.staleness_multiplier
+        return max(self.cfg.control.staleness_min_sec, interval * mult)
 
     @staticmethod
     def _avg(d: deque) -> float | None:
@@ -2238,7 +2238,7 @@ class SchedulerService:
     def _task_monitor(self) -> dict[str, dict]:
         """每任务监控视图（设计第十四节）。
 
-        B2：在基础运行指标上补充——健康基线摘要（按业务阶段：样本数/速率/
+        B2：在基础运行指标上补充——健康基线摘要（样本数/速率/
         变慢判定）、不足退避原因、存活执行的暂停原因统计、生产者崩溃信息
         （持续报警在监控中始终可见，不依赖一次性日志）。
         """

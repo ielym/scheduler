@@ -3,9 +3,9 @@
 契约：
 - 事件种类统一 5 种：started / progress / error / done / ack（见 errors.py）。
   通信格式统一（同一信封），type 只区分语义。
-- 进展只报单调递增已完成单元数 + 可选业务阶段；耗时、资源消耗、存活节奏
-  一律由调度器自行观测统计（cgroup / 墙钟 / 事件间隔 EMA），任务不预估。
-- 断点恢复、协作暂停、可重放执行、幂等提交是必需能力。
+- 进展只报单调递增已完成单元数；耗时、资源消耗、存活节奏一律由调度器
+  自行观测统计（cgroup / 墙钟 / 事件间隔 EMA），任务不预估。
+- 协作暂停、可重放执行、幂等提交是必需能力；断点是任务可选实践。
 - 终止结果由退出码表达：0=成功（须发 done）、75=资源不足、其他=业务失败；
   错误归因统一发 error 事件（reason 携带错误类型+资源标识）。
 
@@ -227,11 +227,6 @@ class ExecutorTask:
         """报告资源不足并退出（raise Shortage → exit 75）。"""
         raise Shortage(reason)
 
-    def report_error_event(self, reason: str = "") -> None:
-        """仅发 error 事件归因但不退出（短暂失败可自行恢复的场景）。
-        持续不足应调用 report_shortage() 退出退让。"""
-        self._events.emit(EventKind.ERROR, reason=_clean_reason(reason))
-
     def complete(self, record: dict | None = None) -> None:
         """标记完成并提交持久化完成记录（幂等）。"""
         self._events.emit(EventKind.DONE, record=record or {})
@@ -255,36 +250,4 @@ def run_task(task: ExecutorTask) -> int:
 __all__ = [
     "ExecutorTask", "Shortage", "PauseRequested", "run_task",
     "EXIT_OK", "EXIT_SHORTAGE", "EventKind",
-    "emit_event", "report_progress", "report_shortage", "report_error_event",
-    "complete",
 ]
-
-
-# ---- 模块级便捷 API（面向"裸脚本"但走事件通道） ----
-_module_last_cu: int | None = None
-
-
-def emit_event(kind: str, **payload) -> int:
-    return _events.emit(kind, **payload)
-
-
-def report_progress(completed_units: int) -> None:
-    global _module_last_cu
-    cu = int(completed_units)
-    if _module_last_cu is not None and cu < _module_last_cu:
-        raise ValueError(
-            f"completed_units 回退：{cu} < 已报告的 {_module_last_cu}")
-    _module_last_cu = cu
-    emit_event(EventKind.PROGRESS, completed_units=cu)
-
-
-def report_shortage(reason: str = "") -> None:
-    raise Shortage(reason)
-
-
-def report_error_event(reason: str = "") -> None:
-    emit_event(EventKind.ERROR, reason=_clean_reason(reason))
-
-
-def complete(record: dict | None = None) -> None:
-    emit_event(EventKind.DONE, record=record or {})

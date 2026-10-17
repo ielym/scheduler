@@ -7,7 +7,7 @@ sched 是常驻单进程的**本地子任务调度器**：
 - **生产/执行分离**：每个启用任务常驻一个生产者，自行发现业务事件并发布「就绪 JSON」到 `outbox/`；调度器只控制执行进程的运行规模。生产者永不因调度压力被暂停/限额/抢占。
 - **无预设上限**：不填最大运行/排队数量、不填 CPU/内存/IO 资源申请。调度器只观测执行进程的实测消耗与业务进展，动态学习运行目标（冷启动 1 个，逐步 +1）。
 - **SQLite 执行库**：作业/attempt/事件/检查点/回执落盘，重启接管、进程身份核实、作业去重（相同 job_id 相同内容幂等，内容不同隔离）。
-- **统一执行协议**：心跳 + 进展 + 统一外部不足（exit 75）+ 检查点 + 协作暂停 + 幂等提交。断点恢复、协作暂停、可重放执行、幂等提交是所有子任务的必需能力。
+- **统一执行协议**：5 类事件（started/progress/error/done/ack），资源不足经退出码 75 表达；协作暂停 + 幂等提交。协作暂停、可重放执行、幂等提交是必需能力；断点是任务可选实践。
 
 ## 安装
 
@@ -30,7 +30,7 @@ python3 -c "import sched; print(sched.__version__)"   # 3.0.0
   "schema_version": 1, "task_id": "hello", "enabled": true, "priority": 50,
   "producer_entry": { "file": "producer.py", "interpreter": "python3", "args": [] },
   "executor_entry": { "file": "run.py", "interpreter": "python3", "args": [] },
-  "workdir": ".", "progress_semver": "1.0.0",
+  "workdir": ".",
   "recovery": { "replay": "outbox", "retain": "outbox 归档保留 30 天", "replay_note": "按 idempotency_key 核对归档识别遗漏" }
 }
 ```
@@ -57,7 +57,7 @@ from sched_task_sdk import ExecutorTask, run_task
 
 class HelloExecutor(ExecutorTask):
     def execute(self):
-        self.report_progress(0, True, "start")
+        self.report_progress(0)
         # 业务处理...
         self.complete({"ok": True})
 
@@ -117,20 +117,20 @@ sched attempt cancel <id> [--reason r]  # 显式取消单个 attempt
 
 | 退出码 | 含义 | 调度器动作 |
 | --- | --- | --- |
-| 0 | 成功（已提交完成记录） | SUCCEEDED |
-| 75 | 统一外部不足 | BACKOFF 到期探测 |
+| 0 | 成功（已发 done 事件） | SUCCEEDED |
+| 75 | 资源不足 | BACKOFF 到期探测 |
 | 其他非 0 | 业务/未知失败 | FAILED |
 
 ## SDK（`sched_task_sdk`）
 
 - **`Producer`**：发现游标 + 待发布记录 + 无丢失发布 + 稳定 job_id + 重放。
-- **`ExecutorTask`**：心跳/进展/断点（`checkpoint`/`resume_data`）/`report_progress`/`report_shortage`/`complete`/协作暂停。
+- **`ExecutorTask`**：进展/断点（`checkpoint`/`resume_data`）/`report_progress`/`report_shortage`/`complete`/协作暂停。
 
 ## 调度模型
 
 - **动态运行目标**：无写死上限；冷启动 1、观察后逐步 +1；不足/退化先撤销近期增加。
 - **高优保护 + 累计退让**：高优受阻逐步让低优退让，有界、有截止、可恢复。
-- **变慢检测**：按任务+阶段基线识别无报错变慢（温和退让）。
+- **变慢检测**：按任务基线识别无报错变慢（温和退让）。
 - **状态机**：QUEUED → STARTING → RUNNING → PAUSING → PAUSED / BACKOFF / SUCCEEDED / FAILED / RECOVERING / CANCELLED。
 
 ## 开发

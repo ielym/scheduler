@@ -5,8 +5,7 @@
 2. 变慢判定：速率下降 且（处理耗时上升 或 在途上升），不误删完成态样本（设计第十一节）
 3. _request_pause 仅在高优保护退让时计入累计退让账（设计第十节）
 4. OOM 优先暂停低优先级中可释放内存较多者（设计第八节）
-5. SDK 暂不足事件 report_shortage_event：只报事件不退（设计第六节）
-6. 内存快速增长标记不健康（设计第八节）
+5. 内存快速增长标记不健康（设计第八节）
 """
 
 from __future__ import annotations
@@ -83,7 +82,7 @@ def test_request_pause_yield_accounting(home):
     svc.attempts["a1"] = FakeAttempt()
     svc._transition = lambda m, s, reason="": setattr(m, "status", s)
 
-    svc._request_pause("a1", "心跳过期")           # 非保护退让
+    svc._request_pause("a1", "事件静默超时")           # 非保护退让
     assert "a1" not in svc.protect.st.yielded
 
     meta.status = JobStatus.RUNNING              # 复位存活态再触发第二次
@@ -120,18 +119,7 @@ def test_choose_oom_yield_candidate(home):
     assert svc._choose_oom_yield_candidate("a_lo") is None
 
 
-# ---------- 5. SDK 错误归因事件：只报事件不退 ----------
-def test_report_shortage_event_module(tmp_path, monkeypatch):
-    monkeypatch.setenv("SCHED_EVENT_FILE", str(tmp_path / "ev.jsonl"))
-    from sched_task_sdk import EventKind, report_error_event
-    report_error_event("临时不足")
-    lines = (tmp_path / "ev.jsonl").read_text().strip().splitlines()
-    obj = json.loads(lines[0])
-    assert obj["kind"] == EventKind.ERROR
-    assert obj["reason"] == "临时不足"
-
-
-# ---------- 6. 内存快速增长标记不健康 ----------
+# ---------- 5. 内存快速增长标记不健康 ----------
 def test_mark_memory_growth(home):
     t = scaling.ResourceTrend(0.9, 0.8, 3)
     t.sample(0.1, 0.1, True)

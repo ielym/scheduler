@@ -458,15 +458,13 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   background: var(--text-3); box-shadow: 0 0 0 3px var(--surface);
 }
 .tl-item.k-started .tl-dot { background: var(--c-starting); }
-.tl-item.k-heartbeat .tl-dot { background: var(--text-3); }
 .tl-item.k-progress .tl-dot { background: var(--accent); }
-.tl-item.k-external_shortage .tl-dot { background: var(--c-backoff); }
-.tl-item.k-control_ack .tl-dot { background: var(--c-pausing); }
-.tl-item.k-checkpoint .tl-dot { background: var(--c-succeeded); }
-.tl-item.k-completed .tl-dot { background: var(--c-succeeded); box-shadow: 0 0 8px rgba(45, 212, 191, 0.6); }
+.tl-item.k-error .tl-dot { background: var(--c-backoff); }
+.tl-item.k-done .tl-dot { background: var(--c-succeeded); box-shadow: 0 0 8px rgba(45, 212, 191, 0.6); }
+.tl-item.k-ack .tl-dot { background: var(--c-pausing); }
 .tl-item .tl-kind { font-family: var(--mono); font-size: 10.5px; color: var(--text-2); min-width: 108px; }
-.tl-item.k-external_shortage .tl-kind { color: var(--c-backoff); }
-.tl-item.k-completed .tl-kind { color: var(--c-succeeded); }
+.tl-item.k-error .tl-kind { color: var(--c-backoff); }
+.tl-item.k-done .tl-kind { color: var(--c-succeeded); }
 .tl-item .tl-at { font-family: var(--mono); font-size: 10px; color: var(--text-3); margin-left: auto; white-space: nowrap; }
 .tl-item .tl-payload { font-size: 10.5px; color: var(--text-3); overflow-wrap: anywhere; max-width: 340px; }
 .tl-more { text-align: center; padding: 4px 0 8px; }

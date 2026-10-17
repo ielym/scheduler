@@ -4,8 +4,8 @@
   {"command_id", "job_id", "attempt_id", "token", "action": "pause",
    "reason", "deadline"}
 
-worker 每次进入安全边界时调用 current_pause() 检查；确认后提交检查点、
-发送 control_ack + checkpoint 事件，然后正常退出。
+worker 每次进入安全边界时调用 current_pause() 检查；确认后保存断点（若有）、
+发送 ack 事件，然后正常退出。
 """
 
 from __future__ import annotations

@@ -163,7 +163,7 @@ def test_emit_failure_waits_then_gives_up_without_raising(tmp_path, monkeypatch)
     monkeypatch.setenv("SCHED_EVENT_FILE", "/proc/definitely/not/writable/ev.jsonl")
     monkeypatch.setattr(sdk_events.EventWriter, "_RETRY_DELAYS",
                         (0.01, 0.01, 0.01))
-    seq = sdk_events.emit("heartbeat")
+    seq = sdk_events.emit("error")
     assert seq >= 1  # 不抛异常，返回 seq（stderr 告警）
 
 
