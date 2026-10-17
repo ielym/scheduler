@@ -211,7 +211,7 @@ class ExecutorTask:
         # 断点已在 checkpoint() 或业务周期提交中持久化
 
     # ---------- 进度 / 错误 / 完成 ----------
-    def report_progress(self, completed_units: int, stage: str = "") -> None:
+    def report_progress(self, completed_units: int) -> None:
         # completed_units 必须单调递增——回退是指标污染，立即抛错落 FAILED。
         # 新 attempt 从 0 重新计数合法（重放场景：本对象为全新实例）。
         cu = int(completed_units)
@@ -221,8 +221,7 @@ class ExecutorTask:
                 f"completed_units 回退：{cu} < 已报告的 {last}"
                 "（进展必须单调递增）")
         self._last_completed_units = cu
-        self._events.emit(EventKind.PROGRESS,
-                          completed_units=cu, stage=str(stage or ""))
+        self._events.emit(EventKind.PROGRESS, completed_units=cu)
 
     def report_shortage(self, reason: str = "") -> None:
         """报告资源不足并退出（raise Shortage → exit 75）。"""
@@ -269,14 +268,14 @@ def emit_event(kind: str, **payload) -> int:
     return _events.emit(kind, **payload)
 
 
-def report_progress(completed_units: int, stage: str = "", **kw) -> None:
+def report_progress(completed_units: int) -> None:
     global _module_last_cu
     cu = int(completed_units)
     if _module_last_cu is not None and cu < _module_last_cu:
         raise ValueError(
             f"completed_units 回退：{cu} < 已报告的 {_module_last_cu}")
     _module_last_cu = cu
-    emit_event(EventKind.PROGRESS, completed_units=cu, stage=str(stage or ""))
+    emit_event(EventKind.PROGRESS, completed_units=cu)
 
 
 def report_shortage(reason: str = "") -> None:

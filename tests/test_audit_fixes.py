@@ -101,7 +101,7 @@ def test_reap_orphans_excludes_protected(home, monkeypatch):
 
 # ---------- #2 _is_slow 速率差分 ----------
 def _sample(ts, cum):
-    return scaling.ProgressSample(ts_mono=ts, completed_units=int(cum), stage="s")
+    return scaling.ProgressSample(ts_mono=ts, completed_units=int(cum))
 
 
 def test_is_slow_uses_rate_differential(home):
@@ -384,7 +384,7 @@ def test_pausing_with_shortage_exit_is_backoff():
 # ---------- #17 has_progress_since ----------
 def test_has_progress_since():
     h = scaling.HealthTracker()
-    h.record_progress("t", 100.0, 5, "s")
+    h.record_progress("t", 100.0, 5)
     assert h.has_progress_since("t", 99.0) is True
     assert h.has_progress_since("t", 101.0) is False
     assert h.has_progress_since("other", 0.0) is False

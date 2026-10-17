@@ -316,7 +316,7 @@ def test_task_monitor_rich_fields(home, monkeypatch):
     svc.specs["t1"] = _spec("t1")
     now = time.monotonic()
     for i in range(3):  # 阶段 s1：恒定速率 10 units/s
-        svc.health.record_progress("t1", now - 30 + i * 10, i * 100, "s1")
+        svc.health.record_progress("t1", now - 30 + i * 10, i * 100)
     _mk_job(svc.db, "j_b", task_id="t1", priority=50)
     svc.db.set_job_status("j_b", JobStatus.BACKOFF,
                           "测试不足：外部依赖不可用", runner.now_iso())
@@ -334,10 +334,9 @@ def test_task_monitor_rich_fields(home, monkeypatch):
     assert p["crash_count"] == 2
     assert p["last_crash_wall"] == "2026-10-12T08:00:00+08:00"
     hs = mon["health"]
-    assert len(hs) == 1 and hs[0]["stage"] == "s1"
-    assert hs[0]["samples"] == 3
-    assert hs[0]["completed_units"] == 200
-    assert hs[0]["rate_per_sec"] == 10.0  # (200-0) / 20s
+    assert hs["samples"] == 3
+    assert hs["completed_units"] == 200
+    assert hs["rate_per_sec"] == 10.0  # (200-0) / 20s
 
 
 # ---------- B3：接收器新文件优先发现 ----------
@@ -420,13 +419,13 @@ def test_report_progress_monotonic(tmp_path, monkeypatch):
             pass
 
     t = T()
-    t.report_progress(5, "s1")
-    t.report_progress(7, "s1")
+    t.report_progress(5)
+    t.report_progress(7)
     with pytest.raises(ValueError, match="单调递增"):
-        t.report_progress(6, "s1")       # 回退 → 立即抛错
-    t.report_progress(7, "s1")           # 相等允许（重复上报同值）
+        t.report_progress(6)       # 回退 → 立即抛错
+    t.report_progress(7)           # 相等允许（重复上报同值）
     t2 = T()
-    t2.report_progress(0, "s1")          # 新实例（新 attempt）从 0 合法
+    t2.report_progress(0)          # 新实例（新 attempt）从 0 合法
 
 
 # ---------- C1：回执一次性消费 + 归档 GC + 窗口对账 ----------

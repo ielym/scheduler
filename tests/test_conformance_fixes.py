@@ -33,7 +33,7 @@ def _svc(home):
 # ---------- 1. 完成态样本计数为进展证据 ----------
 def test_completion_sample_counts_as_progress(home):
     h = scaling.HealthTracker()
-    h.record_progress("t", 100.0, 5, "s")
+    h.record_progress("t", 100.0, 5)
     assert h.has_samples("t") is True
 
 
@@ -42,11 +42,11 @@ def test_is_slow_via_process_duration_rise(home):
     h = scaling.HealthTracker(slow_confidence_sec=5.0,
                               timing=scaling.TaskTiming(default_interval_sec=0.5))
     samples = [
-        scaling.ProgressSample(ts_mono=float(i), completed_units=i * 10, stage="s")
+        scaling.ProgressSample(ts_mono=float(i), completed_units=i * 10)
         for i in range(6)
     ] + [
         scaling.ProgressSample(ts_mono=float(i),
-                               completed_units=60 + (i - 6) * 2, stage="s")
+                               completed_units=60 + (i - 6) * 2)
         for i in range(6, 12)
     ]
     # 归一化速率下降（10 -> 2）：判慢
@@ -57,7 +57,7 @@ def test_completion_samples_do_not_trigger_slow(home):
     h = scaling.HealthTracker(slow_confidence_sec=5.0,
                               timing=scaling.TaskTiming(default_interval_sec=0.5))
     samples = [
-        scaling.ProgressSample(ts_mono=float(i), completed_units=i, stage="s")
+        scaling.ProgressSample(ts_mono=float(i), completed_units=i)
         for i in range(12)
     ]
     assert not h._is_slow(deque(samples))  # 恒速率：不判慢

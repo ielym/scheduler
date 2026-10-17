@@ -7,7 +7,7 @@
 - 就绪 JSON workdir 包含校验 + task_id 格式校验（防越权）；
 - cmd_task enable/disable 容错与启用前校验；
 - EntrySpec interpreter 命令名校验；
-- HealthTracker 基线按 (task_id, stage, metric_semver) 分离；
+- HealthTracker 基线按 task_id 单维度分离；
 - OOM 让级候选不高于受害者优先级（退让只向下让）；
 - 遗留行（有 pid 无 pid_start_time）恢复安全化（cgroup 归属核实）；
 - skill 模板（atomic_write_json / wait_interruptible）。

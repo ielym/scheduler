@@ -823,8 +823,7 @@ class SchedulerService:
                         meta.attempt_id, meta.last_progress_cu, cu)
             return
         meta.last_progress_cu = cu
-        self.health.record_progress(
-            meta.task_id, _now_mono(), cu, str(ev.get("stage") or ""))
+        self.health.record_progress(meta.task_id, _now_mono(), cu)
 
     def _transition(self, meta: AttMeta, status: str, reason: str = "") -> None:
         meta.status = status
@@ -2273,9 +2272,9 @@ class SchedulerService:
                 "next_retry_at": self._next_retry_by_task.get(task_id, ""),
                 "backoff_reason": backoff_reasons.get(task_id, ""),
             }
-            stages = self.health.stages_summary(task_id, now_mono)
-            if stages:
-                mon["health"] = stages
+            h = self.health.summary(task_id, now_mono)
+            if h:
+                mon["health"] = h
             if task_id in pausing_reasons:
                 mon["pausing_reasons"] = pausing_reasons[task_id]
             p = producers.get(task_id)

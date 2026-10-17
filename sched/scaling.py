@@ -19,7 +19,6 @@ from typing import Any
 class ProgressSample:
     ts_mono: float
     completed_units: int
-    stage: str
 
 
 class TaskTiming:
@@ -49,9 +48,9 @@ class TaskTiming:
 
 
 class HealthTracker:
-    """按任务+业务阶段维护近期进展基线，识别无报错变慢。
+    """按任务维护近期进展基线，识别无报错变慢。
 
-    基线键为 (task_id, stage)；速率 = completed_units 差分 / 时间。
+    基线按 task_id 单维度；速率 = completed_units 差分 / 时间。
     耗时与资源消耗由调度器实测（cgroup/墙钟），任务不预估、样本不携带。
     """
 
@@ -60,7 +59,7 @@ class HealthTracker:
         self.window_sec = window_sec
         self.slow_confidence_sec = slow_confidence_sec
         self.timing = timing or TaskTiming()
-        self._samples: dict[tuple[str, str], deque[ProgressSample]] = {}
+        self._samples: dict[str, deque[ProgressSample]] = {}
         # 恢复早期豁免：暂停/重放恢复的任务在豁免窗口内不参与变慢判定
         self._resume_exempt_until: dict[str, float] = {}
 
@@ -70,66 +69,51 @@ class HealthTracker:
             prev = self._resume_exempt_until.get(task_id, 0.0)
             self._resume_exempt_until[task_id] = max(prev, until)
 
-    def record(self, task_id: str, stage: str, sample: ProgressSample) -> None:
-        key = (task_id, str(stage))
-        dq = self._samples.setdefault(key, deque())
+    def record_progress(self, task_id: str, now_mono: float, completed_units: int) -> None:
+        sample = ProgressSample(ts_mono=now_mono, completed_units=int(completed_units))
+        dq = self._samples.setdefault(task_id, deque())
         dq.append(sample)
         while dq and sample.ts_mono - dq[0].ts_mono > self.window_sec:
             dq.popleft()
 
-    def record_progress(self, task_id: str, now_mono: float, completed_units: int,
-                        stage: str = "") -> None:
-        self.record(task_id, str(stage), ProgressSample(
-            ts_mono=now_mono,
-            completed_units=int(completed_units),
-            stage=str(stage)))
-
     def has_samples(self, task_id: str) -> bool:
-        return any(k[0] == task_id for k in self._samples)
+        return bool(self._samples.get(task_id))
 
     def has_progress_since(self, task_id: str, since_mono: float) -> bool:
         """自 since_mono 以来是否有新的业务进展样本到达（保护改善判定用）。"""
-        for key, dq in self._samples.items():
-            if key[0] != task_id:
-                continue
-            for s in reversed(dq):
-                if s.ts_mono >= since_mono:
-                    return True
-        return False
+        dq = self._samples.get(task_id)
+        if not dq:
+            return False
+        return any(s.ts_mono >= since_mono for s in reversed(dq))
 
-    def stages_summary(self, task_id: str, now_mono: float) -> list[dict]:
-        """该任务各业务阶段的近期健康摘要（监控视图）。"""
-        out: list[dict] = []
-        for (tid, stage), dq in self._samples.items():
-            if tid != task_id or not dq:
-                continue
-            s_first, s_last = dq[0], dq[-1]
-            span = s_last.ts_mono - s_first.ts_mono
-            rate = 0.0
-            if span > 0 and s_last.completed_units > s_first.completed_units:
-                rate = (s_last.completed_units - s_first.completed_units) / span
-            recent = now_mono - s_last.ts_mono <= self.window_sec
-            out.append({
-                "stage": stage,
-                "samples": len(dq),
-                "completed_units": s_last.completed_units,
-                "rate_per_sec": round(rate, 4),
-                "slow": recent and self._is_slow(dq, tid),
-            })
-        return out
+    def summary(self, task_id: str, now_mono: float) -> dict | None:
+        """该任务近期健康摘要（监控视图）。"""
+        dq = self._samples.get(task_id)
+        if not dq:
+            return None
+        s_first, s_last = dq[0], dq[-1]
+        span = s_last.ts_mono - s_first.ts_mono
+        rate = 0.0
+        if span > 0 and s_last.completed_units > s_first.completed_units:
+            rate = (s_last.completed_units - s_first.completed_units) / span
+        recent = now_mono - s_last.ts_mono <= self.window_sec
+        return {
+            "samples": len(dq),
+            "completed_units": s_last.completed_units,
+            "rate_per_sec": round(rate, 4),
+            "slow": recent and self._is_slow(dq, task_id),
+        }
 
     def slow(self, task_id: str, now_mono: float) -> bool:
-        """任一业务阶段近期速率持续下降即判慢（陈旧样本不参与，恢复早期豁免）。"""
+        """近期速率持续下降即判慢（陈旧样本不参与，恢复早期豁免）。"""
         if now_mono < self._resume_exempt_until.get(task_id, 0.0):
             return False
-        for key, dq in self._samples.items():
-            if key[0] != task_id or not dq:
-                continue
-            if now_mono - dq[-1].ts_mono > self.window_sec:
-                continue  # 最新样本已陈旧：本阶段近期无证据，不判慢
-            if self._is_slow(dq, task_id):
-                return True
-        return False
+        dq = self._samples.get(task_id)
+        if not dq:
+            return False
+        if now_mono - dq[-1].ts_mono > self.window_sec:
+            return False  # 最新样本已陈旧：近期无证据，不判慢
+        return self._is_slow(dq, task_id)
 
     def _is_slow(self, dq: deque, task_id: str = "") -> bool:
         if len(dq) < 4:

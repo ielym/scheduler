@@ -343,10 +343,10 @@ def test_module_level_progress_monotonic(monkeypatch, tmp_path):
     monkeypatch.setenv("SCHED_EVENT_FILE", str(ev))
     import sched_task_sdk.executor as ex
     ex._module_last_cu = None
-    ex.report_progress(5, "s")
-    ex.report_progress(5, "s")   # 持平合法
+    ex.report_progress(5)
+    ex.report_progress(5)   # 持平合法
     with pytest.raises(ValueError):
-        ex.report_progress(4, "s")  # 回退抛错
+        ex.report_progress(4)  # 回退抛错
     ex._module_last_cu = None
 
 
@@ -418,7 +418,7 @@ def test_resume_exemption_blocks_slow_detection(tmp_path):
     h.note_resumed("t", now, exempt_sec=120.0)
     # 构造强退化样本：豁免期内不判慢
     for i in range(6):
-        h.record_progress("t", now + i * 1.0, completed_units=10 - i, stage="s")
+        h.record_progress("t", now + i * 1.0, completed_units=10 - i)
     assert h.slow("t", now + 5.0) is False  # 豁免期内
     assert h.slow("t", now + 200.0) is True or True  # 豁免期后（样本已陈旧则不判）
 
@@ -430,7 +430,7 @@ def test_slow_window_scales_with_feedback(tmp_path):
     now = time.monotonic()
     # 30s 跨度的退化样本：低于 360s 门槛 → 不判慢
     for i in range(6):
-        h.record_progress("t_fb", now + i * 6.0, completed_units=10 - i, stage="s")
+        h.record_progress("t_fb", now + i * 6.0, completed_units=10 - i)
     assert h.slow("t_fb", now + 35.0) is False
 
 
@@ -450,9 +450,9 @@ def test_scheduler_rejects_regressing_progress(home):
     try:
         meta = AttMeta("a-r", "j-r", "t-r", 50, "tok")
         meta.status = JobStatus.RUNNING
-        svc._ingest_progress_event(meta, 5, {"stage": "s"})
-        svc._ingest_progress_event(meta, 3, {"stage": "s"})   # 回退：不入基线
-        samples = [k for k in svc.health._samples if k[0] == "t-r"]
+        svc._ingest_progress_event(meta, 5, {})
+        svc._ingest_progress_event(meta, 3, {})   # 回退：不入基线
+        samples = [k for k in svc.health._samples if k == "t-r"]
         for key in samples:
             dq = svc.health._samples[key]
             assert all(s.completed_units >= 5 for s in dq)

@@ -156,9 +156,8 @@ const jobTimes = j => {
   return "—";
 };
 const EVENT_CN = {
-  started: "已启动", heartbeat: "心跳", progress: "进展",
-  external_shortage: "外部不足", control_ack: "控制确认",
-  checkpoint: "检查点", completed: "完成",
+  started: "已启动", progress: "进展", error: "错误",
+  done: "完成", ack: "控制确认",
 };
 const EV_KIND_CN = {
   attempt_launched: "启动执行", attempt_finalized: "执行结束",
@@ -1422,8 +1421,8 @@ function buildAttBlock(a, open) {
     </div>
     <div class="att-block-body">
       <div class="tl" data-tl="${esc(a.attempt_id)}">
-        <div class="tl-filter">${[["all", "全部"], ["progress", "进展"], ["external_shortage", "不足"],
-          ["checkpoint", "检查点"], ["completed", "完成"], ["control_ack", "控制"]].map(([k, cn]) =>
+        <div class="tl-filter">${[["all", "全部"], ["progress", "进展"], ["error", "错误"],
+          ["done", "完成"], ["ack", "控制"]].map(([k, cn]) =>
           `<button data-tlf="${k}">${cn}</button>`).join("")}</div>
         <div class="tl-list"></div>
         <div class="tl-foot"></div>
@@ -1504,12 +1503,10 @@ function _tlItemHtml(e, attemptId) {
   if (e.kind === "progress") {
     const parts = [];
     if (p.completed_units != null) parts.push(`已完成 ${p.completed_units} 单元`);
-    if (p.stage) parts.push(`阶段 ${p.stage}`);
     if (p.pending != null) parts.push(p.pending ? "有待处理" : "无待处理");
     extra = parts.join(" · ");
-  } else if (e.kind === "external_shortage") extra = p.reason || "";
-  else if (e.kind === "control_ack") extra = p.command || p.kind || "";
-  else if (e.kind === "checkpoint") extra = p.ref ? `位置 ${p.ref}` : "";
+  } else if (e.kind === "error") extra = p.reason || "";
+  else if (e.kind === "ack") extra = p.command || p.kind || "";
   else if (e.kind === "started") {
     const bits = [];
     if (p.pid) bits.push(`PID ${p.pid}`);
@@ -1665,17 +1662,15 @@ function openTaskDetail(taskId) {
         ${m.next_retry_at ? `<dt>下次重试</dt><dd>${fmt.dateTime(m.next_retry_at)}</dd>` : ""}
       </dl>
     </div>
-    ${health.length ? `
+    ${health ? `
     <div class="so-section">
-      <div class="so-section-title">健康基线（按业务阶段）</div>
-      ${health.map(h => `
-        <div class="stat-item" style="margin-bottom:8px">
-          <div style="display:flex;justify-content:space-between;align-items:baseline">
-            <span class="s-label" style="font-size:11px">${esc(h.stage)} · v${esc(h.semver)}</span>
-            <span class="s-value" style="font-size:13px;${h.slow ? "color:var(--c-starting)" : ""}">${(h.rate_per_sec || 0).toFixed(3)} <small>单元/s</small></span>
-          </div>
-          <div class="dim" style="font-size:10.5px;margin-top:2px">样本 ${h.samples} · 累计完成 ${fmt.num(h.completed_units)} 单元${h.slow ? " · <span style='color:var(--c-starting)'>判定变慢</span>" : ""}</div>
-        </div>`).join("")}
+      <div class="so-section-title">健康基线</div>
+      <div class="stat-item" style="margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <span class="s-value" style="font-size:13px;${health.slow ? "color:var(--c-starting)" : ""}">${(health.rate_per_sec || 0).toFixed(3)} <small>单元/s</small></span>
+        </div>
+        <div class="dim" style="font-size:10.5px;margin-top:2px">样本 ${health.samples} · 累计完成 ${fmt.num(health.completed_units)} 单元${health.slow ? " · 判定变慢" : ""}</div>
+      </div>
     </div>` : ""}
     <div class="so-section">
       <div class="so-section-title">生产者</div>
