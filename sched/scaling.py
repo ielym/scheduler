@@ -46,6 +46,22 @@ class TaskTiming:
     def feedback_interval(self, task_id: str) -> float:
         return self._feedback_interval.get(task_id, self.default_interval_sec)
 
+    def snapshot(self) -> dict:
+        """持久化当前各任务的进度节奏 EMA（只存间隔秒数，monotonic 不落盘）。"""
+        return {"feedback_interval": dict(self._feedback_interval)}
+
+    def restore(self, snap: dict) -> None:
+        """重启后回填进度节奏 EMA，避免进度节奏归零（存活不依赖它，见 heartbeat）。"""
+        if not isinstance(snap, dict):
+            return
+        fi = snap.get("feedback_interval")
+        if isinstance(fi, dict):
+            for k, v in fi.items():
+                try:
+                    self._feedback_interval[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    pass
+
 
 class HealthTracker:
     """按任务维护近期进展基线，识别无报错变慢。

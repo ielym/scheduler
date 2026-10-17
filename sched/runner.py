@@ -46,6 +46,7 @@ class AttemptSpec:
     entry_args: list[str]
     workdir: str
     env: dict[str, str]
+    heartbeat_interval_sec: float = 5.0
 
 
 class AttemptRun:
@@ -164,7 +165,11 @@ class AttemptRun:
                 continue
             if not isinstance(obj, dict):
                 continue
-            seq = int(obj.get("seq") or 0)
+            try:
+                seq = int(obj.get("seq") or 0)
+            except (TypeError, ValueError):
+                # 畸形 seq：跳过该行（偏移已推进，不会反复重读，也不拖垮整轮）
+                continue
             if seq > self._read_seq:
                 self._read_seq = seq
             if seq > after_seq:
@@ -428,6 +433,7 @@ def build_env(spec: AttemptSpec, input_refs: list[str]) -> dict[str, str]:
         "SCHED_CHECKPOINT_FILE": str(config.run_dir(spec.attempt_id) / "checkpoint.json"),
         "SCHED_PERMIT_FILE": str(config.run_dir(spec.attempt_id) / "permit.json"),
         "SCHED_WORKSPACE": str(spec.task_root),
+        "SCHED_HEARTBEAT_INTERVAL_SEC": str(spec.heartbeat_interval_sec),
     })
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + existing if existing else "")
@@ -502,6 +508,11 @@ def decide_outcome(status_ctx: str, exit_code: int | None, had_completed: bool
                                   "取消请求到达前已完成并持久化完成记录")
         return AttemptOutcome(JobStatus.CANCELLED, exit_code, "显式取消")
     if status_ctx == JobStatus.PAUSING:
+        # 完成证据优先于暂停意图：暂停请求到达时若已发 done（业务已完成），
+        # 不得误标为 PAUSED 再排队重跑已完成的作业。
+        if exit_code == 0 and had_completed:
+            return AttemptOutcome(JobStatus.SUCCEEDED, exit_code,
+                                  "暂停请求到达前已完成并持久化完成记录")
         if exit_code == EXIT_SHORTAGE:
             # 暂停请求中以外不足退出：断点未必已保存，语义是不足而非已暂停
             return AttemptOutcome(JobStatus.BACKOFF, exit_code,

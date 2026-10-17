@@ -212,7 +212,7 @@ def test_plain_pause_still_resumes_immediately(home):
 def test_stale_pause_cooldown_unchanged(home):
     svc = _svc(home)
     _mk_job(svc.db, "jH")
-    _pause_job(svc, "jH", "事件静默超时，疑似卡住；协作暂停，断点已保存")
+    _pause_job(svc, "jH", "心跳超时，疑似卡死；协作暂停，断点已保存")
     svc._tick_release(time.monotonic())
     assert svc.db.get_job("jH")["status"] == JobStatus.PAUSED
 

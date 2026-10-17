@@ -82,7 +82,7 @@ def test_request_pause_yield_accounting(home):
     svc.attempts["a1"] = FakeAttempt()
     svc._transition = lambda m, s, reason="": setattr(m, "status", s)
 
-    svc._request_pause("a1", "事件静默超时")           # 非保护退让
+    svc._request_pause("a1", "心跳超时")           # 非保护退让
     assert "a1" not in svc.protect.st.yielded
 
     meta.status = JobStatus.RUNNING              # 复位存活态再触发第二次

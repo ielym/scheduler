@@ -3,8 +3,7 @@
 启动：取单实例锁 → 恢复执行数据库与进程身份（完成记录核实 / 旧进程协作退出 /
 按检查点重放 / 身份未知转 RECOVERY_BLOCKED）→ 独立确认所有生产者常驻（任务级单实例锁接管）。
 
-每轮：消费控制命令 → 处理退出/进展/错误/完成/控制确认（事件静默超时、启动握手
-超时监护）→ 重启恢复推进 → 增量接收（优先级序 + 同级轮转 + 时间片）→ 资源趋势
+每轮：消费控制命令 → 处理退出/进展/错误/完成/控制确认（心跳超时监护）→ 重启恢复推进 → 增量接收（优先级序 + 同级轮转 + 时间片）→ 资源趋势
 （CPU/内存/IO/OOM 滞回，观测不足减速探索）→ 动态目标 / 高优先级保护（优先级防劫持、
 准入门禁、截止延长、改善释放、逐步放回）→ 不足到期重排（指数退避 + 抖动）→
 按优先级/同级轮转/任务内顺序准入并握手启动 → 发布快照。
@@ -92,6 +91,7 @@ class AttMeta:
         self.cancel_deadline_mono = 0.0
         self.started_mono = _now_mono()
         self.last_event_mono = _now_mono()
+        self.last_heartbeat_mono = _now_mono()  # 最近一次 heartbeat 到达时刻（存活判定）
         self.last_progress_mono = 0.0    # 最近一次 progress 事件到达时刻（B7 判定）
 
 
@@ -104,6 +104,8 @@ class SchedulerService:
         # 任务级实测 timing EMA（反馈间隔等由调度器自统计，任务不声明）
         self.timing = scaling.TaskTiming(
             default_interval_sec=self.cfg.control.feedback_interval_init_sec)
+        self._last_timing_save_mono = 0.0
+        self._restore_timing()
         self.health = scaling.HealthTracker(
             slow_confidence_sec=self.cfg.control.slow_confidence_sec,
             timing=self.timing)
@@ -464,6 +466,7 @@ class SchedulerService:
                 entry_args=_json.loads(job["entry_args_json"]),
                 workdir=job["workdir"],
                 env=_json.loads(job["env_json"]),
+                heartbeat_interval_sec=self.cfg.control.heartbeat_interval_sec,
             )
             from . import cgroup as _cg
             cg_name = str(att.get("cgroup") or "")
@@ -707,22 +710,35 @@ class SchedulerService:
             ok = self.cancel_attempt(target, reason or "显式取消")
             return ok, "cancelled" if ok else "not found"
         if kind == "pause_attempt":
-            # 任务级"停止全部执行"：协作暂停（检查点保留），作业经 PAUSED
-            # 自动回 QUEUED；任务禁用时被准入闸门挡住，重新启用后自动续跑
+            # 单 attempt 协作暂停（检查点保留），经 PAUSED 自动回 QUEUED
             meta = self.meta.get(target)
             if meta is None or meta.status not in (JobStatus.RUNNING,
                                                    JobStatus.STARTING):
                 return False, "not running"
             self._request_pause(target, reason or "任务级停止")
             return True, "pausing"
+        if kind == "pause_task":
+            # 任务级"停止全部执行"：协作暂停该任务所有存活 attempt
+            return self.pause_task(target, reason or "任务级停止全部执行")
         if kind == "requeue_job":
             ok = self.requeue_job(target, reason or "人工重排")
             return ok, "requeued" if ok else "not requeueable"
         return False, f"未知命令类型：{kind}"
 
+    def pause_task(self, task_id: str, reason: str = "") -> tuple[bool, str]:
+        """协作暂停某任务全部存活执行（STARTING/RUNNING）。返回 (是否暂停, 详情)。"""
+        n = 0
+        for aid, m in list(self.meta.items()):
+            if m.task_id == task_id and m.status in (JobStatus.RUNNING,
+                                                     JobStatus.STARTING):
+                self._request_pause(aid, reason)
+                n += 1
+        return (n > 0, f"paused {n}")
+
     # ---------- 执行尝试事件/退出 ----------
     def _tick_attempts(self, now_mono: float) -> None:
         now = runner.now_iso()
+        self._maybe_save_timing(now_mono)
         for attempt_id in list(self.attempts.keys()):
             a = self.attempts.get(attempt_id)
             meta = self.meta.get(attempt_id)
@@ -755,64 +771,78 @@ class SchedulerService:
                     if not a.is_alive() or a.poll_terminate(now_mono) == "gone":
                         self._finalize(a, meta, now)
                 continue
-            if meta.status == JobStatus.RUNNING:
-                stale_threshold = self._staleness_threshold(meta)
-                if now_mono - meta.last_event_mono > stale_threshold:
-                    # 事件静默超时（依据实测反馈间隔与实际延迟推导，非固定等待）：先告警 + 协作暂停
-                    log.warning("attempt %s event silence >%.1fs, requesting pause",
-                                attempt_id, stale_threshold)
+            if meta.status in (JobStatus.STARTING, JobStatus.RUNNING):
+                timeout = self._heartbeat_timeout()
+                if now_mono - meta.last_heartbeat_mono > timeout:
+                    # 心跳超时：丢失 heartbeat 判死（存活与业务进展解耦，不受
+                    # 首步/并发/重启影响）。先协作暂停核实，宽限内不响应再
+                    # 非阻塞 TERM→KILL。
+                    log.warning("attempt %s heartbeat timeout >%.1fs, requesting pause",
+                                attempt_id, timeout)
                     self._append_status({
-                        "ts": now, "kind": "staleness", "attempt_id": attempt_id,
+                        "ts": now, "kind": "heartbeat_stale", "attempt_id": attempt_id,
                         "job_id": meta.job_id, "task_id": meta.task_id,
-                        "stale_sec": round(now_mono - meta.last_event_mono, 1)})
-                    self._request_pause(attempt_id, reason="事件静默超时，疑似卡住")
-            elif meta.status == JobStatus.STARTING:
-                if now_mono - meta.started_mono > self.cfg.control.starting_timeout_sec:
-                    # 启动握手超时：拉起后长时间无 started 事件（非阻塞撤进程树）
-                    log.warning("attempt %s starting handshake timeout", attempt_id)
-                    a.begin_terminate(now_mono, self.cfg.control.pause_grace_base_sec)
-                    if not a.is_alive() or a.poll_terminate(now_mono) == "gone":
-                        self._finalize(a, meta, now, reason_override="启动握手超时")
+                        "idle_sec": round(now_mono - meta.last_heartbeat_mono, 1)})
+                    self._request_pause(attempt_id, reason="心跳超时，疑似卡死")
 
     def _ingest_events(self, a: runner.AttemptRun, meta: AttMeta) -> None:
         for ev in a.read_events(meta.after_seq):
-            seq = int(ev.get("seq") or 0)
+            try:
+                seq = int(ev.get("seq") or 0)
+            except (TypeError, ValueError):
+                log.warning("attempt %s 畸形事件（seq 非法）跳过: %r",
+                            meta.attempt_id, ev.get("seq"))
+                continue
             meta.after_seq = max(meta.after_seq, seq)
             meta.last_event_mono = _now_mono()
-            kind = ev.get("kind")
-            now_m = _now_mono()
-            # 每次业务事件都喂反馈间隔 EMA（TaskTiming，调度器自统计）
+            try:
+                self._ingest_event(a, meta, ev, seq)
+            except Exception:
+                # 单条畸形事件不得中断整轮调度：隔离跳过（防后半段每轮反复失败）
+                log.warning("attempt %s 畸形事件跳过: %r", meta.attempt_id, ev)
+
+    def _ingest_event(self, a: runner.AttemptRun, meta: AttMeta, ev: dict,
+                      seq: int) -> None:
+        kind = ev.get("kind")
+        now_m = _now_mono()
+        # 只让业务事件（started/progress/done/error）喂进度节奏 EMA；
+        # heartbeat/ack 不喂——否则心跳会把进度节奏塌缩到心跳间隔。
+        if kind in (EventKind.STARTED, EventKind.PROGRESS,
+                    EventKind.DONE, EventKind.ERROR):
             self.timing.note_event(meta.task_id, now_m)
-            if kind == EventKind.STARTED:
-                if meta.status == JobStatus.STARTING:
-                    self._transition(meta, JobStatus.RUNNING)
-                    # A7 启动许可：调度器确认 STARTED/RUNNING 后写 permit.json，
-                    # worker 在许可前不产生业务副作用（设计第十三节）
-                    try:
-                        a.write_permit()
-                    except Exception:
-                        log.warning("write permit failed for attempt %s",
-                                    meta.attempt_id)
-            elif kind == EventKind.PROGRESS:
-                meta.last_progress_mono = now_m
-                self._ingest_progress_event(
-                    meta, int(ev.get("completed_units") or 0), ev)
-                # 一次正确执行的步骤：解除"逐个拉取"的首步验证位 /
-                # 任务退避（VERIFY/EMPTY）恢复正常（TaskBackoff）
-                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, now_m)
-                self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
-            elif kind == EventKind.ERROR:
-                meta.shortage_at_mono = now_m
-                self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
-                self._on_explicit_shortage(meta)
-            elif kind == EventKind.DONE:
-                meta.had_completed = True
-                # 成功也是"正确一步"：任务退避立即恢复正常（TaskBackoff）
-                self.tbackoff.note_progress(meta.task_id, meta.attempt_id, now_m)
-                self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
-            else:
-                # ack / 未知类型：仅落库
-                self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
+        if kind == EventKind.STARTED:
+            if meta.status == JobStatus.STARTING:
+                self._transition(meta, JobStatus.RUNNING)
+                # A7 启动许可：调度器确认 STARTED/RUNNING 后写 permit.json，
+                # worker 在许可前不产生业务副作用（设计第十三节）
+                try:
+                    a.write_permit()
+                except Exception:
+                    log.warning("write permit failed for attempt %s",
+                                meta.attempt_id)
+        elif kind == EventKind.HEARTBEAT:
+            meta.last_heartbeat_mono = now_m
+            self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
+        elif kind == EventKind.PROGRESS:
+            meta.last_progress_mono = now_m
+            self._ingest_progress_event(
+                meta, int(ev.get("completed_units") or 0), ev)
+            # 一次正确执行的步骤：解除"逐个拉取"的首步验证位 /
+            # 任务退避（VERIFY/EMPTY）恢复正常（TaskBackoff）
+            self.tbackoff.note_progress(meta.task_id, meta.attempt_id, now_m)
+            self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
+        elif kind == EventKind.ERROR:
+            meta.shortage_at_mono = now_m
+            self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
+            self._on_explicit_shortage(meta)
+        elif kind == EventKind.DONE:
+            meta.had_completed = True
+            # 成功也是"正确一步"：任务退避立即恢复正常（TaskBackoff）
+            self.tbackoff.note_progress(meta.task_id, meta.attempt_id, now_m)
+            self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
+        else:
+            # ack / 未知类型：仅落库
+            self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
 
     def _ingest_progress_event(self, meta: AttMeta, cu: int, ev: dict) -> None:
         """进展样本入健康基线：回退样本拒绝入基线（防污染变慢判定的速率差分），
@@ -946,10 +976,27 @@ class SchedulerService:
         status_ctx = JobStatus.PAUSING if meta.status == JobStatus.PAUSING else \
             (JobStatus.CANCELLED if meta.status == JobStatus.CANCELLED else "")
         outcome = runner.decide_outcome(status_ctx, exit_code, meta.had_completed)
+        # OOM 证据优先：worker 被内核 OOM 杀死应判资源不足（BACKOFF 可恢复自动退避），
+        # 不得按 SIGKILL(-9) 退出码误归为业务失败导致无法自动恢复。
+        # 这里在 _tick_resource 之前（_tick_attempts 先跑）直接读 cgroup oom 计数。
+        if not status_ctx:
+            try:
+                cnt = a.cgrp.read_oom_kill_count() if a.cgrp is not None else None
+            except Exception:
+                cnt = None
+            if cnt is not None and cnt > self._last_oom.get(meta.attempt_id, 0):
+                self.trend.mark_oom()
+                self._stats["oom_events"] += 1
+                outcome = runner.AttemptOutcome(
+                    JobStatus.BACKOFF, exit_code, "执行进程被 OOM 杀死（资源不足）")
+                self._append_status({
+                    "ts": now, "kind": "oom_evidence",
+                    "attempt_id": meta.attempt_id, "job_id": meta.job_id,
+                    "task_id": meta.task_id, "delta": 1})
         reason = reason_override or outcome.reason
         if not reason_override and outcome.status == JobStatus.PAUSED \
                 and meta.pause_command and meta.pause_command.get("reason"):
-            # 保留发起暂停的原因（事件静默超时/OOM/保护退让），供恢复冷却与审计区分暂停来源
+            # 保留发起暂停的原因（心跳超时/OOM/保护退让），供恢复冷却与审计区分暂停来源
             reason = f"{meta.pause_command['reason']}；{outcome.reason}"
         self.db.commit_transition(
             meta.attempt_id,
@@ -1327,11 +1374,11 @@ class SchedulerService:
 
     # ---------- 暂停恢复（PAUSED → QUEUED，逐步放回） ----------
     # 恢复排队前需冷却的暂停来源（防紧密"重启→再暂停"循环，设计第八/十四节）：
-    # - 事件静默超时：疑似卡死，冷却后再探（原有行为）；
+    # - 心跳超时：疑似卡死，冷却后再探（原有行为）；
     # - OOM 证据 / 内存增长退让：内存超限任务立即重启会周期性再触发 OOM，
     #   冷却把循环降到低频探测（与 BACKOFF 的"长期保持低频探测"一致）；
     # - 保护自收缩：设计第十节"失败的 A 作业自行保存进度并冷却"。
-    _RESUME_COOLDOWN_MARKERS = ("事件静默超时", "OOM", "内存增长退让", "无低优先级可退让")
+    _RESUME_COOLDOWN_MARKERS = ("心跳超时", "OOM", "内存增长退让", "无低优先级可退让")
 
     def _resume_cooldown_sec(self, job: dict) -> float:
         """该 PAUSED 作业恢复排队前的冷却秒数（0=立即恢复）。"""
@@ -1350,7 +1397,7 @@ class SchedulerService:
         # PAUSED 作业恢复正常排队：
         # - 无保护轮：全部按既有冷却规则恢复；
         # - A3：保护轮进行中，优先级不低于保护对象的作业（含保护对象自身
-        #   事件静默超时暂停的执行）仍按正常冷却恢复——保护轮不得冻结高优先级
+        #   心跳超时暂停的执行）仍按正常冷却恢复——保护轮不得冻结高优先级
         #   作业的恢复通道；仅低优先级作业保持逐步放回节奏（pending_resume）。
         cooldown = self.cfg.control.stale_pause_cooldown_sec
         now_utc = datetime.now(timezone.utc)
@@ -1778,7 +1825,7 @@ class SchedulerService:
         self._transition(meta, JobStatus.PAUSING)
         a.signal_pause()
         # 只有"高优先级保护退让"才计入保护轮的累计退让账（设计第十节）；
-        # 事件静默超时、OOM 等其它暂停不得污染 yielded/yielded_tasks 或延长保护截止。
+        # 心跳超时、OOM 等其它暂停不得污染 yielded/yielded_tasks 或延长保护截止。
         if yield_to_protect:
             # 截止延长按本次退让的实际暂停宽限推导（设计第十节：长度按暂停耗时计算）
             self.protect.note_yielded(attempt_id, meta.task_id, meta.priority,
@@ -1798,14 +1845,31 @@ class SchedulerService:
         grace = max(self.cfg.control.pause_grace_base_sec, interval * 4)
         return min(grace, self.cfg.control.pause_grace_max_sec)
 
-    def _staleness_threshold(self, meta: AttMeta) -> float:
-        """疑似卡死阈值：配置下限与实测反馈间隔×倍数的较大者（不固定等待）。
+    def _heartbeat_timeout(self) -> float:
+        """心跳超时阈值 = 心跳间隔 × 丢失倍数（不依赖业务进展节奏，无固定下限）。
 
-        存活检测由进程树 + 事件到达间隔承担，任务不单独上报存活。
+        存活由显式 heartbeat 事件承担，与业务进展解耦；首步/并发/重启均不影响。
         """
-        interval = self.timing.feedback_interval(meta.task_id)
-        mult = self.cfg.control.staleness_multiplier
-        return max(self.cfg.control.staleness_min_sec, interval * mult)
+        return (self.cfg.control.heartbeat_interval_sec
+                * self.cfg.control.heartbeat_stale_multiplier)
+
+    # ---------- 进度节奏 EMA 持久化（重启回填，避免进度节奏归零） ----------
+    def _restore_timing(self) -> None:
+        from . import store
+        snap = store.load_json(config.runtime_dir() / "timing.json")
+        self.timing.restore(snap)
+
+    def _save_timing(self) -> None:
+        from . import store
+        store.save_json(config.runtime_dir() / "timing.json", self.timing.snapshot())
+
+    def _maybe_save_timing(self, now_mono: float) -> None:
+        if now_mono - self._last_timing_save_mono >= 30.0:
+            self._last_timing_save_mono = now_mono
+            try:
+                self._save_timing()
+            except Exception:
+                pass
 
     @staticmethod
     def _avg(d: deque) -> float | None:
@@ -1978,6 +2042,7 @@ class SchedulerService:
                 entry_args=_json.loads(job["entry_args_json"]),
                 workdir=job["workdir"],
                 env=_json.loads(job["env_json"]),
+                heartbeat_interval_sec=self.cfg.control.heartbeat_interval_sec,
             )
             a = runner.launch(aspec, _json.loads(job["input_refs_json"]))
         except Exception as e:
@@ -2191,9 +2256,9 @@ class SchedulerService:
             "queued": self.db.count_queued(),
             "live_attempts": len(self.attempts),
             "producers": self.guard.list(),
-            "exec_cpu_usec": int(self._sample_cpu),
+            "exec_cpu_usec": int(sum(self._last_cpu_usec.values())),
             "exec_mem_mb": int(self._sample_mem_mb),
-            "exec_io_bytes": int(self._sample_io),
+            "exec_io_bytes": int(sum(self._last_io_bytes.values())),
             "exec_pressure": self._sample_pressure,
             "observability_ok": self._observability_ok,
             "resource_unhealthy": self.trend.unhealthy(),

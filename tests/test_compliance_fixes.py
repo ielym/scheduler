@@ -267,10 +267,10 @@ def test_release_without_protect_resumes_all(home):
 
 
 def test_release_stale_cooldown_still_applies(home):
-    """事件静默超时冷却逻辑保持：冷却窗口内即使高优先级也不立即重启。"""
+    """心跳超时冷却逻辑保持：冷却窗口内即使高优先级也不立即重启。"""
     svc = _svc(home)
     _mk_job(svc.db, "j_hb", task_id="t_hb", priority=90)
-    svc.db.set_job_status("j_hb", JobStatus.PAUSED, "事件静默超时", runner.now_iso())
+    svc.db.set_job_status("j_hb", JobStatus.PAUSED, "心跳超时", runner.now_iso())
     svc._tick_release(time.monotonic())
     assert svc.db.get_job("j_hb")["status"] == JobStatus.PAUSED
 

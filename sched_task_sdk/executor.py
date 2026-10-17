@@ -18,6 +18,7 @@ import json
 import os
 import re
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -32,6 +33,19 @@ from .errors import EXIT_OK, EXIT_SHORTAGE, EventKind
 # reason 整理：保留错误类型与资源标识（归因依据），仅做不可见字符清理、
 # 空白压缩与长度截断。凭证/账号类敏感信息由任务侧保证不写入。
 _MAX_REASON_LEN = 300
+
+# 心跳（存活信号）发送间隔默认值：与调度器 config.json 的 heartbeat_interval_sec
+# 镜像。SDK 后台线程周期发 heartbeat，与业务进展分离，任务无需自行实现。
+DEFAULT_HEARTBEAT_INTERVAL_SEC = 5.0
+
+
+def _heartbeat_interval_from_env() -> float:
+    raw = os.environ.get("SCHED_HEARTBEAT_INTERVAL_SEC")
+    try:
+        v = float(raw) if raw else DEFAULT_HEARTBEAT_INTERVAL_SEC
+        return v if v > 0 else DEFAULT_HEARTBEAT_INTERVAL_SEC
+    except (TypeError, ValueError):
+        return DEFAULT_HEARTBEAT_INTERVAL_SEC
 
 
 def _clean_reason(reason: str) -> str:
@@ -69,6 +83,8 @@ class ExecutorTask:
         self._pause: _control.PauseCommand | None = None
         self._ckpt_saved_this_attempt = False   # 本 attempt 是否已提交过检查点
         self._last_completed_units: int | None = None  # 进展单调校验基准
+        self.heartbeat_interval_sec = _heartbeat_interval_from_env()
+        self._heartbeat_thread: threading.Thread | None = None
 
     # ---------- 子类实现 ----------
     def execute(self) -> None:
@@ -79,6 +95,7 @@ class ExecutorTask:
         self._ckpt.load()
         self._install_signal()
         self._events.emit(EventKind.STARTED, name=self.name)
+        self._start_heartbeat()
         exit_code = EXIT_OK
         try:
             self._wait_for_permit()
@@ -104,7 +121,34 @@ class ExecutorTask:
             exit_code = 1
         finally:
             self._stop_evt.set()
+            self._stop_heartbeat()
         return exit_code
+
+    def _start_heartbeat(self) -> None:
+        """启动存活心跳线程：周期发 heartbeat，业务是否推进不影响存活判定。
+
+        与 progress 严格分离——即使首步阻塞/长耗时，心跳仍每 interval 到，
+        调度器据此判活而非靠"事件静默"推断。
+        """
+        if self.heartbeat_interval_sec <= 0:
+            return
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="sched-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                self._events.emit(EventKind.HEARTBEAT)
+            except Exception:
+                pass  # 心跳失败不致命，避免后台线程噪音
+            self._stop_evt.wait(self.heartbeat_interval_sec)
+
+    def _stop_heartbeat(self) -> None:
+        t = self._heartbeat_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=self.heartbeat_interval_sec)
+        self._heartbeat_thread = None
 
     def _wait_for_permit(self) -> None:
         """启动许可门：调度器确认 STARTED/RUNNING 后写 permit.json，

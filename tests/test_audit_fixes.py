@@ -6,7 +6,7 @@
 #3  RECOVERY_BLOCKED 持续核实 + requeue_job
 #4  生产者空事件轮次游标持久化
 #5  准入同级任务轮转
-#6  反馈间隔契约（STARTED 申报 → 事件静默超时/暂停宽限推导）
+#6  反馈间隔契约（STARTED 申报 → 心跳超时/暂停宽限推导）
 #8  监控统计（task_monitor / 生产者状态摘要）
 #9  events.jsonl 增量读 + 轮转重置；SDK 事件文件 16MB 轮转
 #10 jobs_in_status 过滤与 LIMIT
@@ -212,21 +212,17 @@ def test_started_event_sets_feedback_interval(home):
     assert meta.status == JobStatus.RUNNING
 
 
-def test_feedback_interval_derives_thresholds(home):
+def test_heartbeat_timeout_and_pause_grace(home):
     svc = _svc(home)
     c = svc.cfg.control
-    c.staleness_min_sec = 10.0
-    c.staleness_multiplier = 3.0
+    c.heartbeat_interval_sec = 5.0
+    c.heartbeat_stale_multiplier = 3.0
     meta = AttMeta("a", "j", "t", 50, "tok")
-    # 未观测到事件 → 用全局反馈间隔默认值
-    assert svc._staleness_threshold(meta) == pytest.approx(15.0)
-    # 观测到 2s 反馈间隔 → 阈值回落到配置下限
-    svc.timing.note_event("t", 0.0)
-    svc.timing.note_event("t", 2.0)
-    assert svc.timing.feedback_interval("t") == pytest.approx(2.0)
-    assert svc._staleness_threshold(meta) == pytest.approx(10.0)
-    # 暂停宽限：无观测 → 基值
-    assert svc._pause_grace_sec(meta) == pytest.approx(c.pause_grace_base_sec)
+    # 存活阈值 = 心跳间隔 × 倍数，与业务进展节奏无关（首步/并发/重启不影响）
+    assert svc._heartbeat_timeout() == pytest.approx(15.0)
+    # 暂停宽限仍按业务进展节奏 EMA 推导：无观测 → 默认反馈间隔 × 4
+    assert svc._pause_grace_sec(meta) == pytest.approx(
+        max(c.pause_grace_base_sec, c.feedback_interval_init_sec * 4))
     # 观测到 100s 反馈间隔 → 宽限抬升并封顶
     svc.timing = scaling.TaskTiming(default_interval_sec=c.feedback_interval_init_sec)
     svc.timing.note_event("t", 0.0)

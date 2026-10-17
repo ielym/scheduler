@@ -317,6 +317,19 @@ def cmd_task(args) -> int:
         except config.TaskError as e:
             print(f"FAILED {args.task_id}: {e}", file=sys.stderr)
             return 2
+    if args.action == "pause":
+        if not _serve_alive():
+            print("serve 不在线，无法协作暂停（停止全部执行需 serve 在线）", file=sys.stderr)
+            return 2
+        ack = _send_command("pause_task", args.task_id, "CLI task pause")
+        if ack is None:
+            print("等待 serve 确认超时", file=sys.stderr)
+            return 2
+        if ack.get("ok"):
+            print(f"PAUSED {args.task_id}（{ack.get('detail')}）")
+            return 0
+        print(f"pause failed: {ack.get('detail')}", file=sys.stderr)
+        return 2
     if args.action in ("enable", "disable"):
         td = config.task_dir(args.task_id)
         tj = td / "task.json"
@@ -430,6 +443,8 @@ def _parser() -> argparse.ArgumentParser:
     tsub.add_parser("validate").add_argument("task_id")
     tsub.add_parser("enable").add_argument("task_id")
     tsub.add_parser("disable").add_argument("task_id")
+    _tp = tsub.add_parser("pause", help="任务级停止全部执行（协作暂停所有存活 attempt）")
+    _tp.add_argument("task_id")
     p_task.set_defaults(func=cmd_task)
 
     p_job = sub.add_parser("job", help="作业管理")

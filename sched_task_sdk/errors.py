@@ -5,8 +5,9 @@
 - 75 资源不足（资源类错误，可恢复退让）
 - 其他非 0 业务/未知失败
 
-事件种类统一为 5 种（通信格式统一，type 只区分语义）：
+事件种类统一为 6 种（通信格式统一，type 只区分语义）：
 - started  ：进程启动（可选 name，纯可观测）
+- heartbeat：存活信号（SDK 后台周期自动发送，无业务字段；与 progress 分离）
 - progress ：业务推进（completed_units 单调递增）
 - error    ：错误终止前的归因（reason 携带错误类型+资源标识）；退出码决定
             性质——75=资源不足→退避，其他=业务失败
@@ -23,6 +24,7 @@ EXIT_SHORTAGE = 75
 
 class EventKind:
     STARTED = "started"
+    HEARTBEAT = "heartbeat"
     PROGRESS = "progress"
     ERROR = "error"
     DONE = "done"

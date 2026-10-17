@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     receive_seq INTEGER NOT NULL DEFAULT 0,
     retry_count INTEGER NOT NULL DEFAULT 0,
     next_retry_at TEXT NOT NULL DEFAULT '',
-    status_seq INTEGER NOT NULL DEFAULT 0
+    status_seq INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, receive_seq ASC);
 CREATE INDEX IF NOT EXISTS idx_jobs_task_status_pri_seq ON jobs(task_id, status, priority DESC, receive_seq ASC);
@@ -147,6 +148,11 @@ class DB:
             # 状态变更事件序号（设计第十二节：每次状态变更带事件序号）
             self._conn.execute(
                 "ALTER TABLE jobs ADD COLUMN status_seq INTEGER NOT NULL DEFAULT 0")
+        if "deleted" not in job_cols:
+            # 逻辑删除标记（web 删除作业：serve 侧准入/排队/退避/放回均需过滤，
+            # 否则排队作业删后仍会被拉起执行）
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
         att_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(attempts)")}
         if "pid_start_time" not in att_cols:
             self._conn.execute(
@@ -273,7 +279,7 @@ class DB:
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM jobs WHERE task_id=? AND status=? "
+                "SELECT * FROM jobs WHERE task_id=? AND status=? AND deleted=0 "
                 "ORDER BY priority DESC, receive_seq ASC LIMIT ?",
                 (task_id, JobStatus.QUEUED, int(limit))).fetchall()
         return [dict(r) for r in rows]
@@ -286,7 +292,7 @@ class DB:
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT task_id, MAX(priority) p FROM jobs WHERE status=? "
+                "SELECT task_id, MAX(priority) p FROM jobs WHERE status=? AND deleted=0 "
                 "GROUP BY task_id ORDER BY p DESC LIMIT ?",
                 (JobStatus.QUEUED, int(limit))).fetchall()
         return [(r["task_id"], int(r["p"])) for r in rows]
@@ -300,7 +306,7 @@ class DB:
         覆盖到，避免固定窗口把排在窗口外的作业永久饿死（设计第五节）。
         """
         with self._lock:
-            sql = "SELECT * FROM jobs WHERE status=?"
+            sql = "SELECT * FROM jobs WHERE status=? AND deleted=0"
             params: list = [status]
             if task_id:
                 sql += " AND task_id=?"
@@ -414,11 +420,11 @@ class DB:
         with self._lock:
             if task_id:
                 row = self._conn.execute(
-                    "SELECT COUNT(*) n FROM jobs WHERE status=? AND task_id=?",
+                    "SELECT COUNT(*) n FROM jobs WHERE status=? AND task_id=? AND deleted=0",
                     (JobStatus.QUEUED, task_id)).fetchone()
             else:
                 row = self._conn.execute(
-                    "SELECT COUNT(*) n FROM jobs WHERE status=?",
+                    "SELECT COUNT(*) n FROM jobs WHERE status=? AND deleted=0",
                     (JobStatus.QUEUED,)).fetchone()
         return int(row["n"])
 

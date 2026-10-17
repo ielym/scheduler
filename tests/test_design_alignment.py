@@ -338,10 +338,10 @@ class TestRestartThrottledResume:
             svc.db.create_attempt(f"att-{jid}", jid, 1, "tok", now)
             svc.db.update_attempt(f"att-{jid}", status=JobStatus.PAUSED,
                                   finished_at=now)
-        svc.db.set_job_status("j-hb", JobStatus.PAUSED, "事件静默超时，疑似卡住", now)
+        svc.db.set_job_status("j-hb", JobStatus.PAUSED, "心跳超时，疑似卡死", now)
         svc._recover()
         st = svc.protect.st
-        # 退让任务按任务分组注入逐步放回队列；事件静默超时作业不注入
+        # 退让任务按任务分组注入逐步放回队列；心跳超时作业不注入
         assert set(st.pending_resume) == {"lo", "lo2"}
         assert st.protected_task == ""  # 保护轮不重建（重启即视为本轮结束）
         assert st.pending_resume["lo2"] == 20

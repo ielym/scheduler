@@ -156,7 +156,7 @@ const jobTimes = j => {
   return "—";
 };
 const EVENT_CN = {
-  started: "已启动", progress: "进展", error: "错误",
+  started: "已启动", heartbeat: "心跳", progress: "进展", error: "错误",
   done: "完成", ack: "控制确认",
 };
 const EV_KIND_CN = {
@@ -1420,13 +1420,6 @@ function buildAttBlock(a, open) {
       <svg class="ic" style="width:13px;height:13px;color:var(--text-3)" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" stroke-linecap="round"/></svg>
     </div>
     <div class="att-block-body">
-      <div class="tl" data-tl="${esc(a.attempt_id)}">
-        <div class="tl-filter">${[["all", "全部"], ["progress", "进展"], ["error", "错误"],
-          ["done", "完成"], ["ack", "控制"]].map(([k, cn]) =>
-          `<button data-tlf="${k}">${cn}</button>`).join("")}</div>
-        <div class="tl-list"></div>
-        <div class="tl-foot"></div>
-      </div>
       <div class="att-log" data-log="${esc(a.attempt_id)}">
         <div class="att-log-head">
           <span class="att-log-title">执行日志 · worker.log（末尾 200 行）</span>
@@ -1436,6 +1429,10 @@ function buildAttBlock(a, open) {
           </span>
         </div>
         <pre class="att-log-body">加载中…</pre>
+      </div>
+      <div class="tl" data-tl="${esc(a.attempt_id)}">
+        <div class="tl-list"></div>
+        <div class="tl-foot"></div>
       </div>
     </div>
   </div>`);
@@ -1456,11 +1453,6 @@ function buildAttBlock(a, open) {
   const fw = $("[data-follow]", blk);
   fw.onclick = e => e.stopPropagation();
   fw.onchange = () => { det.follow[aid] = fw.checked; if (fw.checked) loadAttemptLog(aid); };
-  $$(".tl-filter [data-tlf]", blk).forEach(b => b.onclick = e => {
-    e.stopPropagation();
-    det.tlFilter[aid] = b.dataset.tlf;
-    renderTimeline(aid, false);
-  });
   return blk;
 }
 

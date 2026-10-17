@@ -39,8 +39,14 @@ class TestDecideOutcome:
         o = runner.decide_outcome("", 0, had_completed=False)
         assert o.status == JobStatus.RECOVERING
 
-    def test_pause_ctx_wins(self):
+    def test_pause_ctx_completed_wins(self):
+        # 暂停请求到达前已完成（done）→ 完成证据优先于暂停意图，不误标 PAUSED 重跑
         o = runner.decide_outcome(JobStatus.PAUSING, 0, True)
+        assert o.status == JobStatus.SUCCEEDED
+
+    def test_pause_ctx_no_completed_is_paused(self):
+        # 未完成时协作暂停 → PAUSED（断点已保存）
+        o = runner.decide_outcome(JobStatus.PAUSING, 0, False)
         assert o.status == JobStatus.PAUSED
 
     def test_cancel_ctx_wins(self):
