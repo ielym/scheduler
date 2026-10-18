@@ -213,6 +213,24 @@ def test_step_stats_requires_min_samples_before_judging():
     assert s.deviation("t") is None
 
 
+def test_step_stats_reload_keeps_samples_and_applies_new_params():
+    """热更新：换参数生效，但已积累的单步样本/EMA 不丢（实验切配置不重启的前提）。"""
+    s = scaling.StepDurationStats(_median_cfg())        # median/recent_median
+    for _ in range(50):
+        s.note_step("t", 2.0)
+    assert s.samples_count("t") == 50
+    assert s.baseline("t") == pytest.approx(2.0)
+    # 热更到 slow_ema/fast_ema + 更小样本阈值：参数换、样本留
+    hot = config.SchedulerConfig()
+    hot.control.step_deviation_k = 2.0
+    hot.control.step_deviation_min_samples = 3
+    s.reload(hot)
+    assert s.baseline_method == "slow_ema" and s.current_method == "fast_ema"
+    assert s.min_samples == 3
+    assert s.samples_count("t") == 50                   # 样本保留
+    assert s.baseline("t") is not None                  # 慢 EMA 仍可用（由历史样本喂出）
+
+
 def test_task_backoff_state_machine():
     """TaskBackoff：同任务作业必共用资源 → 报错步降自己任务内的执行；
     跨任务独立；逐个拉取一步验证；全退避按递增间隔探测。"""

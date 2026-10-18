@@ -106,6 +106,9 @@ class SchedulerService:
             default_interval_sec=self.cfg.control.feedback_interval_init_sec)
         # 单步耗时"基线 vs 当前"偏离统计（资源退避的触发闸，纯运行时统计量）
         self.step_stats = scaling.StepDurationStats(self.cfg)
+        # 退避闸参数的热更新锚点（config.json mtime）：实验需在不重启服务的前提下
+        # 切换参数（重启会清空未终结 attempt 并触发全量重排+重扫，污染测量窗口）
+        self._cfg_mtime = self._config_mtime()
         self._last_timing_save_mono = 0.0
         self._restore_timing()
         self.health = scaling.HealthTracker(
@@ -303,12 +306,55 @@ class SchedulerService:
         self.specs = specs
         return specs
 
+    # ---------- 退避闸参数热更新 ----------
+    _GATE_FIELDS = (
+        "step_baseline_method", "step_baseline_samples", "step_baseline_trim_ratio",
+        "step_baseline_ema_alpha", "step_current_method", "step_current_samples",
+        "step_current_alpha", "step_deviation_min_samples", "step_deviation_k")
+
+    @staticmethod
+    def _config_mtime() -> float:
+        try:
+            return config.config_file().stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _maybe_reload_gate(self) -> None:
+        """config.json 变更后热更新退避闸 step_* 参数（无需重启服务）。
+
+        只热更退避闸一组参数、不换其它运行态对象，避免运行中被整体换配置；
+        单步样本与 EMA 保留（见 StepDurationStats.reload），切换后立刻有效。
+        """
+        mtime = self._config_mtime()
+        if mtime == self._cfg_mtime:
+            return
+        self._cfg_mtime = mtime
+        try:
+            new = config.load_config()
+        except Exception:
+            log.warning("热更新退避闸参数失败，保留原参数", exc_info=True)
+            return
+        for f in self._GATE_FIELDS:
+            setattr(self.cfg.control, f, getattr(new.control, f))
+        self.step_stats.reload(self.cfg)
+        # 审计事件（status.jsonl 可观测）：驱动实验可据此确认热更新已生效
+        self._append_status({
+            "ts": runner.now_iso(), "kind": "gate_reloaded",
+            "baseline_method": self.cfg.control.step_baseline_method,
+            "current_method": self.cfg.control.step_current_method,
+            "k": self.cfg.control.step_deviation_k})
+        log.info("退避闸参数已热更新：baseline=%s current=%s K=%s",
+                 self.cfg.control.step_baseline_method,
+                 self.cfg.control.step_current_method,
+                 self.cfg.control.step_deviation_k)
+
     # ---------- 主循环 ----------
     def _loop(self) -> None:
         last_refresh = time.monotonic()
         while not self._stopping.wait(self.cfg.control.loop_tick_sec):
             try:
                 now = _now_mono()
+                self._maybe_reload_gate()
                 if now - last_refresh >= 5.0:
                     self.refresh_specs()
                     last_refresh = now

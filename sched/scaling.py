@@ -82,6 +82,18 @@ class StepDurationStats:
     """
 
     def __init__(self, cfg):
+        self._samples: dict[str, deque[float]] = {}
+        self._baseline_ema: dict[str, float] = {}
+        self._current_ema: dict[str, float] = {}
+        self.reload(cfg)
+
+    def reload(self, cfg) -> None:
+        """热更新闸门参数，**保留**已积累的单步样本与 EMA。
+
+        供"不改代码、不重启服务"地切换退避闸配置（实验用）。之所以必须避免重启：
+        重启会清空未终结 attempt/事件、把全部作业重新入队，并触发一轮全量"重扫
+        OSS"风暴，测量窗口会被严重污染（实测重启后 progress 事件暴涨百倍）。
+        """
         c = getattr(cfg, "control", cfg)
         self.baseline_method = str(getattr(c, "step_baseline_method", "median"))
         self.baseline_samples = max(2, int(getattr(c, "step_baseline_samples", 50)))
@@ -91,9 +103,6 @@ class StepDurationStats:
         self.current_samples = max(1, int(getattr(c, "step_current_samples", 10)))
         self.current_alpha = min(1.0, max(1e-4, float(getattr(c, "step_current_alpha", 0.3))))
         self.min_samples = max(1, int(getattr(c, "step_deviation_min_samples", 8)))
-        self._samples: dict[str, deque[float]] = {}
-        self._baseline_ema: dict[str, float] = {}
-        self._current_ema: dict[str, float] = {}
 
     def note_step(self, task_id: str, duration_sec: float) -> None:
         """记录一次同 attempt 内的单步耗时（非正/NaN 丢弃）。"""

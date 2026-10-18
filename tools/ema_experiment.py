@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """EMA 退避闸网格实验驱动器（实验分支专用，无人值守）。
 
-对每组 step_* 配置：改 config.json → 重启 scheduler.service → 静置 SETTLE 秒
-→ 采集 WINDOW 秒内的指标 → 记录一行 JSON。全部跑完恢复初始配置并重启。
+对每组 step_* 配置：**热更新** config.json（scheduler 按 mtime 1s 内生效，不重启）
+→ 静置 SETTLE 秒 → 采集 WINDOW 秒内的指标 → 记录一行 JSON。支持 --rounds 交替采样。
+全部跑完热更新恢复初始配置。
+
+为什么必须避免重启：重启会清空未终结 attempt/事件、把全部作业重新入队，并触发
+全量"重扫 OSS"风暴（实测重启后 progress 事件量暴涨约百倍），测量窗口被严重污染。
 
 优化目标（用户口径）：
 - 总吞吐 ↑           → thru_per_min（成功的日期作业/分钟）
@@ -11,7 +15,8 @@
 - 强杀应保持 0       → kill_grace（pause_grace_exceeded 次数）
 
 用法：
-  python3 tools/ema_experiment.py [--settle 150] [--window 510] [--out /tmp/ema_results.jsonl]
+  python3 tools/ema_experiment.py [--settle 60] [--window 420] [--rounds 4]
+                                 [--grid grid.json] [--out /tmp/ema_results.jsonl]
 """
 
 from __future__ import annotations
@@ -19,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -30,22 +34,19 @@ CONFIG = HOME / "config.json"
 DB = HOME / "runtime" / "state" / "exec.db"
 STATUS = HOME / "runtime" / "logs" / "status.jsonl"
 
-# (名称, config.json 覆盖项)。第一组是"恒判偏离"的对照组 = 改动前行为。
+# (名称, config.json 覆盖项)。ctrl 是"恒判偏离"对照组（= 闸门前的行为）。
+# 下面三组是交替采样（--rounds）下验证过的组合；落选的中位数变体已移除。
 CONFIGS: list[tuple[str, dict]] = [
-    ("ctrl_always_backoff",
+    ("ctrl_K0",
      {"step_deviation_k": 0.0}),
-    ("median50_trim10_recMed10_k3",
-     {"step_baseline_method": "median", "step_baseline_samples": 50,
-      "step_baseline_trim_ratio": 0.1, "step_current_method": "recent_median",
-      "step_current_samples": 10, "step_deviation_k": 3.0}),
-    ("median30_trim25_recMed5_k2",
-     {"step_baseline_method": "median", "step_baseline_samples": 30,
-      "step_baseline_trim_ratio": 0.25, "step_current_method": "recent_median",
-      "step_current_samples": 5, "step_deviation_k": 2.0}),
-    ("slowEma_a02_fastEma_a3_k3",
+    ("gate_K3",
      {"step_baseline_method": "slow_ema", "step_baseline_ema_alpha": 0.02,
       "step_current_method": "fast_ema", "step_current_alpha": 0.3,
       "step_deviation_k": 3.0}),
+    ("gate_K2",
+     {"step_baseline_method": "slow_ema", "step_baseline_ema_alpha": 0.02,
+      "step_current_method": "fast_ema", "step_current_alpha": 0.3,
+      "step_deviation_k": 2.0}),
 ]
 
 
@@ -67,8 +68,30 @@ def save_cfg(obj: dict) -> None:
                       encoding="utf-8")
 
 
-def restart() -> None:
-    subprocess.run(["systemctl", "restart", "scheduler.service"], check=False)
+def _wait_reload(since_epoch: float, timeout: float = 30.0) -> bool:
+    """等 status.jsonl 出现 gate_reloaded 事件（loop_tick=1s，约 1-2s 生效）。
+
+    用状态审计流而非日志：服务未配置 logging handler（root=WARNING），info 级
+    不回显；status.jsonl 才是可靠的可观测通道。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            for line in STATUS.read_text("utf-8", errors="replace").splitlines()[-200:]:
+                if not line.strip():
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("kind") == "gate_reloaded":
+                    ts = _parse(o.get("ts") or "")
+                    if ts is None or ts.timestamp() >= since_epoch - 5:
+                        return True
+        except OSError:
+            pass
+        time.sleep(1.0)
+    return False
 
 
 def _parse(ts: str) -> datetime | None:
@@ -107,6 +130,12 @@ def evaluate(t0: datetime, t1: datetime) -> dict:
     try:
         db = sqlite3.connect(str(DB))
         db.row_factory = sqlite3.Row
+        # 真实工作量（论文级 progress 事件数）比 "attempt 数" 更能代表吞吐：
+        # 每个 attempt 处理的论文数差异极大（1 篇 vs 上百篇），用 attempt 数
+        # 计数会被"这批作业恰好内容多少"淹没，这正是前两轮噪声巨大的主因。
+        papers = db.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='progress' "
+            "AND at >= ? AND at < ?", (a0, a1)).fetchone()[0]
         rows = db.execute(
             "SELECT status, started_at, finished_at FROM attempts "
             "WHERE finished_at >= ? AND finished_at < ?", (a0, a1)).fetchall()
@@ -125,6 +154,7 @@ def evaluate(t0: datetime, t1: datetime) -> dict:
         ages = [(now - _parse(r["started_at"])).total_seconds() / 60.0
                 for r in live if _parse(r["started_at"])]
         db.close()
+        res["papers"] = int(papers)
         res["finalized"] = len(rows)
         res["succeeded"] = by.get("SUCCEEDED", 0)
         res["backoff75"] = by.get("BACKOFF", 0)
@@ -139,20 +169,25 @@ def evaluate(t0: datetime, t1: datetime) -> dict:
               "task_backoff_empty", "backoff_deviated", "backoff_suppressed",
               "protect_started", "protect_released"):
         res[k] = sc.get(k, 0)
+    res["papers_per_min"] = round(res.get("papers", 0) / mins, 2)
     res["thru_per_min"] = round(res.get("succeeded", 0) / mins, 3)
     res["fin_per_min"] = round(res.get("finalized", 0) / mins, 2)
     res["launch_per_min"] = round(res.get("attempt_launched", 0) / mins, 2)
     res["ratio75"] = round(res.get("backoff75", 0) / max(1, res.get("finalized", 0)), 3)
+    res["exit75_rate"] = round(
+        res.get("backoff75", 0) / max(1, res.get("backoff75", 0) + res.get("succeeded", 0)), 3)
     return res
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--settle", type=float, default=150.0)
-    ap.add_argument("--window", type=float, default=510.0)
+    ap.add_argument("--settle", type=float, default=60.0)
+    ap.add_argument("--window", type=float, default=420.0)
     ap.add_argument("--out", default="/tmp/ema_results.jsonl")
     ap.add_argument("--grid", default=None,
                     help="自定义网格 JSON：[{\"name\":..,\"overrides\":{..}}, ..]；缺省用内置 CONFIGS")
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="轮数：按网格顺序循环 N 轮（交替采样，抵消时间漂移与冷启动偏置）")
     args = ap.parse_args()
 
     grid = CONFIGS
@@ -163,31 +198,45 @@ def main() -> int:
     base = load_cfg()
     out_lines = []
     try:
-        for name, over in grid:
-            cfg = load_cfg()
-            cfg.setdefault("control", {}).update(over)   # 覆盖项必须落在 control 段内
-            save_cfg(cfg)                                # 内含 schema 预检，非法即抛错
-            log(f"=== {name}: 应用配置 {over} ===")
-            restart()
-            log(f"静置 {args.settle:.0f}s（冷启动重排+爬坡）...")
-            time.sleep(args.settle)
-            t0 = datetime.now(timezone.utc)
-            log(f"采集窗口 {args.window:.0f}s ...")
-            time.sleep(args.window)
-            t1 = datetime.now(timezone.utc)
-            res = evaluate(t0, t1)
-            row = {"config": name, "overrides": over,
-                   "window_sec": round((t1 - t0).total_seconds()),
-                   **res}
-            out_lines.append(row)
-            with open(args.out, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            log(f"  结果: {json.dumps(res, ensure_ascii=False)}")
+        for rnd in range(1, max(1, args.rounds) + 1):
+            for name, over in grid:
+                cfg = load_cfg()
+                cfg.setdefault("control", {}).update(over)   # 覆盖项必须落在 control 段内
+                log(f"=== [第{rnd}轮] {name}: 热更新配置 {over} ===")
+                t_write = time.time()
+                save_cfg(cfg)                                # 内含 schema 预检，非法即抛错
+                ok = _wait_reload(t_write)
+                log(f"  热更新{'已确认' if ok else '未确认（继续，留意日志）'}")
+                log(f"静置 {args.settle:.0f}s ...")
+                time.sleep(args.settle)
+                t0 = datetime.now(timezone.utc)
+                log(f"采集窗口 {args.window:.0f}s ...")
+                time.sleep(args.window)
+                t1 = datetime.now(timezone.utc)
+                res = evaluate(t0, t1)
+                row = {"round": rnd, "config": name, "overrides": over,
+                       "window_sec": round((t1 - t0).total_seconds()),
+                       **res}
+                out_lines.append(row)
+                with open(args.out, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                log(f"  结果: {json.dumps(res, ensure_ascii=False)}")
     finally:
-        log("恢复初始配置并重启")
+        log("恢复初始配置（热更新，无需重启）")
         save_cfg(base)
-        restart()
-    log("=== 汇总 ===")
+        _wait_reload(time.time())
+    log("=== 汇总（按组聚合 papers/min 中位数，抗漂移） ===")
+    import statistics as _st
+    by_cfg: dict[str, list[dict]] = {}
+    for r in out_lines:
+        by_cfg.setdefault(r["config"], []).append(r)
+    for name, rs in by_cfg.items():
+        med = lambda key: _st.median(x.get(key, 0) for x in rs)  # noqa: E731
+        log(f"{name}: papers/min 中位={med('papers_per_min')}  "
+            f"thru/min 中位={med('thru_per_min')}  "
+            f"exit75率 中位={med('exit75_rate')}  "
+            f"paused 中位={med('paused')}  "
+            f"suppressed 中位={med('backoff_suppressed')}")
     for r in out_lines:
         log(json.dumps(r, ensure_ascii=False))
     return 0
