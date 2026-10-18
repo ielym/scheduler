@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "task_id": "arxiv_topic_qfin_rm",
+  "enabled": true,
+  "priority": 30,
+  "producer_entry": {
+    "file": "producer.py",
+    "interpreter": "python3",
+    "args": [],
+    "cwd": "."
+  },
+  "executor_entry": {
+    "file": "run.py",
+    "interpreter": "python3",
+    "args": [],
+    "cwd": "."
+  },
+  "workdir": ".",
+  "recovery": {
+    "replay": "outbox",
+    "retain": "OSS 永久保留 _done.json 与论文对象",
+    "replay_note": "以目标日期为稳定事件标识，重放幂等去重"
+  },
+  "params": {
+    "topic": "qfin_rm",
+    "query": "cat:q-fin.RM",
+    "start_date": "2020-01-01",
+    "end_date": "2026-10-01"
+  }
+}
