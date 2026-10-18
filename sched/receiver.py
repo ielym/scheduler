@@ -41,7 +41,11 @@ def _write_receipt(task_id: str, job_id: str, content_hash: str, now: str,
     rd = config.receipts_dir(task_id)
     rd.mkdir(parents=True, exist_ok=True)
     from . import store
-    store.save_json(rd / f"{job_id}.json", {
+    # 回执的唯一写者是接收器（调度器主循环单线程），读者（生产者）本就裸读
+    # 文件；atomic_write_json 已保证读者永不见半截文件，无需 flock 旁路锁。
+    # 走 save_json 会给每条回执留一个 <job_id>.json.lock（实测逾万个、
+    # 随作业量无界增长），故此处直接用无锁原子写。
+    store.atomic_write_json(rd / f"{job_id}.json", {
         "job_id": job_id, "task_id": task_id, "content_hash": content_hash,
         "received_at": now, "status": status, "reason": reason,
     })

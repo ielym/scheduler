@@ -9,17 +9,14 @@
 """
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 
 _SCHED_SRC = os.environ.get(

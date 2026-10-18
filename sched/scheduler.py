@@ -157,6 +157,7 @@ class SchedulerService:
         self._last_full_rescan_mono = 0.0                 # outbox 全量重扫兜底节流
         self._last_archive_gc_mono = 0.0                  # 归档 GC 节流（C1）
         self._last_orphan_gc_mono = 0.0                   # 孤儿运行态目录 GC 节流
+        self._last_lock_gc_mono = 0.0                     # .lock 残影 GC 节流
         self._status_scan: dict[str, tuple[int, int]] = {} # 状态扫描滚动游标 status -> (offset, len)（C5）
         self._last_cleanup_mono = 0.0                     # 已完结作业清理节流（B13）
         self._lock = threading.RLock()
@@ -320,6 +321,7 @@ class SchedulerService:
                 self._tick_cleanup(now)
                 self._tick_archive_gc(now)
                 self._tick_orphan_gc(now)
+                self._tick_lock_gc(now)
                 self._tick_resource(now)
                 self._tick_control(now)
                 self._tick_backoff(now)
@@ -482,6 +484,57 @@ class SchedulerService:
             self._append_status({"ts": runner.now_iso(), "kind": "orphan_gc",
                                  "area": area, "task_id": name})
 
+    LOCK_GC_INTERVAL_SEC = 3600.0
+    LOCK_GC_MIN_AGE_SEC = 3600.0
+    # 需长期保留的持久锁：调度器单实例锁 / 生产者任务级单实例锁（持续被持有）
+    _PERSISTENT_LOCKS = frozenset({"scheduler.lock", "producer.lock"})
+
+    def _tick_lock_gc(self, now_mono: float) -> None:
+        """回收 store.file_lock 遗留的旁路 *.lock 残影（file_lock 用完不删锁文件）。
+
+        只删「陈旧（mtime 早于保留期）且此刻无人持有（能拿到 flock）」的锁文件：
+        持续被持有的持久锁（scheduler.lock/producer.lock）拿不到锁、按名跳过；
+        mtime 保留期又为"同进程正在 open→flock 的窗口"兜底，避免误删后同名重建
+        导致互斥失效。删除失败下轮重试。首次运行会一次性清掉历史残影。
+        """
+        if now_mono - self._last_lock_gc_mono < self.LOCK_GC_INTERVAL_SEC:
+            return
+        self._last_lock_gc_mono = now_mono
+        root = config.runtime_dir()
+        if not root.is_dir():
+            return
+        cutoff = time.time() - self.LOCK_GC_MIN_AGE_SEC
+        gone = 0
+        for p in root.rglob("*.lock"):
+            if p.name in self._PERSISTENT_LOCKS:
+                continue
+            try:
+                if p.stat().st_mtime > cutoff:
+                    continue
+                fd = os.open(str(p), os.O_RDWR)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                continue  # 仍被持有：跳过
+            try:
+                p.unlink()
+                gone += 1
+            except OSError:
+                pass
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
+        if gone:
+            log.info("lock gc: removed %d stale unlocked .lock files", gone)
+            self._append_status({"ts": runner.now_iso(), "kind": "lock_gc",
+                                 "removed": gone})
+
     def _scan_order(self) -> list[str]:
         """接收顺序：任务优先级降序，同级任务轮转（设计文档第五节）。"""
         groups: dict[int, list[str]] = {}
@@ -524,8 +577,13 @@ class SchedulerService:
             # 不会出现"命令已删但确认丢失"让 CLI 永远等不到响应
             for ack in acks:
                 store.append_jsonl(config.commands_ack_file(), ack)
+            # 本轮读到的命令全部移除——含无 id 的畸形命令：仅按 id 匹配会让
+            # 无 id 命令永久留在队列中每轮重复执行、ack 无限累积。并发追加的
+            # 新命令一律带 id（ipc.enqueue* 生成），故 `or not o.get("id")`
+            # 不会误删尚未处理的新命令。
             store.remove_jsonl(config.commands_file(),
-                               lambda o, _ids=ids: o.get("id") in _ids)
+                               lambda o, _ids=ids: o.get("id") in _ids
+                               or not o.get("id"))
         except Exception:
             log.exception("ack commands failed")
 

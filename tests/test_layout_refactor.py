@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -218,3 +220,38 @@ def test_orphan_gc_removes_deleted_task_dirs(home):
                  config.logs_dir(), config.tasks_state_root()):
         assert not (root / "gone").exists(), root
     assert (config.archive_root() / "live").exists()   # 现存任务保留
+
+
+# ---------- 运行态卫生：命令队列清理 + .lock 残影 GC ----------
+
+def test_tick_commands_removes_idless_command(home):
+    """无 id 的畸形命令必须被移除：此前仅按 id 匹配会每轮重复执行、ack 累积。"""
+    svc = SchedulerService()
+    config.ensure_layout()
+    store.append_jsonl(config.commands_file(),
+                       {"kind": "cancel_job", "target": "nonexistent"})  # 无 id
+    svc._tick_commands()
+    svc._tick_commands()          # 第二轮：命令应已不在队列，不得再次执行
+    assert store.read_jsonl(config.commands_file()) == []
+    assert len(store.read_jsonl(config.commands_ack_file())) == 1
+
+
+def test_lock_gc_removes_stale_unlocked_locks(home):
+    """GC 只删陈旧且未被持有的 .lock；持久锁与新鲜锁保留。"""
+    svc = SchedulerService()
+    config.ensure_layout()
+    old = time.time() - 7200.0
+    d = config.receipts_dir("t")
+    d.mkdir(parents=True, exist_ok=True)
+    stale = d / "job1.json.lock"
+    stale.write_text("")
+    os.utime(stale, (old, old))
+    fresh = d / "job2.json.lock"
+    fresh.write_text("")
+    keep = config.runtime_dir() / "scheduler.lock"   # 持久锁按名跳过
+    keep.write_text("")
+    os.utime(keep, (old, old))
+    svc._tick_lock_gc(10 ** 9)
+    assert not stale.exists()
+    assert fresh.exists()
+    assert keep.exists()

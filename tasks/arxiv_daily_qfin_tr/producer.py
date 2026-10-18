@@ -1,4 +1,4 @@
-"""arXiv 每日生产者（常驻）：每天北京 15:00 发现 T-5 目标日期并发布一个就绪作业（arXiv 公布滞后 2-4 天、周末更长，T-2 会赶在公布前查到 0 篇）。
+"""arXiv 每日生产者（常驻）：每天北京 15:00 发现 T-7 目标日期并发布一个就绪作业（arXiv 公布滞后 2-4 天、周末更长，T-7 留足索引尾巴确保创建时数据必已完整）。
 
 - 生产者在调度器之外独立运行，发现与发布解耦于执行压力。
 - 稳定事件标识 = 目标日期；业务版本固定为 1 → 相同日期重放得到相同 job_id（幂等去重）。
@@ -79,7 +79,7 @@ class DailyProducer(Producer):
             "idempotency_key": f"{topic}:{date_str}",
             "env": {"SCHED_CONFIG": rel},
         }]
-        _log(f"[{topic}] 发布 T-2 目标 {date_str}")
+        _log(f"[{topic}] 发布 T-7 目标 {date_str}")
         return {"last_date": date_str}, jobs
 
 
