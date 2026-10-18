@@ -63,7 +63,8 @@ def save_cfg(obj: dict) -> None:
     sys.path.insert(0, str(HOME))
     from sched import config as _cfg            # noqa: PLC0415
     _cfg.SchedulerConfig.model_validate(obj)    # 不合法直接抛错，绝不静默
-    CONFIG.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    CONFIG.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n",
+                      encoding="utf-8")
 
 
 def restart() -> None:

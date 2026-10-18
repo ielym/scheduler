@@ -158,8 +158,16 @@ def test_scaling_shortage_marks_evidence(tmp_path):
 
 # ---------- 单步耗时"基线 vs 当前"偏离统计（资源退避闸，纯运行时统计量） ----------
 
+def _median_cfg():
+    """显式指定中位数估计（默认配置已是 slow_ema/fast_ema，此处的数值期望按中位数）。"""
+    c = config.SchedulerConfig()
+    c.control.step_baseline_method = "median"
+    c.control.step_current_method = "recent_median"
+    return c
+
+
 def test_step_stats_median_baseline_and_deviation():
-    s = scaling.StepDurationStats(config.SchedulerConfig())
+    s = scaling.StepDurationStats(_median_cfg())
     # 样本不足：无从判定 → None
     for _ in range(3):
         s.note_step("t", 2.0)
@@ -177,8 +185,20 @@ def test_step_stats_median_baseline_and_deviation():
     assert s.deviation("t") >= 3.0
 
 
-def test_step_stats_trim_resists_outliers():
+def test_step_stats_default_config_is_slowema_fastema():
+    """默认配置＝网格实验选出的最优组合（慢 EMA 基线 + 快 EMA 当前值）：
+    长期正常、近期尖峰恶化 → 判定严重偏离。"""
     s = scaling.StepDurationStats(config.SchedulerConfig())
+    assert s.baseline_method == "slow_ema" and s.current_method == "fast_ema"
+    for _ in range(50):
+        s.note_step("t", 2.0)
+    for _ in range(3):                 # 近期尖峰（快 EMA 迅速抬起，慢 EMA 几乎不动）
+        s.note_step("t", 20.0)
+    assert s.deviation("t") >= 3.0
+
+
+def test_step_stats_trim_resists_outliers():
+    s = scaling.StepDurationStats(_median_cfg())
     for _ in range(40):
         s.note_step("t", 2.0)
     for _ in range(4):                 # 少量极端异常点
@@ -187,7 +207,7 @@ def test_step_stats_trim_resists_outliers():
 
 
 def test_step_stats_requires_min_samples_before_judging():
-    s = scaling.StepDurationStats(config.SchedulerConfig())
+    s = scaling.StepDurationStats(_median_cfg())
     for _ in range(7):                 # < 默认 min_samples=8
         s.note_step("t", 5.0)
     assert s.deviation("t") is None

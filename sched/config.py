@@ -231,11 +231,11 @@ class ControlConfig(BaseModel):
     heartbeat_stale_multiplier: float = 6.0 # 心跳超时 = 心跳间隔 × 该倍数（丢失该数量心跳判死）
     # ---- 单步耗时偏离统计（资源退避的触发闸；纯运行时统计量，无人工计数阈值）----
     # 基线与当前值两套估计；下方参数供网格搜索/调参（只改配置不改代码）。
-    step_baseline_method: str = "median"        # 基线算法：median（去极值中位数）| slow_ema
+    step_baseline_method: str = "slow_ema"      # 基线算法：slow_ema（长记忆）| median（去极值中位数）
     step_baseline_samples: int = 50             # 基线滚动样本数
-    step_baseline_trim_ratio: float = 0.1       # 去极值比例（两端各去该比例后再取中位数）
+    step_baseline_trim_ratio: float = 0.1       # 去极值比例（median 基线两端各去该比例）
     step_baseline_ema_alpha: float = 0.02       # slow_ema 基线的记忆系数（越小越迟钝）
-    step_current_method: str = "recent_median"  # 当前值算法：recent_median | fast_ema
+    step_current_method: str = "fast_ema"       # 当前值算法：fast_ema | recent_median
     step_current_samples: int = 10              # recent_median 的近窗样本数
     step_current_alpha: float = 0.3             # fast_ema 的记忆系数
     step_deviation_min_samples: int = 8         # 少于该样本数不判偏离（无从判定）

@@ -177,8 +177,8 @@ def test_finalize_backoff_deviated_when_step_slow(home):
     svc._admit_budget = 6
     for _ in range(50):                # 基线≈2s
         svc.step_stats.note_step("t", 2.0)
-    for _ in range(10):                # 近期 8s → 偏离≈4 ≥ K
-        svc.step_stats.note_step("t", 8.0)
+    for _ in range(3):                 # 近期尖峰 20s → 偏离 ≥ K（默认 slow_ema+fast_ema）
+        svc.step_stats.note_step("t", 20.0)
     meta = AttMeta("a1", "j1", "t", 50, "tok")
     meta.status = JobStatus.RUNNING
     svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
