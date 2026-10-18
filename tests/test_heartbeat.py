@@ -61,7 +61,6 @@ def test_executor_emits_heartbeat(monkeypatch, tmp_path):
     from sched_task_sdk.executor import EXIT_OK, ExecutorTask, run_task
     ev = tmp_path / "events.jsonl"
     monkeypatch.setenv("SCHED_EVENT_FILE", str(ev))
-    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "checkpoint.json"))
     monkeypatch.setenv("SCHED_ATTEMPT_ID", "att-1")
     monkeypatch.setenv("SCHED_HEARTBEAT_INTERVAL_SEC", "0.05")
     monkeypatch.delenv("SCHED_PERMIT_FILE", raising=False)

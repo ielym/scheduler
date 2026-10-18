@@ -20,7 +20,6 @@ from sched import cgroup as cg
 from sched import config, runner
 from sched.config import JobStatus
 from sched.scheduler import SchedulerService
-from sched_task_sdk.checkpoint import CheckpointStore
 from sched_task_sdk.events import writer as event_writer
 
 
@@ -226,12 +225,3 @@ def test_sdk_event_at_is_utc(monkeypatch, tmp_path):
     w.emit("error")
     line = json.loads(ev.read_text("utf-8").splitlines()[0])
     assert str(line["at"]).endswith("+00:00"), "事件 at 必须是 UTC 时间戳"
-
-
-def test_sdk_checkpoint_saved_at_is_utc(monkeypatch, tmp_path):
-    cp = tmp_path / "checkpoint.json"
-    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(cp))
-    store = CheckpointStore()
-    saved = store.save({"done": 1})
-    assert str(saved["saved_at"]).endswith("+00:00"), \
-        "检查点 saved_at 必须是 UTC 时间戳（设计第十四节）"

@@ -56,7 +56,6 @@ def _fast_config(home):
     c.protect_deadline_sec = 6.0
     c.protect_round_backoff_sec = 2.0
     c.recovery_probe_sec = 0.5
-    c.recover_grace_sec = 3.0
     c.cmd_ack_wait_sec = 5.0
     c.producer_restart_base_sec = 0.5
     store.save_json(config.config_file(), cfg.model_dump())
@@ -151,7 +150,7 @@ class T(ExecutorTask):
             except Exception:
                 done = set()
         for i in range(TOTAL):
-            self.checkpoint({"next": i})   # 安全边界：保存断点 + 检查暂停
+            self.check_pause()   # 安全边界：检查暂停（不落盘）
             if i not in done:
                 time.sleep(0.3)
                 done.add(i)
@@ -214,12 +213,11 @@ class TestEndToEnd:
             assert job["retry_count"] == 0
             # 回执 + outbox 归档。C1：回执是一次性确认凭证——生产者消费确认
             # （unacked 清空落盘）后回执文件被删除，不无限累积
-            td = home / "tasks" / "t_ok"
             wait_until(lambda: jid not in (json.loads(
-                (td / "producer_state" / "state.json").read_text()
+                (config.producer_state_dir("t_ok") / "state.json").read_text()
             ).get("unacked") or {}), desc="producer consumed receipt")
-            assert not (td / "receipts" / f"{jid}.json").exists()
-            assert not list((td / "outbox").glob("*.json"))
+            assert not (config.receipts_dir("t_ok") / f"{jid}.json").exists()
+            assert not list(config.outbox_dir("t_ok").glob("*.json"))
             # attempt 记录
             atts = svc.db.list_attempts(job_id=jid)
             assert len(atts) == 1 and atts[0]["status"] == JobStatus.SUCCEEDED

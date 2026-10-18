@@ -23,7 +23,6 @@ from sched.config import JobStatus  # noqa: E402
 from sched.scheduler import AttMeta, SchedulerService  # noqa: E402
 from sched_task_sdk import control as sdk_control  # noqa: E402
 from sched_task_sdk import events as sdk_events  # noqa: E402
-from sched_task_sdk.checkpoint import CheckpointStore  # noqa: E402
 from sched_task_sdk.executor import ExecutorTask, Shortage, _clean_reason  # noqa: E402
 
 
@@ -86,7 +85,6 @@ class TestPermitGate:
         monkeypatch.setenv("SCHED_JOB_ID", "j1")
         monkeypatch.setenv("SCHED_EVENT_FILE", str(tmp_path / "ev.jsonl"))
         monkeypatch.setenv("SCHED_CONTROL_FILE", str(tmp_path / "ctl.json"))
-        monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "cp.json"))
         return ExecutorTask("t", permit_timeout_sec=0.3)
 
     def test_mismatched_permit_times_out_as_shortage(self, tmp_path, monkeypatch):
@@ -122,36 +120,6 @@ class TestPauseIdentity:
         monkeypatch.setenv("SCHED_TOKEN", "tok-NEW")
         p = sdk_control.current_pause()
         assert p is not None and p.command_id == "c1"
-
-
-# ---------- B4 检查点 checksum ----------
-
-class TestCheckpointChecksum:
-    def _store(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("SCHED_JOB_ID", "j1")
-        monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "cp.json"))
-        return CheckpointStore(), tmp_path / "cp.json"
-
-    def test_roundtrip_ok(self, tmp_path, monkeypatch):
-        cs, p = self._store(tmp_path, monkeypatch)
-        cs.save({"a": 1})
-        assert (CheckpointStore().load() or {}).get("data") == {"a": 1}
-
-    def test_corrupted_data_discarded(self, tmp_path, monkeypatch):
-        cs, p = self._store(tmp_path, monkeypatch)
-        cp = cs.save({"a": 1})
-        obj = json.loads(p.read_text("utf-8"))
-        obj["data"] = {"a": 999}  # 外部篡改/半写
-        p.write_text(json.dumps(obj), "utf-8")
-        fresh = CheckpointStore()
-        assert fresh.load() is None and fresh.commit_seq == 0
-
-    def test_missing_checksum_backward_compatible(self, tmp_path, monkeypatch):
-        cs, p = self._store(tmp_path, monkeypatch)
-        p.write_text(json.dumps({"format_version": 1, "commit_seq": 3,
-                                 "data": {"legacy": True}}), "utf-8")
-        fresh = CheckpointStore()
-        assert (fresh.load() or {}).get("data") == {"legacy": True}
 
 
 # ---------- C2 事件写失败不向上抛 ----------
@@ -213,7 +181,7 @@ def test_launch_infra_failure_keeps_job_queued(home, monkeypatch):
     assert svc._backoff_until.get("j10", 0.0) > 0.0  # 短退避后重试
     att = svc.db.list_attempts(job_id="j10")[0]
     assert att["status"] == JobStatus.FAILED  # attempt 留证据
-    lines = (home / "runtime" / "status.jsonl").read_text("utf-8").splitlines()
+    lines = config.status_log().read_text("utf-8").splitlines()
     assert any('"launch_failed"' in ln for ln in lines)
 
 
@@ -309,5 +277,5 @@ def test_revoke_released_pauses_lower_priority(home):
     # QUEUED 作业回退 PAUSED，pending_resume 回灌
     assert svc.db.get_job("j-lo")["status"] == JobStatus.PAUSED
     assert svc.protect.st.pending_resume.get("lo") == 50
-    lines = (home / "runtime" / "status.jsonl").read_text("utf-8").splitlines()
+    lines = config.status_log().read_text("utf-8").splitlines()
     assert any('"release_revoked"' in ln for ln in lines)

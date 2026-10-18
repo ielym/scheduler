@@ -85,10 +85,6 @@ class AttemptRun:
     def control_file(self) -> Path:
         return self.run_dir / "control.json"
 
-    @property
-    def checkpoint_file(self) -> Path:
-        return self.run_dir / "checkpoint.json"
-
     def is_alive(self) -> bool:
         if self.proc is not None and self.proc.poll() is not None:
             return False
@@ -293,11 +289,17 @@ def build_env(spec: AttemptSpec) -> dict[str, str]:
         "SCHED_JOB_ID": spec.job_id,
         "SCHED_TASK_ID": spec.task_id,
         "SCHED_TOKEN": spec.token,
+        # 代码（只读）与运行态（可写）分离：
+        "SCHED_TASK_DIR": str(config.task_dir(spec.task_id)),
+        "SCHED_TASK_STATE_DIR": str(config.task_state_dir(spec.task_id)),
+        "SCHED_ATTEMPT_DIR": str(config.run_dir(spec.attempt_id)),
+        "SCHED_ATTEMPT_WORK_DIR": str(config.attempt_work_dir(spec.attempt_id)),
+        # 兼容旧 SDK/任务写法：可写工作区 = 任务级运行态目录
+        "SCHED_WORKSPACE": str(config.task_state_dir(spec.task_id)),
         "SCHED_RUN_DIR": str(config.run_dir(spec.attempt_id)),
         "SCHED_EVENT_FILE": str(config.run_dir(spec.attempt_id) / "events.jsonl"),
         "SCHED_CONTROL_FILE": str(config.run_dir(spec.attempt_id) / "control.json"),
         "SCHED_PERMIT_FILE": str(config.run_dir(spec.attempt_id) / "permit.json"),
-        "SCHED_WORKSPACE": str(spec.task_root),
         "SCHED_HEARTBEAT_INTERVAL_SEC": str(spec.heartbeat_interval_sec),
     })
     existing = env.get("PYTHONPATH", "")
@@ -309,13 +311,15 @@ def build_env(spec: AttemptSpec) -> dict[str, str]:
 def launch(spec: AttemptSpec, input_refs: list[str] | None = None) -> AttemptRun:
     run_dir = config.run_dir(spec.attempt_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # attempt 级任务临时区（随 attempt 回收；任务自由布局）
+    config.attempt_work_dir(spec.attempt_id).mkdir(parents=True, exist_ok=True)
     input_refs = input_refs or []
-    # 工作目录：task.json 的 entry.cwd 为基，就绪请求的 workdir 相对它解析
-    # （两者均默认 "."，与既有行为一致；路径合法性已在 parse_task/parse_ready 校验）
-    base = spec.task_root
+    # 工作目录（可写）：落在任务**运行态**目录 runtime/tasks/<id>/ 内——
+    # entry.cwd 与就绪请求 workdir 均相对它解析（代码在 tasks/，产物在 runtime/）
+    base = config.task_state_dir(spec.task_id)
     entry_cwd = getattr(spec.executor_entry, "cwd", ".") or "."
     if entry_cwd not in (".", ""):
-        base = spec.task_root / entry_cwd
+        base = base / entry_cwd
     workdir = base if spec.workdir in (".", "") else (base / spec.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 

@@ -165,7 +165,7 @@ class TestResourceTrend:
 class TestReceiver:
     def _mk_task(self, home, task_id="t1", priority=50):
         td = home / "tasks" / task_id
-        (td / "outbox").mkdir(parents=True)
+        config.outbox_dir(task_id).mkdir(parents=True, exist_ok=True)
         spec = config.TaskSpec(
             schema_version=1, task_id=task_id, priority=priority,
             producer_entry=config.EntrySpec(file="producer.py"),
@@ -178,7 +178,7 @@ class TestReceiver:
                "idempotency_key": f"idem-{job_id}"}
         if pri is not None:
             obj["priority"] = pri
-        (td / "outbox" / f"{job_id}.json").write_text(json.dumps(obj))
+        (config.outbox_dir(task_id) / f"{job_id}.json").write_text(json.dumps(obj))
 
     def test_batch_time_slice(self, home):
         td, spec = self._mk_task(home)

@@ -86,7 +86,7 @@ def test_db_attempt_unique_live(tmp_path):
 # ---------- receiver ----------
 def test_receiver_flow(home, tmp_path):
     _write_task(home, "demo")
-    out = home / "tasks" / "demo" / "outbox"
+    out = config.outbox_dir("demo")
     out.mkdir(parents=True)
     payload = {"schema_version": 1, "job_id": "demo-abc", "task_id": "demo",
                "entry_args": [], "input_refs": [], "idempotency_key": "k", "env": {}}
@@ -97,14 +97,14 @@ def test_receiver_flow(home, tmp_path):
     assert summary["created"] == 1
     assert d.get_job("demo-abc")["status"] == config.JobStatus.QUEUED
     # 回执写入
-    assert (home / "tasks" / "demo" / "receipts" / "demo-abc.json").exists()
+    assert (config.receipts_dir("demo") / "demo-abc.json").exists()
     # 归档
     assert not list(out.glob("*.json"))
 
 
 def test_receiver_conflict_isolation(home, tmp_path):
     _write_task(home, "demo")
-    out = home / "tasks" / "demo" / "outbox"
+    out = config.outbox_dir("demo")
     out.mkdir(parents=True)
     d = dbmod.DB(tmp_path / "e.db")
     spec = config.load_task("demo")
@@ -115,7 +115,7 @@ def test_receiver_conflict_isolation(home, tmp_path):
     (out / "demo-x.json").write_text(json.dumps(p2))
     summary = receiver.receive_outbox("demo", spec, d, "now2")
     assert summary["conflict"] == 1
-    assert (home / "runtime" / "isolation" / "demo" / "demo-x.json").exists()
+    assert (config.isolation_root() / "demo" / "demo-x.json").exists()
     # 原作业未被覆盖
     assert d.get_job("demo-x")["env_json"] == "{}"
 
@@ -215,17 +215,6 @@ def test_protect_yield_candidate():
 
 
 # ---------- SDK ----------
-def test_sdk_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "cp.json"))
-    from sched_task_sdk.checkpoint import CheckpointStore
-    c = CheckpointStore()
-    c.save({"done_ids": [1, 2]})
-    c = CheckpointStore()
-    data = c.load()
-    assert data["data"]["done_ids"] == [1, 2]
-    assert data["commit_seq"] == 1
-
-
 def test_sdk_event_writer(tmp_path, monkeypatch):
     monkeypatch.setenv("SCHED_EVENT_FILE", str(tmp_path / "events.jsonl"))
     from sched_task_sdk import events as ev

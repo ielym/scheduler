@@ -319,7 +319,7 @@ class TestOutboxSubdirectories:
 
     def test_receive_subdir_files_and_archive_by_job_id(self, home):
         spec = self._spec(home)
-        out = home / "tasks" / "t1" / "outbox"
+        out = config.outbox_dir("t1")
         (out / "batch-01").mkdir(parents=True)
         (out / "batch-02").mkdir(parents=True)
         doc_a = {"schema_version": 1, "job_id": "j-sub-a", "task_id": "t1",
@@ -333,24 +333,24 @@ class TestOutboxSubdirectories:
         assert s["created"] == 2  # 分目录内文件均被发现（设计第二节 L23）
         assert not list(out.rglob("*.json"))
         # 归档按 job_id 平铺（与归档对账路径一致），同名文件不冲突
-        arch = home / "runtime" / "archive" / "t1"
+        arch = config.archive_root() / "t1"
         assert (arch / "j-sub-a.json").exists()
         assert (arch / "j-sub-b.json").exists()
 
     def test_isolate_preserves_subdir_structure(self, home):
         spec = self._spec(home)
-        out = home / "tasks" / "t1" / "outbox" / "bad-batch"
+        out = config.outbox_dir("t1") / "bad-batch"
         out.mkdir(parents=True)
         (out / "broken.json").write_text("{not json")
         s = receiver.receive_outbox("t1", spec, SchedulerService().db,
                                     "2026-10-12T00:00:00+00:00")
         assert s["invalid"] == 1
-        iso = home / "runtime" / "isolation" / "t1" / "bad-batch" / "broken.json"
+        iso = config.isolation_root() / "t1" / "bad-batch" / "broken.json"
         assert iso.exists()
 
     def test_seen_tracked_by_relative_path(self, home):
         spec = self._spec(home)
-        out = home / "tasks" / "t1" / "outbox"
+        out = config.outbox_dir("t1")
         (out / "s1").mkdir(parents=True)
         (out / "s2").mkdir(parents=True)
         doc_a = {"schema_version": 1, "job_id": "j-x1", "task_id": "t1",

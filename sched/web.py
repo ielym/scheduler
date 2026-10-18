@@ -3,12 +3,12 @@
   sched web [--host 127.0.0.1] [--port 8765] [--token XXXX]
 
 数据面（全部只读，不干扰 serve 主循环）：
-- runtime/snapshot.json   —— serve 每轮发布的运行时快照（双时钟新鲜度校验）
-- runtime/exec.db (WAL)   —— 作业 / attempt / 事件 / 检查点（只读连接）
+- runtime/state/snapshot.json —— serve 每轮发布的运行时快照（双时钟新鲜度校验）
+- runtime/state/exec.db (WAL) —— 作业 / attempt / 事件（只读连接）
 
 控制面（复用 CLI 与 serve 的既有 IPC 通道，设计第十四节）：
-- runtime/commands.jsonl  —— cancel_job / requeue_job / cancel_attempt
-- runtime/commands_ack.jsonl —— serve 回执（等待至 cmd_ack_wait_sec）
+- runtime/ipc/commands.jsonl  —— cancel_job / requeue_job / cancel_attempt
+- runtime/ipc/commands_ack.jsonl —— serve 回执（等待至 cmd_ack_wait_sec）
 - serve 不在（单实例锁空闲）时直连数据库处理（与 CLI 相同语义）
 
 页面为 sched/web_static/ 下的自包含静态资源（无构建步骤、无外部 CDN）。
@@ -355,7 +355,7 @@ def api_live_attempts(limit: int = 800) -> dict:
 
 _STATUS_KIND_CN = {
     "attempt_launched": "启动执行", "attempt_finalized": "执行结束",
-    "checkpoint_restored": "检查点恢复", "recover_requeued": "重启回收重排",
+    "recover_requeued": "重启回收重排",
     "recover_confirmed": "恢复确认成功", "producer_crash": "生产者崩溃",
     "pause_requested": "请求暂停", "pause_grace_exceeded": "暂停宽限超时",
     "protect_released": "保护解除", "protect_ended": "保护轮结束",
@@ -365,7 +365,7 @@ _STATUS_KIND_CN = {
 
 
 def api_events_recent(limit: int = 60) -> dict:
-    """调度器状态日志末尾 N 条（runtime/status.jsonl，控制动作审计流）。
+    """调度器状态日志末尾 N 条（runtime/logs/status.jsonl，控制动作审计流）。
     尾部 256KB 定位 + 跳过截断半行，不整文件载入。"""
     limit = max(1, min(300, int(limit)))
     p = config.status_log()
@@ -406,14 +406,13 @@ def api_events_recent(limit: int = 60) -> dict:
     return {"items": out}
 
 
-_METRICS_FILE = "web_metrics.jsonl"
 _METRICS_INTERVAL_SEC = 5.0
 _METRICS_ROTATE_BYTES = 16 * 1024 * 1024
 _metrics_lock = threading.Lock()
 
 
 def _metrics_path() -> Path:
-    return config.runtime_dir() / _METRICS_FILE
+    return config.web_metrics_file()
 
 
 def _metrics_sampler() -> None:
@@ -727,16 +726,16 @@ def api_task_delete(task_id: str) -> tuple[dict, int]:
             pass
         if sig == "TERM":
             time.sleep(3.0)
-    # 3. 文件清理：任务目录（代码/配置/outbox/producer_state/receipts）、
-    #    归档、隔离、该任务全部 runs
+    # 3. 文件清理：任务定义（tasks/）、任务运行态（runtime/tasks/）、归档、隔离
     removed = {"task_dir": False, "attempts": 0}
     try:
         shutil.rmtree(td, ignore_errors=True)
         removed["task_dir"] = not td.exists()
     except OSError:
         pass
-    for sub in ("archive", "isolation"):
-        d = config.runtime_dir() / sub / task_id
+    for d in (config.task_state_dir(task_id),
+              config.archive_root() / task_id,
+              config.isolation_root() / task_id):
         if d.is_dir():
             shutil.rmtree(d, ignore_errors=True)
     conn = _rw_conn()

@@ -64,7 +64,7 @@ def test_reconcile_archive_single_batch_per_call(home, monkeypatch):
     svc = _svc(home)
     for jid in ("j1", "j2", "j3"):
         _mk_job(svc.db, jid)
-    ad = home / "runtime" / "archive" / "t"
+    ad = config.archive_root() / "t"
     ad.mkdir(parents=True)
     (ad / "j1.json").write_text("{}")
     (ad / "j2.json").write_text("{}")  # j3 缺归档

@@ -2,9 +2,20 @@
 
 目录布局（设计文档第二节）：
     SCHED_HOME/
-      config.json          全局配置
-      tasks/<task_id>/     task.json + 生产者入口 + 执行入口 + producer_state + outbox + receipts
-      runtime/             单实例锁、执行数据库、请求归档、隔离、执行事件、控制文件、检查点、状态日志
+      config.json          全局配置（全机唯一）
+      tasks/<task_id>/     ★只读定义：task.json（含静态 params）+ 生产者入口 + 执行入口
+      runtime/             ★全部运行态（可整体删除）
+        scheduler.lock
+        state/             exec.db(+wal/shm) / snapshot.json / timing.json
+        ipc/               commands.jsonl / commands_ack.jsonl
+        logs/              status.jsonl* / web_metrics.jsonl* / <task_id>/producer.*
+        artifacts/         runs/<attempt_id>/（含 work/ 随 attempt 回收）/ archive/<task_id>/ / isolation/<task_id>/
+        tasks/<task_id>/   任务级运行态：outbox/ receipts/ producer_state/（契约固定）+ 任务自由布局
+
+目录契约：
+- tasks/<task_id>/ 只放代码与静态定义，**不存放任何运行时产物**；
+- 任务级运行态（生产者游标/outbox/receipts/任务自建缓存等）统一在 runtime/tasks/<task_id>/；
+- attempt 级临时区 runtime/artifacts/runs/<attempt_id>/work/ 随 attempt 回收。
 
 任务不填写最大运行/排队数量或默认资源申请；生产者由调度器独立守护且不施加执行资源控制。
 """
@@ -80,57 +91,112 @@ def runtime_dir() -> Path:
 
 
 def lock_file() -> Path:
+    """调度器单实例锁。"""
     return runtime_dir() / "scheduler.lock"
 
 
+# ---------- runtime/state：权威状态与快照 ----------
+def state_dir() -> Path:
+    return runtime_dir() / "state"
+
+
 def db_file() -> Path:
-    return runtime_dir() / "exec.db"
-
-
-def logs_dir() -> Path:
-    return runtime_dir() / "logs"
-
-
-def runs_root() -> Path:
-    return runtime_dir() / "runs"
-
-
-def status_log() -> Path:
-    return runtime_dir() / "status.jsonl"
+    return state_dir() / "exec.db"
 
 
 def snapshot_file() -> Path:
     """serve 进程每轮发布的运行时快照（CLI status 读取）。"""
-    return runtime_dir() / "snapshot.json"
+    return state_dir() / "snapshot.json"
+
+
+def timing_file() -> Path:
+    """任务级反馈节奏 EMA 持久化。"""
+    return state_dir() / "timing.json"
+
+
+# ---------- runtime/ipc：CLI/Web ↔ serve 控制通道 ----------
+def ipc_dir() -> Path:
+    return runtime_dir() / "ipc"
 
 
 def commands_file() -> Path:
     """CLI → serve 控制命令队列（JSONL，serve 消费后写入 ack 文件）。"""
-    return runtime_dir() / "commands.jsonl"
+    return ipc_dir() / "commands.jsonl"
 
 
 def commands_ack_file() -> Path:
-    return runtime_dir() / "commands_ack.jsonl"
+    return ipc_dir() / "commands_ack.jsonl"
 
 
-def task_dir(task_id: str) -> Path:
-    return tasks_dir() / task_id
+# ---------- runtime/logs：审计/指标/生产者日志 ----------
+def logs_dir() -> Path:
+    return runtime_dir() / "logs"
 
 
-def producer_state_dir(task_id: str) -> Path:
-    return task_dir(task_id) / "producer_state"
+def status_log() -> Path:
+    """调度器状态/审计流水（web 控制台读取末尾展示）。"""
+    return logs_dir() / "status.jsonl"
 
 
-def outbox_dir(task_id: str) -> Path:
-    return task_dir(task_id) / "outbox"
+def web_metrics_file() -> Path:
+    """Web 控制台图表历史采样流。"""
+    return logs_dir() / "web_metrics.jsonl"
 
 
-def receipts_dir(task_id: str) -> Path:
-    return task_dir(task_id) / "receipts"
+# ---------- runtime/artifacts：执行工件 / 归档 / 隔离 ----------
+def artifacts_dir() -> Path:
+    return runtime_dir() / "artifacts"
+
+
+def runs_root() -> Path:
+    return artifacts_dir() / "runs"
 
 
 def run_dir(attempt_id: str) -> Path:
     return runs_root() / attempt_id
+
+
+def attempt_work_dir(attempt_id: str) -> Path:
+    """attempt 级任务临时区（随 attempt 回收；任务自由布局）。"""
+    return run_dir(attempt_id) / "work"
+
+
+def archive_root() -> Path:
+    return artifacts_dir() / "archive"
+
+
+def isolation_root() -> Path:
+    return artifacts_dir() / "isolation"
+
+
+# ---------- runtime/tasks：任务级运行态（契约固定 + 任务自由布局） ----------
+def tasks_state_root() -> Path:
+    return runtime_dir() / "tasks"
+
+
+def task_dir(task_id: str) -> Path:
+    """任务定义目录（tasks/<task_id>/，只读代码与静态定义）。"""
+    return tasks_dir() / task_id
+
+
+def task_state_dir(task_id: str) -> Path:
+    """任务级运行态目录（runtime/tasks/<task_id>/）。"""
+    return tasks_state_root() / task_id
+
+
+def producer_state_dir(task_id: str) -> Path:
+    """契约固定：生产者游标/未确认账目 + 单实例锁。"""
+    return task_state_dir(task_id) / "producer_state"
+
+
+def outbox_dir(task_id: str) -> Path:
+    """契约固定：生产者发布的就绪 JSON。"""
+    return task_state_dir(task_id) / "outbox"
+
+
+def receipts_dir(task_id: str) -> Path:
+    """契约固定：接收方回执（生产者轮询消费）。"""
+    return task_state_dir(task_id) / "receipts"
 
 
 # ---------- 全局配置 config.json ----------
@@ -167,7 +233,6 @@ class ControlConfig(BaseModel):
     observability_slow_factor: float = 3.0  # 观测不足时扩容观察期放大倍数
     task_backoff_probe_base_sec: float = 30.0   # 任务全退避后的首次探测间隔
     task_backoff_probe_cap_sec: float = 600.0   # 探测间隔上限（按级别翻倍递增）
-    recover_grace_sec: float = 30.0         # 重启后旧执行进程协作退出宽限
     cmd_ack_wait_sec: float = 6.0           # CLI 控制命令等待确认超时
     stale_pause_cooldown_sec: float = 60.0  # 心跳超时/OOM/内存增长退让等暂停的作业恢复排队前冷却，防紧密重启循环
     cleanup_terminal_after_sec: float = 604800.0  # 已完结作业（成功/取消）attempt 工件保留时长
@@ -235,6 +300,9 @@ class TaskSpec(BaseModel):
     # 作业不得越过任务优先级，避免执行程序自行改变全局优先级）；任务可
     # 声明更窄的授权（更低的 cap），不可声明比任务优先级更高的 cap。
     job_priority_cap: int | None = Field(None)
+    # 任务静态参数（统一到 task.json）：topic/query/日期范围等由任务自解释，
+    # 调度器不解释其内容，仅保证"静态定义集中在一处、tasks/ 无独立配置文件"。
+    params: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "forbid"}
 
@@ -294,15 +362,17 @@ def parse_task(raw: Any, task_id: str) -> TaskSpec:
         raise TaskError(
             "recovery.retain 与 recovery.replay_note 必须是非空说明"
             "（数据源保留多久/如何识别遗漏，设计第三节）")
-    base = task_dir(task_id)
+    code_base = task_dir(task_id)           # 代码：tasks/ 下（只读）
+    state_base = task_state_dir(task_id)    # 运行态：runtime/tasks/ 下（可写）
     for field, entry in (("producer_entry", doc.producer_entry),
                          ("executor_entry", doc.executor_entry)):
-        p = _rel_within(base, entry.file, f"{field}.file")
+        p = _rel_within(code_base, entry.file, f"{field}.file")
         if not p.exists():
             raise TaskError(f"{field}.file 不存在：{entry.file}")
-        # 入口工作目录必须落在任务目录内（B11：cwd 声明必须被校验且生效）
-        _rel_within(base, entry.cwd or ".", f"{field}.cwd")
-    _rel_within(base, doc.workdir or ".", "workdir")
+        # 入口工作目录落在任务**运行态**目录内（B11：cwd 声明必须被校验且生效；
+        # 代码在 tasks/，可写产物一律在 runtime/）
+        _rel_within(state_base, entry.cwd or ".", f"{field}.cwd")
+    _rel_within(state_base, doc.workdir or ".", "workdir")
     return doc
 
 
@@ -379,10 +449,10 @@ def parse_ready(raw: Any) -> ReadyJob:
         doc = ReadyJob.model_validate(raw)
     except Exception as e:
         raise ReadyError(str(e)) from e
-    # workdir 必须落在其声明任务目录内（与 task.json 的 workdir 同一包含校验）：
-    # 执行进程以此目录为 cwd，越出任务目录即越权访问任务边界之外
+    # workdir 必须落在其声明任务的**运行态**目录内（与 task.json 的 workdir
+    # 同一包含校验）：执行进程以此目录为 cwd，越出即越权访问任务边界之外
     try:
-        _rel_within(task_dir(doc.task_id), doc.workdir or ".", "workdir")
+        _rel_within(task_state_dir(doc.task_id), doc.workdir or ".", "workdir")
     except TaskError as e:
         raise ReadyError(str(e)) from e
     return doc
@@ -390,7 +460,9 @@ def parse_ready(raw: Any) -> ReadyJob:
 
 # ---------- 全局配置读写 ----------
 def ensure_layout() -> None:
-    for d in (tasks_dir(), runtime_dir(), runs_root(), logs_dir()):
+    for d in (tasks_dir(), runtime_dir(), state_dir(), ipc_dir(), logs_dir(),
+              artifacts_dir(), runs_root(), archive_root(), isolation_root(),
+              tasks_state_root()):
         d.mkdir(parents=True, exist_ok=True)
     cf = config_file()
     if not cf.exists():

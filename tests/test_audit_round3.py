@@ -69,7 +69,7 @@ def _ready(job_id, task_id="t1"):
 class TestMismatchTaskIdReceipt:
     def test_mismatched_task_id_writes_invalid_receipt(self, home, tmp_path):
         _write_task(home, "demo")
-        out = home / "tasks" / "demo" / "outbox"
+        out = config.outbox_dir("demo")
         out.mkdir(parents=True)
         payload = {"schema_version": 1, "job_id": "demo-x", "task_id": "other",
                    "entry_args": [], "env": {}, "idempotency_key": "k"}
@@ -79,14 +79,14 @@ class TestMismatchTaskIdReceipt:
         summary = receiver.receive_outbox("demo", spec, db, "now")
         assert summary["invalid"] == 1
         # 回执闭环：错误投递的作业也有反馈，生产者可据此处理
-        rc = home / "tasks" / "demo" / "receipts" / "demo-x.json"
+        rc = config.receipts_dir("demo") / "demo-x.json"
         assert rc.exists()
         doc = json.loads(rc.read_text())
         assert doc["status"] == "invalid"
         assert "other" in doc["reason"]
         # 不入库、已隔离
         assert db.get_job("demo-x") is None
-        assert (home / "runtime" / "isolation" / "demo" / "demo-x.json").exists()
+        assert (config.isolation_root() / "demo" / "demo-x.json").exists()
 
 
 # ---------- 就绪 JSON workdir 包含校验 ----------
@@ -119,7 +119,7 @@ class TestReadyWorkdir:
 
     def test_receiver_isolates_escaping_workdir(self, home, tmp_path):
         _write_task(home, "demo")
-        out = home / "tasks" / "demo" / "outbox"
+        out = config.outbox_dir("demo")
         out.mkdir(parents=True)
         payload = self._doc(job_id="demo-esc", task_id="demo",
                             workdir="../demo")
@@ -128,8 +128,8 @@ class TestReadyWorkdir:
         spec = config.load_task("demo")
         summary = receiver.receive_outbox("demo", spec, db, "now")
         assert summary["invalid"] == 1
-        assert (home / "runtime" / "isolation" / "demo" / "demo-esc.json").exists()
-        assert (home / "tasks" / "demo" / "receipts" / "demo-esc.json").exists()
+        assert (config.isolation_root() / "demo" / "demo-esc.json").exists()
+        assert (config.receipts_dir("demo") / "demo-esc.json").exists()
         assert db.get_job("demo-esc") is None
 
 

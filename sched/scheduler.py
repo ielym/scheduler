@@ -156,6 +156,7 @@ class SchedulerService:
         self._reconcile_offset = 0                        # 归档对账分批游标（时间片）
         self._last_full_rescan_mono = 0.0                 # outbox 全量重扫兜底节流
         self._last_archive_gc_mono = 0.0                  # 归档 GC 节流（C1）
+        self._last_orphan_gc_mono = 0.0                   # 孤儿运行态目录 GC 节流
         self._status_scan: dict[str, tuple[int, int]] = {} # 状态扫描滚动游标 status -> (offset, len)（C5）
         self._last_cleanup_mono = 0.0                     # 已完结作业清理节流（B13）
         self._lock = threading.RLock()
@@ -318,6 +319,7 @@ class SchedulerService:
                 self._tick_receive(runner.now_iso())
                 self._tick_cleanup(now)
                 self._tick_archive_gc(now)
+                self._tick_orphan_gc(now)
                 self._tick_resource(now)
                 self._tick_control(now)
                 self._tick_backoff(now)
@@ -404,7 +406,7 @@ class SchedulerService:
             self._reconcile_offset = 0
             return
         for task_id, job_id in rows:
-            p = config.runtime_dir() / "archive" / task_id / f"{job_id}.json"
+            p = config.archive_root() / task_id / f"{job_id}.json"
             if not p.exists():
                 log.warning("archive reconciliation: job %s (task %s, received "
                             "within %.0fh) missing archive file",
@@ -429,7 +431,7 @@ class SchedulerService:
         if now_mono - self._last_archive_gc_mono < self.ARCHIVE_GC_INTERVAL_SEC:
             return
         self._last_archive_gc_mono = now_mono
-        root = config.runtime_dir() / "archive"
+        root = config.archive_root()
         if not root.is_dir():
             return
         cutoff = time.time() - self.ARCHIVE_RETAIN_SEC
@@ -447,6 +449,38 @@ class SchedulerService:
         if gone:
             log.info("archive gc: removed %d archived files older than %d days",
                      gone, int(self.ARCHIVE_RETAIN_SEC // 86400))
+
+    ORPHAN_GC_INTERVAL_SEC = 3600.0
+
+    def _tick_orphan_gc(self, now_mono: float) -> None:
+        """回收"任务目录已不存在"的孤儿运行态目录（已删任务的残留）。
+
+        判定以任务**定义目录** tasks/<id> 是否存在为准（不以 spec 加载成功为准，
+        避免 task.json 暂不可解析时误删）；覆盖 archive/isolation/logs/tasks 四处。
+        """
+        if now_mono - self._last_orphan_gc_mono < self.ORPHAN_GC_INTERVAL_SEC:
+            return
+        self._last_orphan_gc_mono = now_mono
+        for root, area in ((config.archive_root(), "archive"),
+                           (config.isolation_root(), "isolation"),
+                           (config.logs_dir(), "logs"),
+                           (config.tasks_state_root(), "task_state")):
+            self._gc_orphan_dirs(root, area)
+
+    def _gc_orphan_dirs(self, root: Path, area: str) -> None:
+        try:
+            names = [d.name for d in root.iterdir() if d.is_dir()]
+        except OSError:
+            return
+        for name in names:
+            if config.task_dir(name).is_dir():
+                continue
+            try:
+                shutil.rmtree(root / name, ignore_errors=True)
+            except OSError:
+                continue
+            self._append_status({"ts": runner.now_iso(), "kind": "orphan_gc",
+                                 "area": area, "task_id": name})
 
     def _scan_order(self) -> list[str]:
         """接收顺序：任务优先级降序，同级任务轮转（设计文档第五节）。"""
@@ -803,6 +837,9 @@ class SchedulerService:
              "pid_start_time": a.start_time},
             meta.job_id, outcome.status, reason, now)
         a.cleanup()
+        # attempt 级临时区随 attempt 回收（任务自由布局的缓存/中间产物即时清除；
+        # attempt 目录本身按诊断保留期由 _tick_cleanup 收拾）
+        shutil.rmtree(config.attempt_work_dir(meta.attempt_id), ignore_errors=True)
 
         self.attempts.pop(meta.attempt_id, None)
         self.meta.pop(meta.attempt_id, None)
@@ -1573,12 +1610,12 @@ class SchedulerService:
     # ---------- 进度节奏 EMA 持久化（重启回填，避免进度节奏归零） ----------
     def _restore_timing(self) -> None:
         from . import store
-        snap = store.load_json(config.runtime_dir() / "timing.json")
+        snap = store.load_json(config.timing_file())
         self.timing.restore(snap)
 
     def _save_timing(self) -> None:
         from . import store
-        store.save_json(config.runtime_dir() / "timing.json", self.timing.snapshot())
+        store.save_json(config.timing_file(), self.timing.snapshot())
 
     def _maybe_save_timing(self, now_mono: float) -> None:
         if now_mono - self._last_timing_save_mono >= 30.0:

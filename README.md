@@ -71,31 +71,38 @@ python3 -m sched task validate hello
 python3 -m sched serve            # 前台常驻：守护生产者 → 接收 outbox → 平缓拉起执行进程
 ```
 
-`serve` 会守护生产者，接收 `outbox/` 就绪 JSON → SQLite 去重索引 → 回执 → 平缓拉起 `run.py`，事件经 `runtime/runs/<attempt_id>/events.jsonl` 上报，`runtime/status.jsonl` 记录状态。
+`serve` 会守护生产者，接收 `runtime/tasks/<id>/outbox/` 就绪 JSON → SQLite 去重索引 → 回执 → 平缓拉起 `run.py`，事件经 `runtime/artifacts/runs/<attempt_id>/events.jsonl` 上报，`runtime/logs/status.jsonl` 记录状态。
 
 ## 数据布局（SCHED_HOME，默认 sched 包父目录）
 
 ```
 SCHED_HOME/
-├── config.json                      # 全局配置（control 节奏）
-├── tasks/<task_id>/
-│   ├── task.json                    # 任务清单（唯一真源）
-│   ├── producer.py / run.py         # 生产者入口 / 执行入口
-│   ├── producer_state/state.json    # 游标 + 待发布记录
-│   ├── outbox/<job_id>.json         # 就绪作业 JSON
-│   └── receipts/<job_id>.json       # 接收回执
-└── runtime/
-    ├── exec.db                      # SQLite 执行库
+├── config.json                      # 全局配置（唯一；control 节奏参数）
+├── tasks/<task_id>/                 # ★只读定义（纳入 git）：无任何运行时产物
+│   ├── task.json                    # 任务清单 + 静态 params（topic/query/…）
+│   └── producer.py / run.py         # 生产者入口 / 执行入口
+└── runtime/                         # ★全部运行态（可整体删除）
     ├── scheduler.lock               # 单实例 flock
-    ├── snapshot.json                # serve 每轮写入的运行时快照（CLI status 优先读取）
-    ├── commands.jsonl               # CLI → serve 控制命令通道
-    ├── commands_ack.jsonl           # serve 对控制命令的回执
-    ├── archive/  isolation/         # 归档 / 异常隔离
-    ├── runs/<attempt_id>/           # events.jsonl / control.json / permit.json / worker.log
-    │                               # （checkpoint.json 由任务自行按需写入，调度器不管理）
-    ├── logs/<task_id>/              # 生产者日志
-    └── status.jsonl                 # 状态日志
+    ├── state/                       # exec.db(+wal/shm) / snapshot.json / timing.json
+    ├── ipc/                         # commands.jsonl / commands_ack.jsonl
+    ├── logs/                        # status.jsonl* / web_metrics.jsonl* / <task_id>/producer.*
+    ├── artifacts/
+    │   ├── runs/<attempt_id>/       # events.jsonl / control.json / permit.json / worker.log (+ work/)
+    │   ├── archive/<task_id>/<job_id>.json
+    │   └── isolation/<task_id>/
+    └── tasks/<task_id>/             # 任务级运行态
+        ├── outbox/<job_id>.json     # 契约固定（接收器读）
+        ├── receipts/<job_id>.json   # 契约固定（生产者轮询）
+        ├── producer_state/state.json, producer.lock  # 契约固定（游标账目 + 单实例锁）
+        └── …其余任务自由布局（生成输入 / 缓存等）
 ```
+
+约定：`tasks/` 只放代码与静态定义；一切可写产物在 `runtime/`。attempt 级临时区
+`runtime/artifacts/runs/<attempt_id>/work/` 随 attempt 回收。注入环境变量：
+`SCHED_TASK_DIR`（代码）/`SCHED_TASK_STATE_DIR`（任务运行态）/`SCHED_ATTEMPT_DIR` /
+`SCHED_ATTEMPT_WORK_DIR`（随 attempt 回收的缓存区）；`SCHED_WORKSPACE` 兼容保留 =
+`SCHED_TASK_STATE_DIR`。无断点文件——恢复/幂等由任务以外部真源自证（安全边界调
+`check_pause()`）。
 
 ## CLI
 
@@ -126,7 +133,7 @@ sched attempt cancel <id> [--reason r]  # 显式取消单个 attempt
 ## SDK（`sched_task_sdk`）
 
 - **`Producer`**：发现游标 + 待发布记录 + 无丢失发布 + 稳定 job_id + 重放。
-- **`ExecutorTask`**：进展/断点（`checkpoint`/`resume_data`）/`report_progress`/`report_shortage`/`complete`/协作暂停。
+- **`ExecutorTask`**：进展 `report_progress` / `report_shortage` / `complete` / 协作暂停 `check_pause`（无断点设施：恢复/幂等由任务以外部真源自证）。
 
 ## 调度模型
 

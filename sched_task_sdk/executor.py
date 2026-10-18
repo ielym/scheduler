@@ -5,11 +5,12 @@
   通信格式统一（同一信封），type 只区分语义。
 - 进展只报单调递增已完成单元数；耗时、资源消耗、存活节奏一律由调度器
   自行观测统计（cgroup / 墙钟 / 事件间隔 EMA），任务不预估。
-- 协作暂停、可重放执行、幂等提交是必需能力；断点是任务可选实践。
+- 协作暂停、可重放执行、幂等提交是必需能力；恢复/幂等的"真源"由任务自行
+  以外部系统承担（如 OSS 对象存在性），调度器不管理、不搬运任何断点文件。
 - 终止结果由退出码表达：0=成功（须发 done）、75=资源不足、其他=业务失败；
   错误归因统一发 error 事件（reason 携带错误类型+资源标识）。
 
-子类只需实现 execute()；在安全边界调用 self.checkpoint()（保存断点，顺带检查暂停）。
+子类只需实现 execute()；在安全边界调用 self.check_pause() 检查协作暂停（不落盘）。
 """
 
 from __future__ import annotations
@@ -22,11 +23,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
 
 from . import control as _control
 from . import events as _events
-from .checkpoint import CheckpointStore
 from .errors import EXIT_OK, EXIT_SHORTAGE, EventKind
 
 
@@ -77,11 +76,9 @@ class ExecutorTask:
         # 启动许可等待上限（超时按资源不足退出，不误判为业务失败）
         self.permit_timeout_sec = 60.0 if permit_timeout_sec is None \
             else float(permit_timeout_sec)
-        self._ckpt = CheckpointStore()
         self._events = _events.writer()
         self._stop_evt = threading.Event()
         self._pause: _control.PauseCommand | None = None
-        self._ckpt_saved_this_attempt = False   # 本 attempt 是否已提交过检查点
         self._last_completed_units: int | None = None  # 进展单调校验基准
         self.heartbeat_interval_sec = _heartbeat_interval_from_env()
         self._heartbeat_thread: threading.Thread | None = None
@@ -92,7 +89,6 @@ class ExecutorTask:
 
     # ---------- 生命周期 ----------
     def run(self) -> int:
-        self._ckpt.load()
         self._install_signal()
         self._events.emit(EventKind.STARTED, name=self.name)
         self._start_heartbeat()
@@ -105,11 +101,8 @@ class ExecutorTask:
         except PauseRequested:
             self._on_pause()
         except Shortage as e:
-            # 资源不足退出前提交检查点，避免 75 退出回退到旧检查点丢本轮进度。
-            try:
-                self._ensure_checkpoint_before_exit()
-            except Exception:
-                pass
+            # 资源不足：统一发 error 事件归因（exit 75），交调度器退避重排；
+            # 幂等由任务以外部真源（如 OSS）保证，无需在此保任何本地断点。
             self._events.emit(EventKind.ERROR, reason=e.reason)
             exit_code = EXIT_SHORTAGE
         except Exception as e:
@@ -188,63 +181,26 @@ class ExecutorTask:
     def _on_signal(self, signum, frame):
         self._stop_evt.set()
 
-    def checkpoint(self, data: Any = None, *, input_ref: str = "",
-                   business_version: str = "", progress: Any = None,
-                   noop: bool = False) -> dict | None:
-        """保存断点（原子提交、提交编号递增），并顺带检查暂停。
+    def check_pause(self) -> None:
+        """安全边界检查：收到协作暂停/停止请求即抛 PauseRequested 结束本次 attempt。
 
-        断点只写文件，不发事件——调度器需要"断点推进"信号时直接读文件。
-        在安全边界调用：若已收到暂停，保存断点后抛 PauseRequested。
-        """
-        cp = None
-        if not noop:
-            cp = self._ckpt.save(data, input_ref=input_ref,
-                                 business_version=business_version,
-                                 progress=progress)
-            self._ckpt_saved_this_attempt = True
-        self.checkpoint_now_ack()
-        return cp
-
-    def checkpoint_now_ack(self) -> None:
-        """只检查暂停（不保存断点）。
-
-        确认暂停时若本 attempt 尚未提交过任何检查点、但继承了上一 attempt
-        的检查点数据，则先把继承数据按本 attempt 身份重提交一次。
+        不落任何本地断点文件——恢复/幂等由任务以外部真源（如 OSS 对象存在性）
+        自证。在安全边界调用；暂停期间退出走协作暂停（exit 0 → PAUSED）。
         """
         if self._pause is None:
             self._pause = _control.current_pause()
         if self._pause is not None or self._stop_evt.is_set():
-            self._ensure_checkpoint_before_exit()
             raise PauseRequested()
-
-    def _ensure_checkpoint_before_exit(self) -> None:
-        """退出前（暂停确认 / 资源不足退出）的检查点兜底：本 attempt 尚未
-        提交过但持有断点数据时，按本 attempt 身份重提交一次。"""
-        if self._ckpt_saved_this_attempt:
-            return
-        prev = self._ckpt.last
-        if not isinstance(prev, dict) or prev.get("data") is None:
-            return
-        self._ckpt.save(prev["data"],
-                        input_ref=str(prev.get("input_ref") or ""),
-                        business_version=str(prev.get("business_version") or ""),
-                        progress=prev.get("progress"))
-        self._ckpt_saved_this_attempt = True
 
     def wait_interruptible(self, sec: float) -> None:
         """可中断等待：小步睡眠并检查暂停/停止，长等待必须用它替代 time.sleep。"""
         deadline = time.monotonic() + max(0.0, float(sec))
         while time.monotonic() < deadline:
-            self.checkpoint_now_ack()   # 暂停/停止到达即抛 PauseRequested
+            self.check_pause()   # 暂停/停止到达即抛 PauseRequested
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     def should_stop(self) -> bool:
         return self._pause is not None or self._stop_evt.is_set()
-
-    def resume_data(self) -> Any:
-        """读取最近检查点的业务数据（用于断点恢复）。"""
-        ck = self._ckpt.load()
-        return (ck or {}).get("data") if isinstance(ck, dict) else None
 
     def _on_pause(self) -> None:
         # SIGTERM 可能先于控制文件读取到达——退出路径再读一次控制文件，
@@ -252,7 +208,6 @@ class ExecutorTask:
         pause = self._pause or _control.current_pause() or \
             _control.PauseCommand(command_id="", action="pause")
         self._events.emit(EventKind.ACK, command_id=pause.command_id)
-        # 断点已在 checkpoint() 或业务周期提交中持久化
 
     # ---------- 进度 / 错误 / 完成 ----------
     def report_progress(self, completed_units: int) -> None:

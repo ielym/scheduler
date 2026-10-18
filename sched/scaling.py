@@ -354,7 +354,7 @@ class TaskBackoff:
             self._steps.pop(task_id, None)
 
     def note_progress(self, task_id: str, attempt_id: str, now_mono: float) -> None:
-        """一次正确执行的步骤（progress/checkpoint/成功）：
+        """一次正确执行的步骤（progress/成功）：
         ① 该执行通过首步验证（解除"未完成首步"占位，允许放下一个）；
         ② 任务处于 VERIFY/EMPTY → 累计连续验证步；达到 N 步（期间无新 75）
         才恢复 NORMAL，级别清零。一步不足以证明资源已稳定（方案 A′）。

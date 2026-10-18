@@ -147,7 +147,7 @@ def test_requeue_job_unit(home):
 # ---------- #4 生产者空事件轮次游标持久化 ----------
 def test_run_producer_persists_empty_advance(home, monkeypatch):
     monkeypatch.setenv("SCHED_TASK_ID", "t")
-    monkeypatch.setenv("SCHED_WORKSPACE", str(home / "tasks" / "t"))
+    monkeypatch.setenv("SCHED_WORKSPACE", str(config.task_state_dir("t")))
     from sched_task_sdk.producer import Producer, run_producer
 
     class P(Producer):
@@ -158,7 +158,7 @@ def test_run_producer_persists_empty_advance(home, monkeypatch):
 
     assert run_producer(P(), tick_sec=0.1, replay_only=True) == 0
     state = json.loads(
-        (home / "tasks" / "t" / "producer_state" / "state.json").read_text())
+        (config.producer_state_dir("t") / "state.json").read_text())
     assert state["cursor"] == {"done": True}  # 空事件轮次游标也持久化
 
 
@@ -336,7 +336,7 @@ def test_running_infos_shortage_window(home):
 # ---------- #14 SDK 就绪载荷保留作业级 priority ----------
 def test_sdk_payload_priority(home, monkeypatch):
     monkeypatch.setenv("SCHED_TASK_ID", "t")
-    monkeypatch.setenv("SCHED_WORKSPACE", str(home / "tasks" / "t"))
+    monkeypatch.setenv("SCHED_WORKSPACE", str(config.task_state_dir("t")))
     from sched_task_sdk.producer import Producer
 
     class P(Producer):
@@ -395,7 +395,7 @@ def test_launch_create_attempt_failure_keeps_queued(home, monkeypatch):
 # ---------- 接收发现延迟监控（#8 配套） ----------
 def test_receiver_reports_discovery_latency(home):
     _write_task(home, "demo")
-    out = home / "tasks" / "demo" / "outbox"
+    out = config.outbox_dir("demo")
     out.mkdir(parents=True)
     (out / "demo-abc.json").write_text(json.dumps({
         "schema_version": 1, "job_id": "demo-abc", "task_id": "demo",

@@ -61,11 +61,16 @@ def _build_argv(task_root: Path, entry: config.EntrySpec) -> list[str]:
     return argv
 
 
-def _build_env(task_id: str, task_root: Path) -> dict[str, str]:
+def _build_env(task_id: str) -> dict[str, str]:
     env = {k: os.environ[k] for k in ENV_PASSTHROUGH if k in os.environ}
+    state = config.task_state_dir(task_id)
     env.update({
         "SCHED_TASK_ID": task_id,
-        "SCHED_WORKSPACE": str(task_root),
+        # 代码（只读）在 tasks/；运行态（可写）在 runtime/tasks/<id>/
+        "SCHED_TASK_DIR": str(config.task_dir(task_id)),
+        "SCHED_TASK_STATE_DIR": str(state),
+        # 兼容旧 SDK/任务写法：可写工作区 = 任务级运行态目录
+        "SCHED_WORKSPACE": str(state),
         "SCHED_PRODUCER": "1",
     })
     existing = env.get("PYTHONPATH", "")
@@ -137,8 +142,10 @@ class ProducerGuard:
                         start_time=holder[1], external=True)
                 return False
         task_root = config.task_dir(task_id)
+        state_dir = config.task_state_dir(task_id)
+        state_dir.mkdir(parents=True, exist_ok=True)
         argv = _build_argv(task_root, spec.producer_entry)
-        env = _build_env(task_id, task_root)
+        env = _build_env(task_id)
         log_dir = self._logs / task_id
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +165,7 @@ class ProducerGuard:
             stdout = open(log_dir / "producer.stdout.log", "ab")
             stderr = open(log_dir / "producer.stderr.log", "ab")
             proc = subprocess.Popen(
-                argv, cwd=str(task_root), env=env,
+                argv, cwd=str(state_dir), env=env,
                 stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
                 start_new_session=True, close_fds=True,
             )

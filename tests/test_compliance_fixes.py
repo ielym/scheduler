@@ -10,7 +10,7 @@
 - B4 recovery.retain / replay_note 非空校验
 - B5 SDK report_progress 的 completed_units 单调递增校验
 - C1 回执一次性消费（账目落盘后删除）+ 归档 GC + 归档窗口对账
-- C2 checkpoint save 后目录条目 fsync
+- C2 事件写失败不向上抛 / 目录条目 fsync
 - D4 _pause_grace_base 去除未用的 att 参数
 """
 
@@ -466,7 +466,7 @@ def test_consume_receipts_keeps_receipt_on_save_failure(monkeypatch, tmp_path):
 
 def test_archive_gc_removes_expired(home):
     svc = _svc(home)
-    d = config.runtime_dir() / "archive" / "t"
+    d = config.archive_root() / "t"
     d.mkdir(parents=True)
     old, new = d / "old.json", d / "new.json"
     old.write_text("{}")
@@ -491,7 +491,7 @@ def test_reconcile_archive_window_alarm(home):
     svc = _svc(home)
     _mk_job(svc.db, "j_ok", task_id="t")
     _mk_job(svc.db, "j_miss", task_id="t")
-    ad = config.runtime_dir() / "archive" / "t"
+    ad = config.archive_root() / "t"
     ad.mkdir(parents=True)
     (ad / "j_ok.json").write_text("{}")
     (ad / "ghost.json").write_text("{}")
@@ -503,16 +503,7 @@ def test_reconcile_archive_window_alarm(home):
     assert alarmed == {"j_miss"}
 
 
-# ---------- C2：checkpoint save 目录 fsync ----------
-
-def test_checkpoint_save_fsyncs_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "cp.json"))
-    import sched_task_sdk.checkpoint as ck
-    calls: list[Path] = []
-    monkeypatch.setattr(ck, "_fsync_dir", calls.append)
-    st = ck.CheckpointStore()
-    st.save({"n": 1})
-    assert calls == [tmp_path]
+# （SDK 检查点设施已整体移除：恢复/幂等改由任务以外部真源自证）
 
 
 # ---------- D4：_pause_grace_base 无参调用 ----------

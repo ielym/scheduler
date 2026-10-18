@@ -1,6 +1,5 @@
 """本轮修复的回归测试（编号与审查报告对应）。
 
-P0-1  跨 attempt 检查点继承：_launch 前把旧检查点复制进新 run_dir，resume_data() 真正恢复
 P0-2  explore→steady 恢复链：on_success 恢复 steady；on_shortage 后持久化动态目标
 P1-3  consume_receipts 仅 status==received 才 ack（conflict/invalid 不误删）
 P1-4  Producer.advance 先持久化再推进内存游标（持久化失败不丢事件）
@@ -18,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -74,16 +72,6 @@ def _spec(task_id, priority=50, **kw):
                            executor_entry={"file": "run.py"}, **kw)
 
 
-def _write_cp(attempt_id: str, seq: int, n: int, saved_at: str):
-    d = config.run_dir(attempt_id)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "checkpoint.json").write_text(json.dumps({
-        "format_version": 1, "input_ref": "j", "business_version": "",
-        "progress": None, "commit_seq": seq, "data": {"n": n},
-        "saved_at": saved_at,
-    }, ensure_ascii=False))
-
-
 class _FakeProc:
     def __init__(self, returncode=0):
         self.returncode = returncode
@@ -121,23 +109,6 @@ class _FakeAttempt:
 
     def cleanup(self):
         pass
-
-
-# ---------- 检查点：调度器不搬运，SDK 仍可显式读写 ----------
-
-def test_sdk_resume_data_after_restore(home, monkeypatch, tmp_path):
-    """恢复链端到端：调度器搬运的检查点能被 worker 侧 CheckpointStore 读回。"""
-    from sched_task_sdk.checkpoint import CheckpointStore
-    monkeypatch.setenv("SCHED_JOB_ID", "j1")
-    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "cp.json"))
-    _write_cp("irrelevant", 5, 99, "2026-10-12T01:00:00+00:00")
-    shutil.copy(config.run_dir("irrelevant") / "checkpoint.json", tmp_path / "cp.json")
-    cs = CheckpointStore()
-    assert (cs.load() or {}).get("data") == {"n": 99}  # ExecutorTask.resume_data 同源
-    assert cs.commit_seq == 5
-    # 保存下一个检查点时提交编号从恢复点继续递增
-    cp = cs.save({"n": 100})
-    assert cp["commit_seq"] == 6
 
 
 # ---------- P0-2 explore→steady 恢复链 ----------
@@ -374,7 +345,7 @@ def test_reconcile_archive_detects_mismatch(home, caplog):
     _write_task(home, "t")
     svc.refresh_specs()
     _mk_job(svc.db, "j1", task_id="t")
-    arch = home / "runtime" / "archive" / "t"
+    arch = config.archive_root() / "t"
     arch.mkdir(parents=True)
     (arch / "j1.json").write_text("{}")
     with caplog.at_level(logging.WARNING, logger="sched.scheduler"):
@@ -530,7 +501,7 @@ def test_pausing_grace_exceeded_nonblocking(home):
     assert "att-ps" not in svc.attempts
     assert svc.db.get_job("j-stuck")["status"] == JobStatus.PAUSED
     assert svc.db.get_attempt("att-ps")["exit_code"] == -signal.SIGKILL
-    lines = (home / "runtime" / "status.jsonl").read_text("utf-8").splitlines()
+    lines = config.status_log().read_text("utf-8").splitlines()
     assert any('"pause_grace_exceeded"' in ln for ln in lines)
 
 

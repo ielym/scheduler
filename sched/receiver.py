@@ -29,11 +29,11 @@ def _content_hash(raw: bytes) -> str:
 
 
 def _archive_dir(task_id: str) -> Path:
-    return config.runtime_dir() / "archive" / task_id
+    return config.archive_root() / task_id
 
 
 def _isolation_dir(task_id: str) -> Path:
-    return config.runtime_dir() / "isolation" / task_id
+    return config.isolation_root() / task_id
 
 
 def _write_receipt(task_id: str, job_id: str, content_hash: str, now: str,

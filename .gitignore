@@ -9,5 +9,5 @@ runtime/
 # flock 旁路锁文件（store.save_json 写 config.json 时产生）
 *.lock
 
-# 子任务/子进程目录（tasks/）不受 git 管理：任务代码、运行时意图、缓存等
-tasks/
+# tasks/ 是任务定义（task.json + 入口代码 + 静态 params），纳入 git；
+# 运行时产物一律在 runtime/（已被忽略），tasks/ 下不应出现任何运行态文件。

@@ -258,7 +258,7 @@ def test_receiver_incremental_scan_batch_defer_still_counts(home):
 
 def test_tz_migration_normalizes_legacy_local_timestamps(home):
     """历史 +08:00 行一次性转为 UTC；再开库不重复处理（user_version）。"""
-    db_path = home / "runtime" / "exec.db"
+    db_path = config.db_file()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = dbmod.DB()
     now = "2026-10-11T13:41:11+00:00"

@@ -73,10 +73,10 @@ def test_job_priority_cap_only_narrows(home):
 
 
 def test_job_priority_cap_clamps_at_cap(home, tmp_path):
-    td = _write_task_for_cap(home, cap=30)
+    _write_task_for_cap(home, cap=30)
     spec = config.load_task("t_cap")
     assert spec.job_priority_cap == 30
-    ob = td / "outbox"; ob.mkdir(exist_ok=True)
+    ob = config.outbox_dir("t_cap"); ob.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": 1, "job_id": "t_cap-a", "task_id": "t_cap",
                "idempotency_key": "k", "priority": 40}
     (ob / "t_cap-a.json").write_text(json.dumps(payload))
@@ -295,7 +295,6 @@ def test_permit_wait_pause_is_cooperative(monkeypatch, tmp_path):
     monkeypatch.setenv("SCHED_PERMIT_FILE", str(permit))
     monkeypatch.setenv("SCHED_EVENT_FILE", str(tmp_path / "ev.jsonl"))
     monkeypatch.setenv("SCHED_CONTROL_FILE", str(tmp_path / "ctl.json"))
-    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(tmp_path / "cp.json"))
     # 写入暂停命令（attempt_id 匹配）
     (tmp_path / "ctl.json").write_text(json.dumps(
         {"command_id": "c1", "action": "pause", "job_id": "j1",
@@ -304,35 +303,6 @@ def test_permit_wait_pause_is_cooperative(monkeypatch, tmp_path):
     t = ExecutorTask("t")
     with pytest.raises(PauseRequested):
         t._wait_for_permit()
-
-
-# ---------- 75 退出前提交检查点 ----------
-
-def test_shortage_exit_commits_checkpoint(monkeypatch, tmp_path):
-    monkeypatch.setenv("SCHED_ATTEMPT_ID", "att-2")
-    monkeypatch.setenv("SCHED_JOB_ID", "j2")
-    cp_file = tmp_path / "cp.json"
-    monkeypatch.setenv("SCHED_CHECKPOINT_FILE", str(cp_file))
-    monkeypatch.setenv("SCHED_EVENT_FILE", str(tmp_path / "ev2.jsonl"))
-    monkeypatch.setenv("SCHED_CONTROL_FILE", str(tmp_path / "ctl2.json"))
-    from sched_task_sdk.executor import ExecutorTask, Shortage
-    t = ExecutorTask("t")
-    t._ckpt.load()
-    # 本 attempt 尚未提交过，但先保存一次业务断点（模拟本轮进度）
-    t._ckpt.save({"done": [1, 2, 3]}, input_ref="j2", business_version="1")
-    t._ckpt_saved_this_attempt = True  # 本轮已保存
-    # 再模拟"继承数据但本 attempt 未提交"路径：重置标记
-    t._ckpt_saved_this_attempt = False
-    with pytest.raises(Shortage):
-        t.report_shortage("外部不足")
-    # run() 的 except Shortage 分支会调用 _ensure_checkpoint_before_exit；
-    # 此处直接验证该兜底把继承数据按本 attempt 身份重提交
-    t2 = ExecutorTask("t")
-    t2._ckpt.load()
-    t2._ensure_checkpoint_before_exit()
-    obj = json.loads(cp_file.read_text())
-    assert obj["data"] == {"done": [1, 2, 3]}
-    assert obj["commit_seq"] == 2  # 重提交递增了提交编号
 
 
 # ---------- SDK 分目录发布 ----------
