@@ -151,12 +151,19 @@ def main() -> int:
     ap.add_argument("--settle", type=float, default=150.0)
     ap.add_argument("--window", type=float, default=510.0)
     ap.add_argument("--out", default="/tmp/ema_results.jsonl")
+    ap.add_argument("--grid", default=None,
+                    help="自定义网格 JSON：[{\"name\":..,\"overrides\":{..}}, ..]；缺省用内置 CONFIGS")
     args = ap.parse_args()
+
+    grid = CONFIGS
+    if args.grid:
+        obj = json.loads(Path(args.grid).read_text("utf-8"))
+        grid = [(g["name"], g["overrides"]) for g in obj]
 
     base = load_cfg()
     out_lines = []
     try:
-        for name, over in CONFIGS:
+        for name, over in grid:
             cfg = load_cfg()
             cfg.setdefault("control", {}).update(over)   # 覆盖项必须落在 control 段内
             save_cfg(cfg)                                # 内含 schema 预检，非法即抛错
