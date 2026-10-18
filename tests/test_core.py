@@ -156,6 +156,43 @@ def test_scaling_shortage_marks_evidence(tmp_path):
     assert s.get("t").shortage_streak == 2
 
 
+# ---------- 单步耗时"基线 vs 当前"偏离统计（资源退避闸，纯运行时统计量） ----------
+
+def test_step_stats_median_baseline_and_deviation():
+    s = scaling.StepDurationStats(config.SchedulerConfig())
+    # 样本不足：无从判定 → None
+    for _ in range(3):
+        s.note_step("t", 2.0)
+    assert s.deviation("t") is None
+    # 补足基线（去极值中位数 ≈ 2s）
+    for _ in range(47):
+        s.note_step("t", 2.0)
+    assert s.baseline("t") == pytest.approx(2.0, rel=0.2)
+    assert s.deviation("t") == pytest.approx(1.0, rel=0.05)
+    # 近期单步耗时掉到 8s → 相对自身基线严重偏离（≥K=3）
+    for _ in range(10):
+        s.note_step("t", 8.0)
+    assert s.current("t") == pytest.approx(8.0)
+    assert s.baseline("t") == pytest.approx(2.0, rel=0.2)   # 基线不被近期拖走
+    assert s.deviation("t") >= 3.0
+
+
+def test_step_stats_trim_resists_outliers():
+    s = scaling.StepDurationStats(config.SchedulerConfig())
+    for _ in range(40):
+        s.note_step("t", 2.0)
+    for _ in range(4):                 # 少量极端异常点
+        s.note_step("t", 100.0)
+    assert s.baseline("t") == pytest.approx(2.0, rel=0.2)   # 去极值后仍 ≈ 2s
+
+
+def test_step_stats_requires_min_samples_before_judging():
+    s = scaling.StepDurationStats(config.SchedulerConfig())
+    for _ in range(7):                 # < 默认 min_samples=8
+        s.note_step("t", 5.0)
+    assert s.deviation("t") is None
+
+
 def test_task_backoff_state_machine():
     """TaskBackoff：同任务作业必共用资源 → 报错步降自己任务内的执行；
     跨任务独立；逐个拉取一步验证；全退避按递增间隔探测。"""

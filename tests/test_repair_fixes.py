@@ -154,6 +154,37 @@ def test_finalize_backoff_shrinks_admit_budget(home):
     assert svc._admit_budget == 3
 
 
+def test_finalize_backoff_suppressed_when_step_normal(home):
+    """单步耗时与自身基线相当（偶发 75、节奏正常）→ 不抽人、不减预算。"""
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    svc._admit_budget = 6
+    for _ in range(20):                # 基线≈当前≈2s → 偏离≈1 < K
+        svc.step_stats.note_step("t", 2.0)
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.RUNNING
+    svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
+    assert svc._admit_budget == 6      # 未减半
+    assert svc.tbackoff.state_of("t") == svc.tbackoff.NORMAL   # 未步降
+
+
+def test_finalize_backoff_deviated_when_step_slow(home):
+    """单步耗时严重偏离自身基线（真的走不动）→ 照常抽人 + 预算减半。"""
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    svc._admit_budget = 6
+    for _ in range(50):                # 基线≈2s
+        svc.step_stats.note_step("t", 2.0)
+    for _ in range(10):                # 近期 8s → 偏离≈4 ≥ K
+        svc.step_stats.note_step("t", 8.0)
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.RUNNING
+    svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
+    assert svc._admit_budget == 3
+
+
 # ---------- TaskBackoff VERIFY 死区（步降暂停最后一个执行→自锁） ----------
 
 def test_verify_drained_transitions_to_empty(home):

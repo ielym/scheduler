@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -61,6 +62,90 @@ class TaskTiming:
                     self._feedback_interval[str(k)] = float(v)
                 except (TypeError, ValueError):
                     pass
+
+
+class StepDurationStats:
+    """每任务"单步耗时"基线 B 与当前值 C 的偏离统计（纯运行时统计量，无人工计数阈值）。
+
+    用途：判定"该任务的单步耗时是否严重偏离它自己的常态"，作为资源退避的触发闸——
+    取代"几步成功/几步失败"这类凭经验设定的计数规则。
+
+    - 样本只取**同一 attempt 内相邻 progress 事件**的间隔（干净的单步耗时：
+      不含 started→首步的检索等待、不含跨 attempt 的间隔、不含 error 事件）。
+    - 基线 B（"平常走一步要多久"）：滚动样本**去极值中位数**（默认，对持续退化
+      免疫）或**慢速 EMA**（长记忆）。
+    - 当前 C（近期单步耗时）：**近窗中位数**（默认）或**快 EMA**。
+    - `deviation = C / B`；可用样本不足（< min_samples）→ 返回 None（无从判定）。
+
+    全部参数经 getattr 从 cfg.control 读取并带缺省值，便于在 config.json 上做
+    网格搜索（只改配置、不改代码）。
+    """
+
+    def __init__(self, cfg):
+        c = getattr(cfg, "control", cfg)
+        self.baseline_method = str(getattr(c, "step_baseline_method", "median"))
+        self.baseline_samples = max(2, int(getattr(c, "step_baseline_samples", 50)))
+        self.baseline_trim = min(0.4, max(0.0, float(getattr(c, "step_baseline_trim_ratio", 0.1))))
+        self.baseline_alpha = min(1.0, max(1e-4, float(getattr(c, "step_baseline_ema_alpha", 0.02))))
+        self.current_method = str(getattr(c, "step_current_method", "recent_median"))
+        self.current_samples = max(1, int(getattr(c, "step_current_samples", 10)))
+        self.current_alpha = min(1.0, max(1e-4, float(getattr(c, "step_current_alpha", 0.3))))
+        self.min_samples = max(1, int(getattr(c, "step_deviation_min_samples", 8)))
+        self._samples: dict[str, deque[float]] = {}
+        self._baseline_ema: dict[str, float] = {}
+        self._current_ema: dict[str, float] = {}
+
+    def note_step(self, task_id: str, duration_sec: float) -> None:
+        """记录一次同 attempt 内的单步耗时（非正/NaN 丢弃）。"""
+        try:
+            d = float(duration_sec)
+        except (TypeError, ValueError):
+            return
+        if not (d > 0.0):
+            return
+        self._samples.setdefault(task_id, deque(maxlen=self.baseline_samples)).append(d)
+        b = self._baseline_ema.get(task_id)
+        self._baseline_ema[task_id] = d if b is None \
+            else b * (1.0 - self.baseline_alpha) + d * self.baseline_alpha
+        c = self._current_ema.get(task_id)
+        self._current_ema[task_id] = d if c is None \
+            else c * (1.0 - self.current_alpha) + d * self.current_alpha
+
+    def baseline(self, task_id: str) -> float | None:
+        """该任务常态单步耗时（去极值中位数 / 慢速 EMA）。"""
+        dq = self._samples.get(task_id)
+        if not dq:
+            return None
+        if self.baseline_method == "slow_ema":
+            return self._baseline_ema.get(task_id)
+        vals = sorted(dq)
+        n = len(vals)
+        k = int(n * self.baseline_trim)
+        core = vals[k:n - k] if n - 2 * k >= 1 else vals
+        return statistics.median(core)
+
+    def current(self, task_id: str) -> float | None:
+        """近期单步耗时（近窗中位数 / 快 EMA）。"""
+        dq = self._samples.get(task_id)
+        if not dq:
+            return None
+        if self.current_method == "fast_ema":
+            return self._current_ema.get(task_id)
+        return statistics.median(list(dq)[-self.current_samples:])
+
+    def deviation(self, task_id: str) -> float | None:
+        """C / B（单步耗时相对自身基线的偏离倍数）；样本不足返回 None。"""
+        dq = self._samples.get(task_id)
+        if not dq or len(dq) < self.min_samples:
+            return None
+        b = self.baseline(task_id)
+        c = self.current(task_id)
+        if not b or b <= 0.0 or c is None:
+            return None
+        return c / b
+
+    def samples_count(self, task_id: str) -> int:
+        return len(self._samples.get(task_id) or ())
 
 
 class HealthTracker:

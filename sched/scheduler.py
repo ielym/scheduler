@@ -92,6 +92,7 @@ class AttMeta:
         self.started_mono = _now_mono()
         self.last_heartbeat_mono = _now_mono()  # 最近一次 heartbeat 到达时刻（存活判定）
         self.last_progress_mono = 0.0    # 最近一次 progress 事件到达时刻（B7 判定）
+        self.last_step_mono = 0.0        # 上次 progress 时刻（单步耗时统计基准，跨 attempt 重置）
 
 
 class SchedulerService:
@@ -103,6 +104,8 @@ class SchedulerService:
         # 任务级实测 timing EMA（反馈间隔等由调度器自统计，任务不声明）
         self.timing = scaling.TaskTiming(
             default_interval_sec=self.cfg.control.feedback_interval_init_sec)
+        # 单步耗时"基线 vs 当前"偏离统计（资源退避的触发闸，纯运行时统计量）
+        self.step_stats = scaling.StepDurationStats(self.cfg)
         self._last_timing_save_mono = 0.0
         self._restore_timing()
         self.health = scaling.HealthTracker(
@@ -712,6 +715,12 @@ class SchedulerService:
             self.db.append_event(meta.attempt_id, seq, kind, ev, runner.now_iso())
         elif kind == EventKind.PROGRESS:
             meta.last_progress_mono = now_m
+            # 单步耗时样本：只取**同一 attempt 内相邻 progress** 的间隔（干净，
+            # 不含 started→首步的检索等待、不含跨 attempt 的间隔、不含 error）
+            prev_step = meta.last_step_mono
+            if prev_step > 0.0 and now_m > prev_step:
+                self.step_stats.note_step(meta.task_id, now_m - prev_step)
+            meta.last_step_mono = now_m
             self._ingest_progress_event(
                 meta, int(ev.get("completed_units") or 0), ev)
             # 一次正确执行的步骤：解除"逐个拉取"的首步验证位 /
@@ -931,8 +940,14 @@ class SchedulerService:
             # 动态目标不收缩——恢复后按既有目标逐个（一步验证）拉回
             self.scaling.on_shortage(stid, _now_mono(), self._live_count(stid))
             self._persist_scale(stid)
-            # 任务资源错误(75)：并发预算乘法收缩（AIMD 的 M：max(1, BUDGET//2)）
-            self._shrink_budget("task_75")
+            # 资源退避闸（纯运行时统计量）：仅当"单步耗时严重偏离该任务自己的基线"
+            # （或样本不足、无从判定）时才退避——严重偏离=真的走不动；与基线相当
+            # （即使偶发 75、或"重试几次但仍在推进"）→ 不动，保住吞吐、不误杀长跑。
+            dev = self.step_stats.deviation(stid)
+            _deviated = dev is None or dev >= self.cfg.control.step_deviation_k
+            if _deviated:
+                # 并发预算乘法收缩（AIMD 的 M：max(1, BUDGET//2)）
+                self._shrink_budget("task_75")
             # B7：本 attempt 已有真实业务进展（启动后收到过 progress）时，
             # 重试计数从头开始，不足恢复后的等待不继承历史退避长度
             self._schedule_backoff_retry(
@@ -940,7 +955,14 @@ class SchedulerService:
                 had_evidence=meta.last_progress_mono > meta.started_mono)
             # 每任务独立资源退避（TaskBackoff）：同任务作业必共用资源 →
             # 步降同任务内最新启动的在途执行；无在途可退 → 任务级退避
-            self._task_backoff_step_down(stid, _now_mono())
+            if _deviated:
+                self._task_backoff_step_down(stid, _now_mono())
+            self._append_status({
+                "ts": runner.now_iso(),
+                "kind": "backoff_deviated" if _deviated else "backoff_suppressed",
+                "task_id": stid,
+                "deviation": None if dev is None else round(dev, 2),
+                "k": self.cfg.control.step_deviation_k})
         elif outcome.status == JobStatus.PAUSED:
             # 主动退让不计为任务错误；记录真实暂停耗时（含检查点落地）到
             # 任务级暂停成本 EMA（设计第十节：退让候选综合暂停成本排序）
