@@ -31,7 +31,7 @@ for _p in (
 
 import requests  # noqa: E402
 from sched_task_sdk import ExecutorTask, run_task  # noqa: E402
-from sched_task_sdk.executor import Shortage  # noqa: E402
+from sched_task_sdk.executor import PauseRequested, Shortage  # noqa: E402
 from ip_tunnel.certification import get_credential  # noqa: E402
 from arxiv.cli import parse_feed  # noqa: E402
 
@@ -78,7 +78,7 @@ class ProxySession:
         self.proxies = {"http": proxy_url, "https": proxy_url}
 
     def request(self, method, url, *, params=None, headers=None, stream=False,
-                timeout=120.0, expected_status=200):
+                timeout=120.0, expected_status=200, pause_check=None):
         merged = {"User-Agent": USER_AGENT, "Accept": "*/*"}
         if headers:
             merged.update(headers)
@@ -90,6 +90,11 @@ class ProxySession:
             if _attempt:
                 _log(f"  请求重试 {_attempt}/{_MAX_RETRIES}（{_RETRY_GAP_SEC:.0f}s 后）：{url[:100]}")
                 time.sleep(_RETRY_GAP_SEC)
+            # 小步听暂停：每次网络请求（含重试）前检查协作暂停。长请求窗口内
+            # 收不到暂停信号会被调度器强杀；在此边界优雅停——当前篇本就没传上去，
+            # 损失与强杀相同，但少占用通道、少耗时（不额外丢活）。
+            if pause_check is not None:
+                pause_check()
             try:
                 resp = requests.request(method, url, params=params, headers=merged,
                                         proxies=self.proxies, timeout=timeout,
@@ -103,6 +108,11 @@ class ProxySession:
                 _t0 = time.time()
                 try:
                     for _c in resp.iter_content(65536):
+                        # 分块读之间听暂停：一次下载可能停滞数分钟，是最细的可
+                        # 停顿粒度。中止本次下载与"被强杀"损失相同（该篇本就没
+                        # 传上去），但能立刻响应、不再占通道/被强拽。
+                        if pause_check is not None:
+                            pause_check()
                         _buf.extend(_c)
                         if time.time() - _t0 > _TOTAL_READ_CAP_SEC:
                             # R8 慢速滴：非瞬时抖动，不重试立即上浮
@@ -116,7 +126,7 @@ class ProxySession:
                 if code in (400, 404):
                     raise
                 last_err = Shortage(f"HTTP {code}: {url}（外部资源不可得）")
-            except Shortage:
+            except (Shortage, PauseRequested):
                 raise
             except Exception as e:
                 last_err = Shortage(f"{type(e).__name__}: {url}（外部资源不可得）")
@@ -139,18 +149,21 @@ def _total_results(xml_text):
         raise Shortage(f"arXiv 响应无法解析（疑似限流/错误页）：{e}")
 
 
-def fetch_records(session, query, *, page_size=DEFAULT_PAGE_SIZE):
+def fetch_records(session, query, *, page_size=DEFAULT_PAGE_SIZE, pause_check=None):
     records = []
     start = 0
     total = None
     while True:
+        # 分页之间听暂停：一页检索可能耗时数十秒，是最小可停顿边界
+        if pause_check is not None:
+            pause_check()
         params = {
             "search_query": query, "start": start, "max_results": page_size,
             "sortBy": "submittedDate", "sortOrder": "ascending",
         }
         url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
         _log(f"  检索 page start={start} page_size={page_size}")
-        text = session.request("GET", url, timeout=90.0).text
+        text = session.request("GET", url, timeout=60.0, pause_check=pause_check).text
         page = parse_feed(text.encode("utf-8"))
         records.extend(page)
         if total is None:
@@ -195,7 +208,7 @@ def _is_skip_error(e: BaseException) -> bool:
     return "Proxy Setup Failed" in s or "status=517" in s
 
 
-def download_pdf(session, arxiv_id, dest):
+def download_pdf(session, arxiv_id, dest, pause_check=None):
     dest.parent.mkdir(parents=True, exist_ok=True)
     if _pdf_complete(dest):
         return
@@ -204,16 +217,15 @@ def download_pdf(session, arxiv_id, dest):
     # 整文件下载：内部 request() 已含 R3 有限重试；内容截断（坏出口滴出
     # 半截文件）立即上浮；仅 404/非 PDF 等目标不可得属业务事实
     try:
-        resp = session.request("GET", url, timeout=180.0, stream=False)
+        resp = session.request("GET", url, timeout=60.0, stream=False,
+                               pause_check=pause_check)
         data = resp.content
         if data[:4] != b"%PDF":
             raise _RecordSkip(f"{arxiv_id} 非 PDF 内容")
         if b"%%EOF" not in data:
             raise Shortage(f"内容截断: {url}（外部资源不可得）")
         dest.write_bytes(data)
-    except _RecordSkip:
-        raise
-    except Shortage:
+    except (_RecordSkip, Shortage, PauseRequested):
         raise
     except Exception as e:
         if _is_skip_error(e):
@@ -226,7 +238,7 @@ def _oss_obj(topic, date_str, name) -> str:
     return f"oss://{OSS_PAPERS_PREFIX}/{topic}/{date_str}/{name}"
 
 
-def _oss_exists(topic, date_str, name) -> bool:
+def _oss_exists(topic, date_str, name, pause_check=None) -> bool:
     url = _oss_obj(topic, date_str, name)
     # 资源错误有限重试（R3）：最多 2 次短间隔重试，仍失败立即上浮；
     # 退出码 1 = 对象不存在（业务事实），不重试
@@ -235,20 +247,24 @@ def _oss_exists(topic, date_str, name) -> bool:
         if _attempt:
             _log(f"  OSS查询重试 {_attempt}/{_MAX_RETRIES}（{_RETRY_GAP_SEC:.0f}s 后）：{url[:100]}")
             time.sleep(_RETRY_GAP_SEC)
+        if pause_check is not None:
+            pause_check()   # 每次查询（含重试）前听暂停
         try:
             r = subprocess.run(["aliyun-oss", "exists", url],
-                               capture_output=True, timeout=120)
+                               capture_output=True, timeout=60)
             if r.returncode == 0:
                 return True
             if r.returncode == 1:
                 return False
             last_err = Shortage(f"aliyun-oss 退出码 {r.returncode}: {url}（外部资源不可得）")
+        except PauseRequested:
+            raise
         except Exception as e:
             last_err = Shortage(f"{type(e).__name__}: {url}（外部资源不可得）")
     raise last_err
 
 
-def _oss_upload(local: Path, topic, date_str):
+def _oss_upload(local: Path, topic, date_str, pause_check=None):
     oss_dir = f"oss://{OSS_PAPERS_PREFIX}/{topic}/{date_str}/"
     # 资源错误有限重试（R3）：最多 2 次短间隔重试，仍失败立即上浮
     last_err = None
@@ -256,12 +272,16 @@ def _oss_upload(local: Path, topic, date_str):
         if _attempt:
             _log(f"  OSS上传重试 {_attempt}/{_MAX_RETRIES}（{_RETRY_GAP_SEC:.0f}s 后）：{oss_dir[:100]}")
             time.sleep(_RETRY_GAP_SEC)
+        if pause_check is not None:
+            pause_check()   # 每次上传（含重试）前听暂停
         try:
             r = subprocess.run(["aliyun-oss", "upload", str(local), oss_dir],
-                               capture_output=True, timeout=300)
+                               capture_output=True, timeout=60)
             if r.returncode == 0:
                 return
             last_err = Shortage(f"aliyun-oss 退出码 {r.returncode}: {oss_dir}（外部资源不可得）")
+        except PauseRequested:
+            raise
         except Exception as e:
             last_err = Shortage(f"{type(e).__name__}: {oss_dir}（外部资源不可得）")
     raise last_err
@@ -290,8 +310,10 @@ class DateFetcher(ExecutorTask):
         local_dir = _work_dir() / "downloads"
         local_dir.mkdir(parents=True, exist_ok=True)
 
-        # 已完成标记 → 跳过整个日期（幂等）
-        if _oss_exists(topic, date_str, DONE_MARKER):
+        # 已完成标记 → 跳过整个日期（幂等）。此前也听一次暂停：长检索/下载前
+        # 的边界检查，避免长操作窗口内收不到暂停信号。
+        self.check_pause()
+        if _oss_exists(topic, date_str, DONE_MARKER, pause_check=self.check_pause):
             _log(f"[{topic} {date_str}] 已完成（OSS {DONE_MARKER} 存在），跳过")
             self.complete({"count": 0, "skipped": "already_done"})
             return
@@ -303,8 +325,8 @@ class DateFetcher(ExecutorTask):
         # 外部不足交调度器退避重试，而非硬失败（exit 1）。
         try:
             session = ProxySession()
-        except (Shortage, _RecordSkip):
-            raise  # 统一外部不足/永久跳过直接穿透 SDK 归因
+        except (Shortage, _RecordSkip, PauseRequested):
+            raise  # 统一外部不足/永久跳过/协作暂停直接穿透 SDK 归因
         except Exception as e:
             # 属外部不足：直接上浮交调度器退避重试（不落断点、不做任务内兜底）
             _log(f"[{topic} {date_str}] 代理会话建立失败：{e}")
@@ -312,7 +334,8 @@ class DateFetcher(ExecutorTask):
             return  # unreachable (report_shortage raises Shortage -> exit 75)
         total = 0
         try:
-            records = fetch_records(session, self.full_query)
+            records = fetch_records(session, self.full_query,
+                                    pause_check=self.check_pause)
             total = len(records)
             _log(f"[{topic} {date_str}] 命中 {total} 篇")
             if not total:
@@ -325,7 +348,8 @@ class DateFetcher(ExecutorTask):
                 for _retry in range(1, 6):
                     _log(f"[{topic} {date_str}] 命中 0 篇，内部复核 {_retry}/5（60s 间隔）")
                     self.wait_interruptible(60)
-                    records = fetch_records(session, self.full_query)
+                    records = fetch_records(session, self.full_query,
+                                            pause_check=self.check_pause)
                     if records:
                         total = len(records)
                         _log(f"[{topic} {date_str}] 复核命中 {total} 篇，继续处理")
@@ -333,6 +357,8 @@ class DateFetcher(ExecutorTask):
                 if not total:
                     self.complete({"count": 0, "reason": "检索确认无更新"})
                     return
+        except PauseRequested:
+            raise  # 协作暂停：不得被下面的"检索失败"兜底吞成资源不足（exit 75）
         except Exception as e:
             # 检索失败属外部不足：上浮交调度器退避重试
             _log(f"[{topic} {date_str}] 检索失败：{e}")
@@ -342,6 +368,9 @@ class DateFetcher(ExecutorTask):
             return  # unreachable (report_shortage raises)
 
         def handle_one(rec):
+            # 小步听暂停：每篇开始前（任何网络操作之前）检查协作暂停——
+            # 与篇末检查一起把最小可停顿粒度压到"单篇/单步"，长请求窗口不会被强杀
+            self.check_pause()
             source_id = (rec.get("source_id") or "").strip()
             if not source_id:
                 return
@@ -353,17 +382,19 @@ class DateFetcher(ExecutorTask):
             meta = local_dir / f"{file_id}.json"
             # 单篇级幂等（OSS 为准）：先查对象是否已存在——已存在则既不上传、
             # 也不下载，只补 OSS 缺失的那一份（避免重复下载/上传）。
-            in_oss_pdf = _oss_exists(topic, date_str, f"{file_id}.pdf")
-            in_oss_json = _oss_exists(topic, date_str, f"{file_id}.json")
+            in_oss_pdf = _oss_exists(topic, date_str, f"{file_id}.pdf",
+                                     pause_check=self.check_pause)
+            in_oss_json = _oss_exists(topic, date_str, f"{file_id}.json",
+                                      pause_check=self.check_pause)
             if not in_oss_pdf:
                 if not _pdf_complete(pdf):
-                    download_pdf(session, base_id, pdf)
-                _oss_upload(pdf, topic, date_str)
+                    download_pdf(session, base_id, pdf, pause_check=self.check_pause)
+                _oss_upload(pdf, topic, date_str, pause_check=self.check_pause)
             if not in_oss_json:
                 if not meta.is_file():
                     meta.write_text(json.dumps(rec, ensure_ascii=False),
                                     encoding="utf-8")
-                _oss_upload(meta, topic, date_str)
+                _oss_upload(meta, topic, date_str, pause_check=self.check_pause)
             pdf.unlink(missing_ok=True)
             meta.unlink(missing_ok=True)
             done_ids.add(base_id)
@@ -393,7 +424,7 @@ class DateFetcher(ExecutorTask):
             "topic": topic, "date": date_str, "count": total,
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
-        _oss_upload(marker, topic, date_str)
+        _oss_upload(marker, topic, date_str, pause_check=self.check_pause)
         marker.unlink(missing_ok=True)
         _log(f"[{topic} {date_str}] 完成")
         self.complete({"count": total})

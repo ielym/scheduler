@@ -1648,13 +1648,16 @@ class SchedulerService:
                              "grace_sec": round(grace, 1)})
 
     def _pause_grace_sec(self, meta: AttMeta) -> float:
-        """暂停宽限：依据实测反馈间隔 EMA 与已观测暂停耗时推导，封顶上限。
+        """暂停宽限：依据实测反馈间隔 EMA 推导，封顶上限。
 
-        任务不声明单步耗时——调度器从实际事件间隔（反馈 EMA）与历史暂停
-        /检查点延迟自统计，宽限随真实节奏自适应。
+        任务不声明单步耗时——调度器从实际事件间隔（反馈 EMA）自统计。
+        worker 现已在"每次网络请求/每页检索/每篇边界"检查协作暂停（把最小
+        可停顿粒度压到单步），故宽限只需覆盖一个单步的最长耗时：用 EMA 的
+        8 倍（EMA ≈ 单篇节奏，一页检索/一次下载通常为单篇的数倍）保证工人
+        能优雅走到步边界，避免被强杀。
         """
         interval = self.timing.feedback_interval(meta.task_id)
-        grace = max(self.cfg.control.pause_grace_base_sec, interval * 4)
+        grace = max(self.cfg.control.pause_grace_base_sec, interval * 8)
         return min(grace, self.cfg.control.pause_grace_max_sec)
 
     def _heartbeat_timeout(self) -> float:

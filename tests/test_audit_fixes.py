@@ -199,9 +199,10 @@ def test_heartbeat_timeout_and_pause_grace(home):
     meta = AttMeta("a", "j", "t", 50, "tok")
     # 存活阈值 = 心跳间隔 × 倍数，与业务进展节奏无关（首步/并发/重启不影响）
     assert svc._heartbeat_timeout() == pytest.approx(15.0)
-    # 暂停宽限仍按业务进展节奏 EMA 推导：无观测 → 默认反馈间隔 × 4
+    # 暂停宽限按业务进展节奏 EMA 推导：无观测 → 默认反馈间隔 × 8
+    # （×8：worker 已把最小可停顿粒度压到单步，宽限只需覆盖一个单步耗时）
     assert svc._pause_grace_sec(meta) == pytest.approx(
-        max(c.pause_grace_base_sec, c.feedback_interval_init_sec * 4))
+        max(c.pause_grace_base_sec, c.feedback_interval_init_sec * 8))
     # 观测到 100s 反馈间隔 → 宽限抬升并封顶
     svc.timing = scaling.TaskTiming(default_interval_sec=c.feedback_interval_init_sec)
     svc.timing.note_event("t", 0.0)

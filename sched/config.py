@@ -214,7 +214,10 @@ class ControlConfig(BaseModel):
     exec_mem_cap_ratio: float = 0.80        # 资源水位 SHED 线：执行内存占机器 ≥ 此值即停新增+撤内存（单采样）
     grow_observe_sec: float = 30.0          # 扩容观察期初值
     pause_grace_base_sec: float = 10.0      # 暂停宽限节奏初值
-    pause_grace_max_sec: float = 60.0
+    # 暂停宽限上限：worker 已把最小可停顿粒度压到"单步"（一次网络请求/分块读/
+    # 一篇边界），故宽限须 ≥ 单步最坏耗时（任务的网络请求超时已压到 ≤60s）；
+    # 120s 留一倍余量，使工人几乎总能走到步边界优雅停，不必被强杀。
+    pause_grace_max_sec: float = 120.0
     shortage_retry_base_sec: float = 5.0    # 不足重试指数退避起点
     shortage_retry_cap_sec: float = 900.0
     protect_deadline_sec: float = 300.0     # 整轮保护截止时间初值

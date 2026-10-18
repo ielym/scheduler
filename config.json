@@ -14,7 +14,7 @@
     "exec_mem_cap_ratio": 0.8,
     "grow_observe_sec": 30.0,
     "pause_grace_base_sec": 10.0,
-    "pause_grace_max_sec": 60.0,
+    "pause_grace_max_sec": 120.0,
     "shortage_retry_base_sec": 5.0,
     "shortage_retry_cap_sec": 900.0,
     "protect_deadline_sec": 300.0,

@@ -493,7 +493,10 @@ def test_pausing_grace_exceeded_nonblocking(home):
     assert "att-ps" in svc.attempts               # 进程未退出，保持监护
 
     # 后续轮：到期升级 KILL → 进程退出 → 收尾为 PAUSED（断点可能未保存）
-    for t in (161.0, 161.5, 162.0, 163.0, 165.0, 166.0):
+    # KILL 升级截止 = 首次 grace 超时时刻 + 暂停宽限上限（随配置自适应）
+    kill_at = 100.5 + svc.cfg.control.pause_grace_max_sec
+    for t in (kill_at + 0.5, kill_at + 1.0, kill_at + 2.0,
+              kill_at + 5.5, kill_at + 6.0, kill_at + 6.5):
         if "att-ps" not in svc.attempts:
             break
         time.sleep(0.05)

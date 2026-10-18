@@ -253,14 +253,14 @@ def test_cancel_job_persists_immediately(home):
 def test_pause_grace_uses_feedback_interval(home):
     svc = _svc(home)
     _write_task(home, "tg")
-    svc.cfg.control.pause_grace_max_sec = 300.0  # 不让封顶干扰断言
+    svc.cfg.control.pause_grace_max_sec = 400.0  # 不让封顶干扰断言
     meta = AttMeta("a1", "j1", "tg", 50, "tok")
     undeclared = svc._pause_grace_sec(meta)
-    # 喂事件让反馈间隔 EMA = 40s → 宽限抬升为 40×4=160
+    # 喂事件让反馈间隔 EMA = 40s → 宽限抬升为 40×8=320
     svc.timing.note_event("tg", 0.0)
     svc.timing.note_event("tg", 40.0)
     declared = svc._pause_grace_sec(meta)
-    assert declared == pytest.approx(160.0)
+    assert declared == pytest.approx(320.0)
     assert declared >= undeclared
 
 
