@@ -127,7 +127,7 @@ def test_on_success_restores_steady_after_shortage(home):
     assert ts.mode == "steady" and ts.shortage_streak == 0
 
 
-def test_finalize_backoff_persists_scale(home):
+def test_finalize_backoff_shrinks_own_target_and_persists(home):
     svc = _svc(home)
     _mk_job(svc.db, "j1")
     svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
@@ -137,21 +137,27 @@ def test_finalize_backoff_persists_scale(home):
     meta.status = JobStatus.RUNNING
     svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
     st = next(s for s in svc.db.all_task_states() if s["task_id"] == "t")
-    # on_shortage 不再收缩目标（退避由 TaskBackoff 承担）：目标保持 3，
-    # 但 explore（退避期不扩容）仍持久化，重启不回退
-    assert st["run_target"] == 3 and st["mode"] == "explore"
+    # 各退各的：撞资源缩**它自己**的目标（3 → 1）；explore（退避期不扩容）
+    # 仍持久化，重启不回退
+    assert st["run_target"] == 1 and st["mode"] == "explore"
 
 
-def test_finalize_backoff_shrinks_admit_budget(home):
-    """方案 A′：任一任务 exit 75 → 并发预算乘法收缩 max(1, BUDGET//2)。"""
+def test_finalize_backoff_does_not_shrink_global_budget(home):
+    """各退各的：任务 exit 75 **不再**砍全局并发预算——只缩该任务自己的目标。
+
+    否则撞资源的是 A，被限流的却是全体（任务间是否共用外部资源是随机的，
+    任何层都不假设）。全局预算只保留给机器级资源证据。
+    """
     svc = _svc(home)
     _mk_job(svc.db, "j1")
     svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
     svc._admit_budget = 6
+    svc.scaling.get("t").run_target = 8
     meta = AttMeta("a1", "j1", "t", 50, "tok")
     meta.status = JobStatus.RUNNING
     svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
-    assert svc._admit_budget == 3
+    assert svc._admit_budget == 6                     # 全局预算不动
+    assert svc.scaling.get("t").run_target == 4       # 只缩自己：8 → 4
 
 
 def test_finalize_backoff_suppressed_when_step_normal(home):
@@ -170,11 +176,12 @@ def test_finalize_backoff_suppressed_when_step_normal(home):
 
 
 def test_finalize_backoff_deviated_when_step_slow(home):
-    """单步耗时严重偏离自身基线（真的走不动）→ 照常抽人 + 预算减半。"""
+    """单步耗时严重偏离自身基线（真的走不动）→ 照常抽人 + 缩自己任务的并发目标。"""
     svc = _svc(home)
     _mk_job(svc.db, "j1")
     svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
     svc._admit_budget = 6
+    svc.scaling.get("t").run_target = 8
     for _ in range(50):                # 基线≈2s
         svc.step_stats.note_step("t", 2.0)
     for _ in range(3):                 # 近期尖峰 20s → 偏离 ≥ K（默认 slow_ema+fast_ema）
@@ -182,7 +189,8 @@ def test_finalize_backoff_deviated_when_step_slow(home):
     meta = AttMeta("a1", "j1", "t", 50, "tok")
     meta.status = JobStatus.RUNNING
     svc._finalize(_FakeAttempt(returncode=75), meta, runner.now_iso())
-    assert svc._admit_budget == 3
+    assert svc.scaling.get("t").run_target == 4       # 缩自己：8 → 4
+    assert svc._admit_budget == 6                     # 全局预算不动（各退各的）
 
 
 # ---------- TaskBackoff VERIFY 死区（步降暂停最后一个执行→自锁） ----------

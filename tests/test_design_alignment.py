@@ -510,6 +510,44 @@ class TestPauseCost:
         svc._finalize(_FA(), meta, runner.now_iso())
         assert svc.scaling.pause_cost("t") >= 4.0
 
+    def test_task_shortage_shrinks_only_its_own_target(self, home):
+        """**各退各的**：一个任务的资源短缺只缩它自己的并发目标——
+        不动全局并发预算，也不碰别的任务（任务间是否共用外部资源是随机的）。"""
+        svc = _svc(home)
+        svc.db.upsert_job(_ready("j1", "t"), "h1", "now", 50)
+        svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+        meta = AttMeta("a1", "j1", "t", 50, "tok")
+        meta.status = JobStatus.RUNNING
+        svc.meta["a1"] = meta
+        svc.scaling.get("t").run_target = 8
+        svc.scaling.get("other").run_target = 8
+        budget_before = svc._admit_budget
+
+        class _FA:  # 退出码 75 = 资源不足
+            pid = 1
+            pgid = 1
+            start_time = 1.0
+
+            def __init__(self):
+                self.proc = SimpleNamespace(returncode=75, wait=lambda timeout=None: 75)
+                self.cgrp = SimpleNamespace(available=False, procs=lambda: [],
+                                            kill_all=lambda: None)
+                self.spec = SimpleNamespace(attempt_id="a1")
+
+            def is_alive(self):
+                return False
+
+            def read_events(self, after_seq=0):
+                return []
+
+            def cleanup(self):
+                pass
+
+        svc._finalize(_FA(), meta, runner.now_iso())
+        assert svc.scaling.get("t").run_target == 4        # 只缩自己：8 → 4
+        assert svc.scaling.get("other").run_target == 8    # 别的任务毫发无损
+        assert svc._admit_budget == budget_before          # 全局预算不再被砍
+
 
 # ---------- 修复 8：保护截止推导 ----------
 

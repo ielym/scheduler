@@ -996,8 +996,7 @@ class SchedulerService:
             # B7（设计第十四节）：成功后不足退避计数复位，下次从起点重新探测
             self.db.reset_job_retry(meta.job_id)
         elif outcome.status == JobStatus.BACKOFF:
-            # 资源不足：记录任务级不足证据（阻止退避期间的扩容探索）；
-            # 动态目标不收缩——恢复后按既有目标逐个（一步验证）拉回
+            # 资源不足：记录任务级不足证据（阻止退避期间的扩容探索）
             self.scaling.on_shortage(stid, _now_mono(), self._live_count(stid))
             self._persist_scale(stid)
             # 资源退避闸（纯运行时统计量）：仅当"单步耗时严重偏离该任务自己的基线"
@@ -1006,8 +1005,10 @@ class SchedulerService:
             dev = self.step_stats.deviation(stid)
             _deviated = dev is None or dev >= self.cfg.control.step_deviation_k
             if _deviated:
-                # 并发预算乘法收缩（AIMD 的 M：max(1, BUDGET//2)）
-                self._shrink_budget("task_75")
+                # **各退各的**：撞资源的是这个任务自己，就缩它**自己的**并发目标——
+                # 不动全局并发预算（那会把别的无辜任务一起限流；任务间是否共用外部
+                # 资源是随机的，任何层都不假设）。全局预算只保留给机器级资源证据。
+                self._shrink_task_target(stid)
             # B7：本 attempt 已有真实业务进展（启动后收到过 progress）时，
             # 重试计数从头开始，不足恢复后的等待不继承历史退避长度
             self._schedule_backoff_retry(
@@ -1836,6 +1837,22 @@ class SchedulerService:
             self._append_status({"ts": runner.now_iso(), "kind": "admit_budget_shrink",
                                  "from": old, "budget": self._admit_budget,
                                  "reason": reason})
+
+    def _shrink_task_target(self, task_id: str) -> None:
+        """任务级并发目标乘法收缩（AIMD 的 M）：run_target = max(1, run_target // 2)。
+
+        与 `_shrink_budget`（全局并发预算）的区别：这里只缩**该任务自己**的额度，
+        所以一个任务撞资源不会波及别的任务——任务间是否共用外部资源是随机的，
+        任何层都不假设。增长仍走 may_grow 的"逐证据 +1"。
+        """
+        ts = self.scaling.get(task_id)
+        old = ts.run_target
+        if old <= 1:
+            return                      # 已到最小并发（=1），无更小可退
+        ts.run_target = max(1, old // 2)
+        self._persist_scale(task_id)
+        self._append_status({"ts": runner.now_iso(), "kind": "task_target_shrink",
+                             "task_id": task_id, "from": old, "to": ts.run_target})
 
     def _update_admit_budget(self, now: float) -> None:
         """并发预算状态机：资源越线/OOM 乘法收缩；健康且进展持续加法增长。
