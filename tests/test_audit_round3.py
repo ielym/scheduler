@@ -249,7 +249,7 @@ class TestLegacyRowReinit:
         svc._reinitialize()
         assert killed == ["t/att-1"]
         assert db.get_job("j-1")["status"] == JobStatus.QUEUED
-        assert db.get_attempt("att-1") is None
+        assert db.get_attempt("att-1")["status"] == JobStatus.ABANDONED  # 保留记录作审计
 
 
 # ---------- skill 模板 ----------

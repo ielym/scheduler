@@ -106,6 +106,8 @@ class SchedulerService:
             default_interval_sec=self.cfg.control.feedback_interval_init_sec)
         # 单步耗时"基线 vs 当前"偏离统计（资源退避的触发闸，纯运行时统计量）
         self.step_stats = scaling.StepDurationStats(self.cfg)
+        # 跨任务聚合拥堵信号（把"单任务偶发变慢"与"共享通道整体拥堵"分开）
+        self.congestion = scaling.CongestionTracker(self.cfg)
         # 退避闸参数的热更新锚点（config.json mtime）：实验需在不重启服务的前提下
         # 切换参数（重启会清空未终结 attempt 并触发全量重排+重扫，污染测量窗口）
         self._cfg_mtime = self._config_mtime()
@@ -238,7 +240,7 @@ class SchedulerService:
         1) 加载任务清单；
         2) 清空调度学习态（动态目标/退避/保护从零冷启动）；
         3) 终止上一实例遗留的执行进程（必须在删记录前，防同一作业新旧双进程）；
-        4) 删除未终结 attempt 与其 run_dir 工件；
+        4) 未终结 attempt 归档为 ABANDONED（保留记录与事件，不删除）；
         5) 全部未完结作业回 QUEUED（按正常准入策略重新拉起）；
         6) 守护/接管生产者；兜底回收 sched cgroup 子树残留进程。
         """
@@ -292,25 +294,63 @@ class SchedulerService:
                     pass
 
     def _discard_inflight_attempts(self) -> None:
-        """删除未终结 attempt 的库记录与 run_dir 工件（终态 attempt 保留作历史）。"""
+        """重启冷启动：把在途 attempt 标记为 ABANDONED（**保留记录与事件，不删除**）。
+
+        原先直接删 attempt/events 行，使重启前（含在途作业）的历史在库里彻底消失，
+        跨重启的趋势分析全部失真（实测事后翻库的数字自相矛盾即源于此）。现改为
+        标记终态；run_dir 工件交由 _tick_cleanup 按龄回收（同终端作业策略）。
+        """
+        now = runner.now_iso()
+        n = 0
         for att in self.db.non_terminal_attempts():
-            attempt_id = att["attempt_id"]
+            # 两类未终结记录：真正在途的（无 finished_at）与已收尾但作业待重排的
+            # （PAUSED/BACKOFF，有 finished_at）。分别给不同归档原因，便于事后归因。
+            reason = ("重启丢弃在途执行" if not att.get("finished_at")
+                      else "重启重排归档（作业回队重跑）")
             try:
-                self.db.delete_attempt_artifacts(attempt_id)
-                shutil.rmtree(config.run_dir(attempt_id), ignore_errors=True)
+                self.db.update_attempt(att["attempt_id"], status=JobStatus.ABANDONED,
+                                       reason=reason, finished_at=now)
+                n += 1
             except Exception:
-                log.exception("discard attempt %s failed", attempt_id)
+                log.exception("abandon attempt %s failed", att["attempt_id"])
+        if n:
+            # 审计事件（status.jsonl）：重启归档了多少执行记录，可事后核对
+            self._append_status({"ts": now, "kind": "startup_abandoned", "count": n})
 
     def refresh_specs(self) -> dict[str, config.TaskSpec]:
         specs = load_all_specs()
         self.specs = specs
         return specs
 
-    # ---------- 退避闸参数热更新 ----------
+    # ---------- 退避闸/拥堵信号参数热更新 ----------
     _GATE_FIELDS = (
         "step_baseline_method", "step_baseline_samples", "step_baseline_trim_ratio",
         "step_baseline_ema_alpha", "step_current_method", "step_current_samples",
-        "step_current_alpha", "step_deviation_min_samples", "step_deviation_k")
+        "step_current_alpha", "step_deviation_min_samples", "step_deviation_k",
+        "congestion_gate_enabled", "congestion_alpha_slow", "congestion_alpha_fast",
+        "congestion_k", "congestion_min_ticks")
+
+    def _congestion_ratio(self) -> tuple[float, int]:
+        """活跃任务中"单步耗时严重偏离自身基线"的占比（按任务去重）。
+
+        返回 (占比, 参与判定的任务数)；样本不足的任务不参与（无从判定）。
+        """
+        judged = deviated = 0
+        seen: set[str] = set()
+        for attempt_id, meta in self.meta.items():
+            if attempt_id not in self.attempts:
+                continue                      # 只统计在途执行
+            tid = meta.task_id
+            if tid in seen:
+                continue
+            seen.add(tid)
+            dev = self.step_stats.deviation(tid)
+            if dev is None:
+                continue                      # 样本不足：不参与判定
+            judged += 1
+            if dev >= self.cfg.control.step_deviation_k:
+                deviated += 1
+        return ((deviated / judged, judged) if judged else (0.0, 0))
 
     @staticmethod
     def _config_mtime() -> float:
@@ -337,6 +377,7 @@ class SchedulerService:
         for f in self._GATE_FIELDS:
             setattr(self.cfg.control, f, getattr(new.control, f))
         self.step_stats.reload(self.cfg)
+        self.congestion.reload(self.cfg)
         # 审计事件（status.jsonl 可观测）：驱动实验可据此确认热更新已生效
         self._append_status({
             "ts": runner.now_iso(), "kind": "gate_reloaded",
@@ -991,6 +1032,11 @@ class SchedulerService:
             # （即使偶发 75、或"重试几次但仍在推进"）→ 不动，保住吞吐、不误杀长跑。
             dev = self.step_stats.deviation(stid)
             _deviated = dev is None or dev >= self.cfg.control.step_deviation_k
+            # 通道整体拥堵时（多数活跃任务同时偏离），这次偏离更可能是通道的锅，
+            # 不按"这个任务不行"逐次收缩全局预算——改由聚合信号在上升沿缩一次。
+            if _deviated and self.cfg.control.congestion_gate_enabled \
+                    and self.congestion.congested():
+                _deviated = False
             if _deviated:
                 # 并发预算乘法收缩（AIMD 的 M：max(1, BUDGET//2)）
                 self._shrink_budget("task_75")
@@ -1229,7 +1275,10 @@ class SchedulerService:
             seconds=self.cfg.control.cleanup_terminal_after_sec)
         ).isoformat(timespec="milliseconds")
         gone = 0
-        for attempt_id in self.db.stale_terminal_attempts(cutoff, limit=200):
+        # 两类：按作业终态的（SUCCEEDED/CANCELLED）+ 重启丢弃的在途执行（ABANDONED）
+        stale = (self.db.stale_terminal_attempts(cutoff, limit=200)
+                 + self.db.stale_abandoned_attempts(cutoff, limit=200))
+        for attempt_id in stale:
             if attempt_id in self.attempts or attempt_id in self.meta:
                 continue  # 仍在途（防御，正常不应出现）
             try:
@@ -1492,6 +1541,18 @@ class SchedulerService:
     # ---------- 控制：动态目标 / 保护 / 退让 / 放回 ----------
     def _tick_control(self, now: float) -> None:
         st = self.protect.st
+
+        # 0) 跨任务聚合拥堵信号（实验开关，默认关）：多任务**同时**偏离只可能是
+        #    共享通道整体堵；此时在上升沿收缩一次全局并发预算即可，不必为每个
+        #    偏离任务各缩一次（后者在通道抖动下会把预算反复砍到 1，徒增churn）。
+        if self.cfg.control.congestion_gate_enabled:
+            ratio, judged = self._congestion_ratio()
+            if judged:
+                self.congestion.note(ratio)
+            if self.congestion.rising_edge():
+                self._shrink_budget("congestion")
+                self._append_status({"ts": runner.now_iso(), "kind": "congestion_shrink",
+                                     "ratio": round(ratio, 3), "judged": judged})
 
         # 1) 保护对象改善 / 无待处理需求 → 结束保护；截止 → 失败结束
         if st.protected_task:

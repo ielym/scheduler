@@ -167,7 +167,8 @@ def evaluate(t0: datetime, t1: datetime) -> dict:
     sc = _status_counts(t0, t1)
     for k in ("attempt_launched", "pause_grace_exceeded", "task_backoff_step",
               "task_backoff_empty", "backoff_deviated", "backoff_suppressed",
-              "protect_started", "protect_released"):
+              "protect_started", "protect_released",
+              "congestion_shrink", "admit_budget_shrink"):
         res[k] = sc.get(k, 0)
     res["papers_per_min"] = round(res.get("papers", 0) / mins, 2)
     res["thru_per_min"] = round(res.get("succeeded", 0) / mins, 3)

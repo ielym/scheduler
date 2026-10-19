@@ -157,6 +157,58 @@ class StepDurationStats:
         return len(self._samples.get(task_id) or ())
 
 
+class CongestionTracker:
+    """跨任务聚合拥堵信号：活跃任务中"单步耗时严重偏离自身基线"的占比，及该占比的自身基线。
+
+    为什么要聚合：单个任务偏离可能只是它那篇论文大；但**多数活跃任务同时偏离**
+    只可能是共享通道（代理隧道/OSS）整体变慢。只看单任务自比，无法区分这两者。
+    触发量仍是运行时统计量相对**它自己的基线**（而不是"占比超过 0.6 算堵"这类常数）。
+
+    用法：每个控制轮调用 note(占比)；rising_edge() 只在"由不堵变堵"那一刻返回 True，
+    用于只收缩一次（避免每轮连缩）。
+    """
+
+    def __init__(self, cfg):
+        self._slow: float | None = None
+        self._fast: float | None = None
+        self._n = 0
+        self._active = False
+        self.reload(cfg)
+
+    def reload(self, cfg) -> None:
+        """热更新参数（保留已积累的 EMA），供不重启服务切换配置。"""
+        c = getattr(cfg, "control", cfg)
+        self.alpha_slow = min(1.0, max(1e-4, float(getattr(c, "congestion_alpha_slow", 0.02))))
+        self.alpha_fast = min(1.0, max(1e-4, float(getattr(c, "congestion_alpha_fast", 0.3))))
+        self.k = max(1.0, float(getattr(c, "congestion_k", 2.0)))
+        self.min_ticks = max(1, int(getattr(c, "congestion_min_ticks", 30)))
+
+    def note(self, ratio: float) -> None:
+        """记录一次聚合占比采样（0..1）。"""
+        try:
+            r = min(1.0, max(0.0, float(ratio)))
+        except (TypeError, ValueError):
+            return
+        if self._slow is None:
+            self._slow = self._fast = r
+        else:
+            self._slow = self._slow * (1.0 - self.alpha_slow) + r * self.alpha_slow
+            self._fast = self._fast * (1.0 - self.alpha_fast) + r * self.alpha_fast
+        self._n += 1
+
+    def congested(self) -> bool:
+        if self._slow is None or self._n < self.min_ticks:
+            return False
+        return self._fast >= max(self.k * self._slow, 1e-9)
+
+    def rising_edge(self) -> bool:
+        """拥堵由否变是的那一刻返回 True（只在上升沿触发一次收缩）。"""
+        cur = self.congested()
+        edge = cur and not self._active
+        self._active = cur
+        return edge
+
+
 class HealthTracker:
     """按任务维护近期进展基线，识别无报错变慢。
 

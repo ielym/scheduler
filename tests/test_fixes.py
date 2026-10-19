@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -365,8 +365,8 @@ class TestStateClosures:
         svc._tick_release(0.0)
         assert d.get_job("j-1")["status"] == JobStatus.PAUSED
 
-    def test_reinitialize_requeues_unfinished_and_clears_attempts(self, home):
-        # 冷启动：未终结 attempt 与工件被清除，作业一律回 QUEUED（不核实完成、不接管）
+    def test_reinitialize_abandons_attempts_but_keeps_audit(self, home):
+        # 冷启动：在途 attempt 标为 ABANDONED（**保留记录与事件作审计**），作业回 QUEUED
         svc = self._svc(home)
         d = svc.db
         d.upsert_job(_ready("j-1", "t1"), "h1", "now", 50)
@@ -377,7 +377,16 @@ class TestStateClosures:
         d.set_job_status("j-1", JobStatus.RUNNING, "", "now")
         svc._reinitialize()
         assert d.get_job("j-1")["status"] == JobStatus.QUEUED
-        assert d.get_attempt("att-1") is None  # 旧 attempt 已删除
+        att = d.get_attempt("att-1")
+        assert att is not None and att["status"] == JobStatus.ABANDONED  # 不删除
+        assert att["finished_at"]                                       # 已落终态时间
+        # 已标终态 → 不再被视为未终结；未到保留期不被清理选中，越过则被选中
+        assert all(a["attempt_id"] != "att-1" for a in d.non_terminal_attempts())
+        now = datetime.now(timezone.utc)
+        past = (now - timedelta(days=1)).isoformat(timespec="seconds")
+        future = (now + timedelta(days=1)).isoformat(timespec="seconds")
+        assert d.stale_abandoned_attempts(past) == []
+        assert d.stale_abandoned_attempts(future) == ["att-1"]
 
     def test_reinitialize_keeps_terminal_jobs(self, home):
         # 终态作业（成功/取消/失败）不重排；非终态一律回 QUEUED

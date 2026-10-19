@@ -151,7 +151,7 @@ def test_reinitialize_leftover_uses_cgroup_kill(home, monkeypatch):
     svc._reinitialize()
     assert calls == ["t/att-1"]
     assert svc.db.get_job("j1")["status"] == JobStatus.QUEUED
-    assert svc.db.get_attempt("att-1") is None
+    assert svc.db.get_attempt("att-1")["status"] == JobStatus.ABANDONED  # 保留记录作审计
 
 
 # ---------- A2：保护门槛限高优先级 ----------

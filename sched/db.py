@@ -547,6 +547,19 @@ class DB:
                  before_iso, int(limit))).fetchall()
         return [r["attempt_id"] for r in rows]
 
+    def stale_abandoned_attempts(self, before_iso: str, limit: int = 200) -> list[str]:
+        """取「ABANDONED 且结束时间早于阈值」的 attempt_id（供定期清理工件）。
+
+        与 stale_terminal_attempts 的区别：那里按**作业**终态（SUCCEEDED/CANCELLED）
+        取；被丢弃的在途执行其作业还在 QUEUED，只能按 attempt 自身状态取。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT attempt_id FROM attempts WHERE status=? AND finished_at != '' "
+                "AND finished_at < ? ORDER BY finished_at LIMIT ?",
+                (JobStatus.ABANDONED, before_iso, int(limit))).fetchall()
+        return [r["attempt_id"] for r in rows]
+
     def delete_attempt_artifacts(self, attempt_id: str) -> None:
         """同一事务内删除指定 attempt 的 events / attempts 行。"""
         with self._lock:
@@ -591,11 +604,13 @@ class DB:
             self._conn.execute("DELETE FROM task_state")
 
     def non_terminal_attempts(self) -> list[dict]:
-        """全部未终结 attempt（重启时统一终止并清除的记录集合）。"""
+        """全部未终结 attempt（重启时统一终止并标为 ABANDONED 的记录集合）。"""
+        terminal = sorted(JobStatus.TERMINAL)
+        marks = ",".join("?" * len(terminal))
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM attempts WHERE status NOT IN (?,?,?)",
-                tuple(sorted(JobStatus.TERMINAL))).fetchall()
+                f"SELECT * FROM attempts WHERE status NOT IN ({marks})",
+                tuple(terminal)).fetchall()
         return [dict(r) for r in rows]
 
     def requeue_unfinished_jobs(self, now: str) -> int:
@@ -606,11 +621,12 @@ class DB:
         返回被重排的作业数。
         """
         seq = self._next_status_seq()
+        terminal = sorted(JobStatus.TERMINAL)
+        marks = ",".join("?" * len(terminal))
         with self._lock:
             cur = self._conn.execute(
-                """UPDATE jobs SET status=?, reason=?, retry_count=0, next_retry_at='',
+                f"""UPDATE jobs SET status=?, reason=?, retry_count=0, next_retry_at='',
                                    started_at='', finished_at='', status_seq=?
-                   WHERE deleted=0 AND status NOT IN (?,?,?)""",
-                (JobStatus.QUEUED, "重启重排：按策略重新开始",
-                 seq, *sorted(JobStatus.TERMINAL)))
+                   WHERE deleted=0 AND status NOT IN ({marks})""",
+                (JobStatus.QUEUED, "重启重排：按策略重新开始", seq, *terminal))
         return cur.rowcount if isinstance(cur.rowcount, int) and cur.rowcount > 0 else 0
