@@ -1079,27 +1079,26 @@ class SchedulerService:
         self._backoff_until[job_id] = _now_mono() + delay
 
     def _task_backoff_step_down(self, task_id: str, now_mono: float) -> None:
-        """任务资源退避步降（TaskBackoff，用户设计）。
+        """任务资源退避（TaskBackoff，用户设计）。
 
-        该任务的一个作业报资源错误（exit 75）→ 退避同任务内一个在途执行
-        （最新启动优先——"后执行的先退避"），任务置 VERIFY：等剩余未退避
-        执行"正确一步"验证决定继续退避或恢复。无在途执行可退 → EMPTY：
-        任务级退避，按递增间隔探测（该任务一执行就撞资源，符合预期）。
+        该任务一个作业报资源错误（exit 75）→ 任务转入 VERIFY：**不再放新执行**，等
+        剩余在途执行"正确一步"验证决定继续退避或恢复；无在途可等 → EMPTY：任务级
+        退避，按递增间隔探测（该任务一执行就撞资源，符合预期）。
+
+        **不暂停任何在途执行**：并发收缩交给任务级 run_target 乘法收缩（各退各的、
+        平滑），这里只掐"新准入"。原先会暂停一个在途执行——那会让一份正在正常推进
+        的进度整份作废、重排重跑，是纯粹的启停抖动来源。
         跨任务不做任何协调（是否共用资源未知，各任务独立退避）。
         """
         tb = self.tbackoff
-        cands = [(aid, m) for aid, m in self.meta.items()
-                 if m.task_id == task_id and
-                 m.status in (JobStatus.STARTING, JobStatus.RUNNING)]
-        if cands:
-            cands.sort(key=lambda x: x[1].started_mono, reverse=True)
-            aid = cands[0][0]
+        live = sum(1 for m in self.meta.values()
+                   if m.task_id == task_id and
+                   m.status in (JobStatus.STARTING, JobStatus.RUNNING))
+        if live:
             tb.set_state(task_id, tb.VERIFY)
-            self._request_pause(aid, reason="任务资源退避：步降")
             self._append_status({"ts": runner.now_iso(),
                                  "kind": "task_backoff_step",
-                                 "task_id": task_id, "attempt_id": aid,
-                                 "remain_live": len(cands) - 1})
+                                 "task_id": task_id, "remain_live": live})
         elif tb.state_of(task_id) == tb.EMPTY:
             # EMPTY 探测失败：级别 +1，下次探测间隔翻倍（任务级退避）
             tb.note_empty_probe_failed(task_id, now_mono)

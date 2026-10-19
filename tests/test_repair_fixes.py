@@ -195,6 +195,22 @@ def test_finalize_backoff_deviated_when_step_slow(home):
 
 # ---------- TaskBackoff VERIFY 死区（步降暂停最后一个执行→自锁） ----------
 
+def test_task_backoff_does_not_pause_inflight(home):
+    """任务报 75 → 只掐"新准入"（进 VERIFY），**不暂停任何在途执行**。
+
+    暂停会让一份正在正常推进的进度整份作废、重排重跑——是纯粹的启停抖动来源。
+    并发收缩改由任务级 run_target 乘法收缩承担（各退各的、平滑）。
+    """
+    svc = _svc(home)
+    _mk_job(svc.db, "j1")
+    svc.db.create_attempt("a1", "j1", 1, "tok", "t0")
+    meta = AttMeta("a1", "j1", "t", 50, "tok")
+    meta.status = JobStatus.RUNNING
+    svc.meta["a1"] = meta
+    svc._task_backoff_step_down("t", _now_mono_far())
+    assert svc.tbackoff.state_of("t") == svc.tbackoff.VERIFY   # 掐新准入
+    assert meta.pause_command is None                          # 在途执行毫发无损
+
 def test_verify_drained_transitions_to_empty(home):
     """死锁修复：VERIFY 态的唯一在途执行以 PAUSED 终态退出时，
     任务必须转 EMPTY 探测——否则 VERIFY 无出口（无人可上报进展/
