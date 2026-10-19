@@ -234,33 +234,42 @@ def download_pdf(session, arxiv_id, dest, pause_check=None):
 
 
 # ------------------------------------------------------------------ OSS 上传（走 aliyun-oss CLI，凭证自动取回）
-def _oss_obj(topic, date_str, name) -> str:
-    return f"oss://{OSS_PAPERS_PREFIX}/{topic}/{date_str}/{name}"
+def _oss_list(topic, date_str, pause_check=None) -> set[str]:
+    """一次列出该日期前缀下的全部对象名（只留文件名），替代逐篇 2 次 exists。
 
-
-def _oss_exists(topic, date_str, name, pause_check=None) -> bool:
-    url = _oss_obj(topic, date_str, name)
-    # 资源错误有限重试（R3）：最多 2 次短间隔重试，仍失败立即上浮；
-    # 退出码 1 = 对象不存在（业务事实），不重试
+    为什么必须批量：失败/暂停后的 attempt 会**从头重扫**已完成的每一篇，而逐篇
+    exists 每篇要起 2 个子进程——一个 71 篇的日期在第 70 篇挂掉，重试要白扫 69 篇
+    （约 140 次子进程）才能回到原点，形成"churn → 重扫 → 通道更满 → 更多 shortage
+    → 更多 churn"的正反馈。改为一次 ls 后，重试代价与该日期已有对象数无关。
+    """
+    prefix = f"oss://{OSS_PAPERS_PREFIX}/{topic}/{date_str}/"
+    # 资源错误有限重试（R3）：最多 2 次短间隔重试，仍失败立即上浮
     last_err = None
     for _attempt in range(1 + _MAX_RETRIES):
         if _attempt:
-            _log(f"  OSS查询重试 {_attempt}/{_MAX_RETRIES}（{_RETRY_GAP_SEC:.0f}s 后）：{url[:100]}")
+            _log(f"  OSS列表重试 {_attempt}/{_MAX_RETRIES}（{_RETRY_GAP_SEC:.0f}s 后）：{prefix[:100]}")
             time.sleep(_RETRY_GAP_SEC)
         if pause_check is not None:
             pause_check()   # 每次查询（含重试）前听暂停
         try:
-            r = subprocess.run(["aliyun-oss", "exists", url],
+            r = subprocess.run(["aliyun-oss", "ls", prefix],
                                capture_output=True, timeout=60)
-            if r.returncode == 0:
-                return True
-            if r.returncode == 1:
-                return False
-            last_err = Shortage(f"aliyun-oss 退出码 {r.returncode}: {url}（外部资源不可得）")
+            if r.returncode != 0:
+                last_err = Shortage(
+                    f"aliyun-oss ls 退出码 {r.returncode}: {prefix}（外部资源不可得）")
+                continue
+            names: set[str] = set()
+            for line in r.stdout.decode("utf-8", "replace").splitlines():
+                if "oss://" not in line:
+                    continue        # 跳过表头 / "Object Number is: N" / 耗时行
+                obj = line.split()[-1].rstrip("/")
+                if obj:
+                    names.add(obj.rsplit("/", 1)[-1])
+            return names
         except PauseRequested:
             raise
         except Exception as e:
-            last_err = Shortage(f"{type(e).__name__}: {url}（外部资源不可得）")
+            last_err = Shortage(f"{type(e).__name__}: {prefix}（外部资源不可得）")
     raise last_err
 
 
@@ -313,7 +322,11 @@ class DateFetcher(ExecutorTask):
         # 已完成标记 → 跳过整个日期（幂等）。此前也听一次暂停：长检索/下载前
         # 的边界检查，避免长操作窗口内收不到暂停信号。
         self.check_pause()
-        if _oss_exists(topic, date_str, DONE_MARKER, pause_check=self.check_pause):
+        # 一次列出该日期已有对象，作为本次 attempt 的"已存在"视图（幂等仍以 OSS 为准；
+        # 逐篇 exists 换成一次 ls，避免重试时对已完成对象反复起子进程）
+        existing = _oss_list(topic, date_str, pause_check=self.check_pause)
+        _log(f"[{topic} {date_str}] OSS 已有 {len(existing)} 个对象")
+        if DONE_MARKER in existing:
             _log(f"[{topic} {date_str}] 已完成（OSS {DONE_MARKER} 存在），跳过")
             self.complete({"count": 0, "skipped": "already_done"})
             return
@@ -382,19 +395,19 @@ class DateFetcher(ExecutorTask):
             meta = local_dir / f"{file_id}.json"
             # 单篇级幂等（OSS 为准）：先查对象是否已存在——已存在则既不上传、
             # 也不下载，只补 OSS 缺失的那一份（避免重复下载/上传）。
-            in_oss_pdf = _oss_exists(topic, date_str, f"{file_id}.pdf",
-                                     pause_check=self.check_pause)
-            in_oss_json = _oss_exists(topic, date_str, f"{file_id}.json",
-                                      pause_check=self.check_pause)
+            in_oss_pdf = f"{file_id}.pdf" in existing
+            in_oss_json = f"{file_id}.json" in existing
             if not in_oss_pdf:
                 if not _pdf_complete(pdf):
                     download_pdf(session, base_id, pdf, pause_check=self.check_pause)
                 _oss_upload(pdf, topic, date_str, pause_check=self.check_pause)
+                existing.add(f"{file_id}.pdf")
             if not in_oss_json:
                 if not meta.is_file():
                     meta.write_text(json.dumps(rec, ensure_ascii=False),
                                     encoding="utf-8")
                 _oss_upload(meta, topic, date_str, pause_check=self.check_pause)
+                existing.add(f"{file_id}.json")
             pdf.unlink(missing_ok=True)
             meta.unlink(missing_ok=True)
             done_ids.add(base_id)
