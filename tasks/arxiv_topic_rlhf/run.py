@@ -332,6 +332,7 @@ class DateFetcher(ExecutorTask):
             return
 
         done_ids: set[str] = set()   # 本次 attempt 内已完成篇（内存记账；恢复以 OSS 为准）
+        reported = [False]           # 本次 attempt 是否已上报过进展（首个处理篇必报一次）
         _log(f"[{topic} {date_str}] 开始处理（幂等以 OSS 为准）")
 
         # 代理会话建立（凭证取回）也属外部资源不足：凭证暂不可得时归为统一
@@ -397,23 +398,32 @@ class DateFetcher(ExecutorTask):
             # 也不下载，只补 OSS 缺失的那一份（避免重复下载/上传）。
             in_oss_pdf = f"{file_id}.pdf" in existing
             in_oss_json = f"{file_id}.json" in existing
+            did_work = False
             if not in_oss_pdf:
                 if not _pdf_complete(pdf):
                     download_pdf(session, base_id, pdf, pause_check=self.check_pause)
                 _oss_upload(pdf, topic, date_str, pause_check=self.check_pause)
                 existing.add(f"{file_id}.pdf")
+                did_work = True
             if not in_oss_json:
                 if not meta.is_file():
                     meta.write_text(json.dumps(rec, ensure_ascii=False),
                                     encoding="utf-8")
                 _oss_upload(meta, topic, date_str, pause_check=self.check_pause)
                 existing.add(f"{file_id}.json")
+                did_work = True
             pdf.unlink(missing_ok=True)
             meta.unlink(missing_ok=True)
             done_ids.add(base_id)
-            # 安全边界：检查暂停/停止（不落盘），并上报进展
+            # 安全边界：检查暂停/停止（不落盘）
             self.check_pause()
-            self.report_progress(len(done_ids))
+            # 只在**真的产生了新对象**时上报进展：OSS 已有的篇属于"重扫"，不是新
+            # 工作。若连它也上报，会向调度器注入大量近零耗时的"步骤"样本，把单步
+            # 耗时基线拉塌（基线≈0 时退避闸会把每次 75 都误判为"严重偏离"→步降→
+            # 启停抖动）。首个处理篇仍上报一次，保证本次执行有"首步"供调度器验证。
+            if did_work or not reported[0]:
+                self.report_progress(len(done_ids))
+                reported[0] = True
             _log(f"[{topic} {date_str}] [{file_id}] 完成 {len(done_ids)}/{total}")
 
         # 资源类错误在请求层完成 R3 有限重试（request 内 2 次），耗尽后立即
