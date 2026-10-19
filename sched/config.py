@@ -241,12 +241,6 @@ class ControlConfig(BaseModel):
     step_current_alpha: float = 0.3             # fast_ema 的记忆系数
     step_deviation_min_samples: int = 8         # 少于该样本数不判偏离（无从判定）
     step_deviation_k: float = 3.0               # 偏离倍数阈值：C/B ≥ K 即判"严重偏离"
-    # ---- 跨任务聚合拥堵信号（区分"单任务偶发变慢"与"共享通道整体拥堵"）----
-    congestion_gate_enabled: bool = False   # 总开关（默认关：待交替采样验证后再定默认）
-    congestion_alpha_slow: float = 0.02     # 占比基线的慢 EMA 系数
-    congestion_alpha_fast: float = 0.3      # 占比当前的快 EMA 系数
-    congestion_k: float = 2.0               # 当前占比 ≥ K × 自身基线 判"拥堵"
-    congestion_min_ticks: int = 30          # 少于该采样次数不判定（无从判定）
     resource_unhealthy_ratio: float = 0.9   # 持续超过判定不健康
     resource_healthy_ratio: float = 0.7     # 持续低于判定恢复健康（滞回）
     resource_stable_samples: int = 3        # 滞回连续样本数

@@ -106,8 +106,6 @@ class SchedulerService:
             default_interval_sec=self.cfg.control.feedback_interval_init_sec)
         # 单步耗时"基线 vs 当前"偏离统计（资源退避的触发闸，纯运行时统计量）
         self.step_stats = scaling.StepDurationStats(self.cfg)
-        # 跨任务聚合拥堵信号（把"单任务偶发变慢"与"共享通道整体拥堵"分开）
-        self.congestion = scaling.CongestionTracker(self.cfg)
         # 退避闸参数的热更新锚点（config.json mtime）：实验需在不重启服务的前提下
         # 切换参数（重启会清空未终结 attempt 并触发全量重排+重扫，污染测量窗口）
         self._cfg_mtime = self._config_mtime()
@@ -322,35 +320,11 @@ class SchedulerService:
         self.specs = specs
         return specs
 
-    # ---------- 退避闸/拥堵信号参数热更新 ----------
+    # ---------- 退避闸参数热更新 ----------
     _GATE_FIELDS = (
         "step_baseline_method", "step_baseline_samples", "step_baseline_trim_ratio",
         "step_baseline_ema_alpha", "step_current_method", "step_current_samples",
-        "step_current_alpha", "step_deviation_min_samples", "step_deviation_k",
-        "congestion_gate_enabled", "congestion_alpha_slow", "congestion_alpha_fast",
-        "congestion_k", "congestion_min_ticks")
-
-    def _congestion_ratio(self) -> tuple[float, int]:
-        """活跃任务中"单步耗时严重偏离自身基线"的占比（按任务去重）。
-
-        返回 (占比, 参与判定的任务数)；样本不足的任务不参与（无从判定）。
-        """
-        judged = deviated = 0
-        seen: set[str] = set()
-        for attempt_id, meta in self.meta.items():
-            if attempt_id not in self.attempts:
-                continue                      # 只统计在途执行
-            tid = meta.task_id
-            if tid in seen:
-                continue
-            seen.add(tid)
-            dev = self.step_stats.deviation(tid)
-            if dev is None:
-                continue                      # 样本不足：不参与判定
-            judged += 1
-            if dev >= self.cfg.control.step_deviation_k:
-                deviated += 1
-        return ((deviated / judged, judged) if judged else (0.0, 0))
+        "step_current_alpha", "step_deviation_min_samples", "step_deviation_k")
 
     @staticmethod
     def _config_mtime() -> float:
@@ -377,7 +351,6 @@ class SchedulerService:
         for f in self._GATE_FIELDS:
             setattr(self.cfg.control, f, getattr(new.control, f))
         self.step_stats.reload(self.cfg)
-        self.congestion.reload(self.cfg)
         # 审计事件（status.jsonl 可观测）：驱动实验可据此确认热更新已生效
         self._append_status({
             "ts": runner.now_iso(), "kind": "gate_reloaded",
@@ -1032,11 +1005,6 @@ class SchedulerService:
             # （即使偶发 75、或"重试几次但仍在推进"）→ 不动，保住吞吐、不误杀长跑。
             dev = self.step_stats.deviation(stid)
             _deviated = dev is None or dev >= self.cfg.control.step_deviation_k
-            # 通道整体拥堵时（多数活跃任务同时偏离），这次偏离更可能是通道的锅，
-            # 不按"这个任务不行"逐次收缩全局预算——改由聚合信号在上升沿缩一次。
-            if _deviated and self.cfg.control.congestion_gate_enabled \
-                    and self.congestion.congested():
-                _deviated = False
             if _deviated:
                 # 并发预算乘法收缩（AIMD 的 M：max(1, BUDGET//2)）
                 self._shrink_budget("task_75")
@@ -1541,18 +1509,6 @@ class SchedulerService:
     # ---------- 控制：动态目标 / 保护 / 退让 / 放回 ----------
     def _tick_control(self, now: float) -> None:
         st = self.protect.st
-
-        # 0) 跨任务聚合拥堵信号（实验开关，默认关）：多任务**同时**偏离只可能是
-        #    共享通道整体堵；此时在上升沿收缩一次全局并发预算即可，不必为每个
-        #    偏离任务各缩一次（后者在通道抖动下会把预算反复砍到 1，徒增churn）。
-        if self.cfg.control.congestion_gate_enabled:
-            ratio, judged = self._congestion_ratio()
-            if judged:
-                self.congestion.note(ratio)
-            if self.congestion.rising_edge():
-                self._shrink_budget("congestion")
-                self._append_status({"ts": runner.now_iso(), "kind": "congestion_shrink",
-                                     "ratio": round(ratio, 3), "judged": judged})
 
         # 1) 保护对象改善 / 无待处理需求 → 结束保护；截止 → 失败结束
         if st.protected_task:

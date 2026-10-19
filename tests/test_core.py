@@ -231,39 +231,6 @@ def test_step_stats_reload_keeps_samples_and_applies_new_params():
     assert s.baseline("t") is not None                  # 慢 EMA 仍可用（由历史样本喂出）
 
 
-def test_congestion_tracker_relative_to_own_baseline_and_edge_triggered():
-    """聚合拥堵信号：占比相对**自身基线**判定（不拍脑袋定常数），且只在上升沿触发一次。"""
-    k = config.SchedulerConfig()
-    k.control.congestion_min_ticks = 20
-    s = scaling.CongestionTracker(k)
-    # 常态：占比低 → 自身基线建立
-    for _ in range(60):
-        s.note(0.1)
-    assert not s.congested()
-    # 突然多数活跃任务同时偏离 → 快 EMA 迅速抬起、慢 EMA 几乎不动 → 判拥堵
-    for _ in range(6):
-        s.note(0.9)
-    assert s.congested()
-    # 上升沿只触发一次（持续拥堵不再重复触发收缩）
-    assert s.rising_edge() is True
-    assert s.rising_edge() is False
-    # 回落后解除，并可重新武装
-    for _ in range(80):
-        s.note(0.05)
-    assert not s.congested()
-    assert s.rising_edge() is False
-
-
-def test_congestion_tracker_needs_min_ticks():
-    """采样不足不判定（与单步偏离闸同一原则：无从判定就不动）。"""
-    k = config.SchedulerConfig()
-    k.control.congestion_min_ticks = 30
-    s = scaling.CongestionTracker(k)
-    for _ in range(29):
-        s.note(1.0)
-    assert not s.congested()
-
-
 def test_task_backoff_state_machine():
     """TaskBackoff：同任务作业必共用资源 → 报错步降自己任务内的执行；
     跨任务独立；逐个拉取一步验证；全退避按递增间隔探测。"""
